@@ -1,0 +1,6 @@
+interface:
+  display_name: "End-to-End Development"
+  short_description: "Plan, gate, build, review, and deliver safely"
+  default_prompt: "Use $end-to-end-development to run this change through the durable, approval-gated development workflow."
+policy:
+  allow_implicit_invocation: false

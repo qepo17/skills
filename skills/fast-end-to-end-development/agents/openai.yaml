@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fast End-to-End Development"
+  short_description: "Plan, build, review, revise, and ship fast"
+  default_prompt: "Use $fast-end-to-end-development to plan, implement, review, revise, and open a PR with an HTML explainer."
