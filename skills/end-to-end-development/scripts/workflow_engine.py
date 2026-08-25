@@ -202,6 +202,7 @@ class WorkflowEngine:
         run_dir: Path,
         *,
         skill_dir: Path | None = None,
+        codebase_design_dir: Path | None = None,
         batch_runner: BatchRunner = _default_batch_runner,
         worker_runtime: str = "auto",
         report_root: Path | None = None,
@@ -209,6 +210,9 @@ class WorkflowEngine:
     ) -> None:
         self.run_dir = run_dir.resolve()
         self.skill_dir = (skill_dir or Path(__file__).resolve().parents[1]).resolve()
+        self.codebase_design_dir = (
+            codebase_design_dir.resolve() if codebase_design_dir else None
+        )
         self.batch_runner = batch_runner
         self.worker_runtime = worker_runtime
         self.report_root = (report_root or Path.home() / "src" / "artifacts").resolve()
@@ -1600,9 +1604,35 @@ class WorkflowEngine:
             )
         return assignments
 
+    def _resolve_codebase_design_dir(self) -> Path:
+        configured = os.environ.get("E2E_CODEBASE_DESIGN_DIR")
+        if self.codebase_design_dir is not None:
+            candidates = [self.codebase_design_dir]
+        elif configured:
+            candidates = [Path(configured).expanduser().resolve()]
+        else:
+            candidates = [
+                self.skill_dir.parent / "codebase-design",
+                Path.home() / ".pi" / "agent" / "skills" / "codebase-design",
+                Path.home() / ".agents" / "skills" / "codebase-design",
+                Path.home() / ".codex" / "skills" / "codebase-design",
+            ]
+
+        required_files = ("SKILL.md", "DEEPENING.md")
+        for candidate in dict.fromkeys(path.resolve() for path in candidates):
+            if all((candidate / name).is_file() for name in required_files):
+                return candidate
+
+        searched = ", ".join(str(path) for path in candidates)
+        raise WorkflowError(
+            "the codebase-design skill with SKILL.md and DEEPENING.md is required "
+            f"for design challenges; searched: {searched}. Install it beside this skill "
+            "or set E2E_CODEBASE_DESIGN_DIR."
+        )
+
     def _challenge_inputs(self, run: dict[str, Any], repo_id: str) -> list[Path]:
         repository = run["repositories"][repo_id]
-        codebase_dir = Path.home() / ".pi" / "agent" / "skills" / "codebase-design"
+        codebase_dir = self._resolve_codebase_design_dir()
         paths = [
             Path(run["request_path"]),
             Path(run["requirements_path"]),
@@ -2593,6 +2623,7 @@ class WorkflowEngine:
         spec_path: Path,
         run_dir: Path,
         skill_dir: Path | None = None,
+        codebase_design_dir: Path | None = None,
         batch_runner: BatchRunner = _default_batch_runner,
         worker_runtime: str = "auto",
         report_root: Path | None = None,
@@ -2759,6 +2790,7 @@ class WorkflowEngine:
         engine = cls(
             run_dir,
             skill_dir=skill_dir,
+            codebase_design_dir=codebase_design_dir,
             batch_runner=batch_runner,
             worker_runtime=worker_runtime,
             report_root=report_root,

@@ -77,7 +77,7 @@ npx skills update --global end-to-end-development fast-end-to-end-development
 - The target repository's forge CLI
 - The `codebase-design` skill
 
-The full workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
+The full workflow finds `codebase-design` beside the installed skill and in common Pi/Codex global skill directories. Set `E2E_CODEBASE_DESIGN_DIR` when it lives elsewhere. The workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
 
 ## Repository layout
 

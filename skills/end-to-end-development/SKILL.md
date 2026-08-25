@@ -36,6 +36,8 @@ Workers read only their assigned `schemas/<kind>.md`, never the coordinator docu
 
 ## Coordinator command interface
 
+The orchestrator resolves the required `codebase-design` skill beside this skill and in common Pi/Codex global skill directories. If it is installed elsewhere, set `E2E_CODEBASE_DESIGN_DIR` to the directory containing its `SKILL.md` and `DEEPENING.md` files.
+
 Always invoke the locked project through the wrapper, which keeps the generated virtual environment in the user cache rather than the installed skill directory:
 
 ```bash

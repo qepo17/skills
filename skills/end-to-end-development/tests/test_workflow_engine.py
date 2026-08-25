@@ -572,6 +572,16 @@ class WorkflowEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
+        self.codebase_design_dir = self.root / "codebase-design"
+        self.codebase_design_dir.mkdir()
+        (self.codebase_design_dir / "SKILL.md").write_text(
+            "---\nname: codebase-design\ndescription: Test fixture.\n---\n",
+            encoding="utf-8",
+        )
+        (self.codebase_design_dir / "DEEPENING.md").write_text(
+            "# Deepening\n\nTest fixture.\n",
+            encoding="utf-8",
+        )
         self.repo = self.root / "repo"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
@@ -647,10 +657,20 @@ class WorkflowEngineTests(unittest.TestCase):
             spec_path=self.spec,
             run_dir=self.run_dir,
             skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
             batch_runner=fake or FakePlanningBatch(),
             report_root=self.root / "reports",
             now=self.now,
         )
+
+    def test_missing_codebase_design_dependency_reports_install_action(self) -> None:
+        engine = WorkflowEngine(
+            self.root / "unused-run",
+            skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.root / "missing-codebase-design",
+        )
+        with self.assertRaisesRegex(WorkflowError, "E2E_CODEBASE_DESIGN_DIR"):
+            engine._resolve_codebase_design_dir()
 
     def test_graph_runs_bootstrap_and_planning_then_interrupts_for_exact_bundle(
         self,
@@ -947,6 +967,7 @@ class WorkflowEngineTests(unittest.TestCase):
             spec_path=self.spec,
             run_dir=full_run,
             skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
             batch_runner=fake,
             report_root=self.root / "reports",
             now=self.now,
@@ -1004,6 +1025,7 @@ class WorkflowEngineTests(unittest.TestCase):
             spec_path=self.spec,
             run_dir=full_run,
             skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
             batch_runner=fake,
             report_root=self.root / "reports",
             now=self.now,
@@ -1062,6 +1084,7 @@ class WorkflowEngineTests(unittest.TestCase):
             spec_path=self.spec,
             run_dir=full_run,
             skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
             now=self.now,
         )
         run = engine.load_run()
