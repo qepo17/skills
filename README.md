@@ -73,9 +73,11 @@ npx skills update --global end-to-end-development fast-end-to-end-development
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
 - Git worktrees (Worktrunk is preferred when available)
-- Herdr with Pi or Codex worker support
+- Pi or Codex worker support
 - The target repository's forge CLI
 - The `codebase-design` skill
+
+The full workflow automatically uses Paseo when invoked by a Paseo parent agent, Herdr when invoked inside Herdr, or tmux when invoked inside tmux. Otherwise it runs workers directly in headless mode; users do not configure a terminal manager. The detected backend is pinned for resumability.
 
 The full workflow finds `codebase-design` beside the installed skill and in common Pi/Codex global skill directories. Set `E2E_CODEBASE_DESIGN_DIR` when it lives elsewhere. The workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
 

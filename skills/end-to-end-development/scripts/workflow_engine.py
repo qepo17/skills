@@ -27,6 +27,7 @@ from langgraph.types import interrupt
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
+import worker_supervisor  # noqa: E402
 import workflow_tools  # noqa: E402
 
 
@@ -339,70 +340,15 @@ class WorkflowEngine:
             repo_id=artifact.get("repo_id"),
         )
 
-    def _wait_for_crash_survivor(self, assignment: dict[str, Any]) -> None:
-        """Wait for an orphaned worker, then close its workflow-created pane."""
-        name = workflow_tools._agent_name(assignment)
-        herdr = os.environ.get("E2E_HERDR_BINARY", "herdr")
-        try:
-            state = subprocess.run(
-                [herdr, "agent", "get", name],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return
-        if state.returncode != 0:
-            return
-        try:
-            state_value = json.loads(state.stdout)
-        except json.JSONDecodeError:
-            state_value = {}
-        pane_id = workflow_tools._find_pane_id(state_value)
-        try:
-            waited = subprocess.run(
-                [
-                    herdr,
-                    "agent",
-                    "wait",
-                    name,
-                    "--status",
-                    "idle",
-                    "--timeout",
-                    str(assignment["timeout_seconds"] * 1000),
-                ],
-                check=False,
-                capture_output=True,
-                timeout=assignment["timeout_seconds"] + 30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return
-        if waited.returncode != 0:
-            return
-        try:
-            current = subprocess.run(
-                [herdr, "agent", "get", name],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-            if current.returncode == 0:
-                pane_id = (
-                    workflow_tools._find_pane_id(json.loads(current.stdout)) or pane_id
-                )
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-            pass
-        if pane_id is None:
-            return
-        try:
-            subprocess.run(
-                [herdr, "pane", "close", pane_id],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return
+    def _wait_for_crash_survivor(
+        self, assignment_path: Path, assignment: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Adopt an orphaned worker through its durably recorded backend."""
+        return workflow_tools.recover_assignment_worker(
+            assignment_path,
+            assignment,
+            run_dir=self.run_dir,
+        )
 
     def resume_external_blockers(self) -> bool:
         """Retry only blockers whose external condition can change between invocations."""
@@ -431,13 +377,20 @@ class WorkflowEngine:
 
     def reconcile(self) -> str:
         """Validate durable facts and recover completed outputs after a crash."""
+        cleanup_outcomes = workflow_tools.retry_worker_cleanups(run_dir=self.run_dir)
         preflight = self.load_run()
+        recovered_workers: dict[str, dict[str, Any]] = {}
         for action in preflight["next_actions"]:
             assignment_path = action.get("assignment_path")
             if action.get("status") != "working" or not assignment_path:
                 continue
-            assignment = _load_json(Path(assignment_path))
-            self._wait_for_crash_survivor(assignment)
+            resolved_assignment_path = Path(assignment_path)
+            assignment = _load_json(resolved_assignment_path)
+            worker = self._wait_for_crash_survivor(
+                resolved_assignment_path, assignment
+            )
+            if worker is not None:
+                recovered_workers[assignment["action_id"]] = worker
 
         with RunLock(self.run_dir):
             run = self.load_run()
@@ -446,6 +399,25 @@ class WorkflowEngine:
                 raise WorkflowError("run.json and agents.json have different run IDs")
 
             changed = False
+            for outcome in cleanup_outcomes:
+                agent = next(
+                    (
+                        item
+                        for item in agents["agents"]
+                        if item["name"] == outcome.get("agent_name")
+                    ),
+                    None,
+                )
+                if agent is None:
+                    continue
+                agent["cleanup_status"] = outcome["cleanup_status"]
+                agent["cleanup_error"] = outcome.get("cleanup_error")
+                if (
+                    outcome["cleanup_status"] == "complete"
+                    and agent["status"] in {"starting", "working", "blocked", "idle"}
+                ):
+                    agent["status"] = "closed"
+                changed = True
             recovered: list[tuple[dict[str, Any], dict[str, Any]]] = []
             remaining_actions: list[dict[str, Any]] = []
             for action in run["next_actions"]:
@@ -481,17 +453,25 @@ class WorkflowEngine:
                 agent_name = workflow_tools._agent_name(assignment)
                 if not any(item["name"] == agent_name for item in agents["agents"]):
                     recovered_at = self.now()
+                    worker = recovered_workers.get(assignment["action_id"], {})
+                    cleanup_status = worker.get("cleanup_status", "complete")
                     agents["agents"].append(
                         {
                             "name": agent_name,
                             "stage": assignment["stage"],
                             "repo_id": assignment.get("repo_id"),
                             "attempt": assignment["attempt"],
-                            "pane_id": agent_name,
-                            "status": "closed",
-                            "pane_closed": True,
-                            "started_at": recovered_at,
-                            "ended_at": recovered_at,
+                            "backend": worker.get("backend", "recovered"),
+                            "handle_id": worker.get("handle_id", agent_name),
+                            "status": (
+                                "closed"
+                                if cleanup_status == "complete"
+                                else "idle"
+                            ),
+                            "cleanup_status": cleanup_status,
+                            "cleanup_error": worker.get("cleanup_error"),
+                            "started_at": worker.get("started_at", recovered_at),
+                            "ended_at": worker.get("ended_at", recovered_at),
                             "output_artifact": assignment["output_artifact"],
                         }
                     )
@@ -1046,27 +1026,34 @@ class WorkflowEngine:
                     (item for item in agents["agents"] if item["name"] == agent_name),
                     None,
                 )
-                pane_closed = worker.get("pane_closed")
-                if pane_closed is None:
-                    # Legacy batch adapters owned pane cleanup but did not
-                    # report it separately from the worker outcome.
-                    pane_closed = True
+                cleanup_status = worker.get("cleanup_status")
+                if cleanup_status is None:
+                    # Legacy batch adapters owned pane cleanup but exposed only
+                    # pane_closed. Normalize that old manifest at the seam.
+                    cleanup_status = (
+                        "complete" if worker.get("pane_closed", True) else "retained"
+                    )
                 agent_record = {
                     "name": agent_name,
                     "stage": assignment["stage"],
                     "repo_id": assignment.get("repo_id"),
                     "attempt": assignment["attempt"],
-                    "pane_id": worker.get("pane_id")
+                    "backend": worker.get("backend") or "legacy",
+                    "handle_id": worker.get("handle_id")
+                    or worker.get("pane_id")
                     or worker.get("terminal_id")
                     or agent_name,
                     "status": (
                         "closed"
-                        if worker.get("status") == "accepted" and pane_closed
+                        if worker.get("status") == "accepted"
+                        and cleanup_status == "complete"
                         else "idle"
                         if worker.get("status") == "accepted"
                         else "failed"
                     ),
-                    "pane_closed": pane_closed,
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": worker.get("cleanup_error")
+                    or worker.get("pane_close_error"),
                     "started_at": worker.get("started_at") or self.now(),
                     "ended_at": worker.get("ended_at") or self.now(),
                     "output_artifact": assignment["output_artifact"],
@@ -1349,21 +1336,27 @@ class WorkflowEngine:
     def _external_preflight_error(self, run: dict[str, Any]) -> str | None:
         if self.batch_runner is not _default_batch_runner:
             return None
-        if os.environ.get("HERDR_ENV") != "1":
-            return "HERDR_ENV=1 is required for the graph coordinator."
-        herdr = os.environ.get("E2E_HERDR_BINARY", "herdr")
+        pinned = run.get("worker_execution")
         try:
-            status = subprocess.run(
-                [herdr, "status", "server"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            context = worker_supervisor.detect_execution_context(
+                requested_backend=(
+                    pinned["backend"] if isinstance(pinned, dict) else "auto"
+                ),
+                requested_runtime=(
+                    pinned["runtime"]
+                    if isinstance(pinned, dict)
+                    else self.worker_runtime
+                ),
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return f"Herdr server health check failed: {error}"
-        if status.returncode != 0 or "running" not in status.stdout.lower():
-            return "Herdr server is not running or compatible."
+        except (OSError, RuntimeError, ValueError) as error:
+            return f"Worker execution preflight failed: {error}"
+        if not isinstance(pinned, dict):
+            with RunLock(self.run_dir):
+                current = self.load_run()
+                if current.get("worker_execution") is None:
+                    current["worker_execution"] = context.as_dict()
+                    self._save_run(current)
+            run["worker_execution"] = context.as_dict()
         for repo_id, repository in run["repositories"].items():
             worktree = Path(repository["worktree"])
             try:
@@ -1399,7 +1392,7 @@ class WorkflowEngine:
             self._block(
                 summary=preflight_error,
                 evidence_path=log,
-                required_action="Restore Herdr/Git/forge access, then resume the graph.",
+                required_action="Restore worker-runtime/Git/forge access, then resume the graph.",
                 kind="environment",
             )
             return "blocked"
@@ -2606,11 +2599,12 @@ class WorkflowEngine:
             agent["name"]
             for agent in self.load_agents()["agents"]
             if agent["status"] in {"starting", "working", "blocked", "idle"}
+            or agent.get("cleanup_status") in {"pending", "retained", "failed"}
             or agent.get("pane_closed") is False
         ]
         if unclosed_agents:
             raise WorkflowError(
-                "completion audit found workflow worker panes still open: "
+                "completion audit found workflow worker handles still open: "
                 + ", ".join(sorted(unclosed_agents))
             )
         for repo_id, repository in run["repositories"].items():

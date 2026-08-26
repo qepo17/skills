@@ -1,8 +1,8 @@
 ---
 name: end-to-end-development
-description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional gates, explicit approval of the complete plan bundle, bounded work packets and remediation, isolated worktrees, short-lived Herdr workers, and validated artifact handoffs.
+description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional gates, explicit approval of the complete plan bundle, bounded work packets and remediation, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
 disable-model-invocation: true
-compatibility: Requires uv, Python 3.11+, Git worktrees, Herdr, Pi or Codex inside Herdr, a repository forge CLI, and the installed codebase-design skill. LangGraph dependencies are installed from the locked skill project.
+compatibility: Requires uv, Python 3.11+, Git worktrees, Pi or Codex, a repository forge CLI, and the installed codebase-design skill. Paseo, Herdr, and tmux are detected automatically when the coordinator runs inside them; otherwise workers run headlessly. LangGraph dependencies are installed from the locked skill project.
 ---
 
 # End-to-End Development
@@ -33,7 +33,7 @@ Workers read only their assigned `schemas/<kind>.md`, never the coordinator docu
 12. **Independent review remains mandatory.** Every profile gets at least one fresh baseline-to-worktree review before delivery.
 13. **Complete-plan approval is an unconditional hard gate.** Implementation cannot begin until a later user message explicitly approves every plan in the exact current hash-pinned review bundle. Pre-approval, silence, generic continuation, partial approval, and stale-bundle approval do not count.
 14. **External side effects are idempotently reconciled.** LangGraph checkpointing does not make workers, commits, pushes, or PR creation exactly-once. Valid existing evidence is recovered instead of repeated.
-15. **Completed worker panes are short-lived.** The supervisor keeps Herdr `pane_id` separate from `terminal_id`, closes every workflow-created pane as soon as its worker settles and its output is captured, and records the close result. Crash recovery applies the same cleanup even when the output artifact already exists. Never report completion while a completed workflow worker pane remains open.
+15. **Completed worker handles are short-lived.** The supervisor records an opaque backend handle, cleans it as soon as its worker settles and its output is captured, and records the result. Crash recovery uses the pinned backend to apply the same cleanup even when the output artifact already exists. Never report completion while a settled workflow worker remains open.
 
 ## Coordinator command interface
 
@@ -183,7 +183,7 @@ Never modify limits during an active run. The graph checks `coordinator_attempt_
 
 The compiled graph contains these phase nodes, with `reconcile` between every transition:
 
-1. `bootstrap`, verifying `HERDR_ENV`, Herdr server health, Git worktrees, forge remotes, and forge CLI authentication
+1. `bootstrap`, auto-detecting and pinning the worker backend/runtime, then verifying Git worktrees, forge remotes, and forge CLI authentication
 2. `contract` when policy requires it
 3. `plan`, including conditional challenge and one bounded revision
 4. `plan-review`, implemented with LangGraph `interrupt()`
@@ -203,7 +203,9 @@ Repository IDs and stable IDs sort lexicographically. Independent repositories l
 
 ### Worker routing
 
-The graph constructs immutable assignments and invokes the supervisor internally. `--worker-runtime auto` follows the coordinator: Codex when `CODEX_THREAD_ID` is present, otherwise Pi, unless `E2E_COORDINATOR_RUNTIME` explicitly overrides it.
+The graph constructs immutable assignments and invokes the supervisor internally. Users do not configure a terminal manager. Bootstrap selects the first positively detected active environment in this order: a reachable Paseo parent from `PASEO_AGENT_ID`, a compatible Herdr server from `HERDR_ENV`, the active tmux session from `TMUX`, then the always-available direct headless backend. `PASEO_HOST` alone never selects remote workers because remote paths may not match the coordinator's hash-pinned paths. The selected backend and evidence are pinned in `run.json` for recovery.
+
+`--worker-runtime auto` inherits a Paseo parent's Pi/Codex provider when present, otherwise follows the coordinator: Codex when `CODEX_THREAD_ID` is present and Pi by default. `E2E_COORDINATOR_RUNTIME` remains an internal diagnostic override, not required user setup.
 
 Every worker uses `gpt-5.6-luna` with maximum runtime reasoning. Assignment `thinking` remains the policy classification:
 
@@ -211,7 +213,7 @@ Every worker uses `gpt-5.6-luna` with maximum runtime reasoning. Assignment `thi
 - `high`: standard planning/review, implementation, complex fixes;
 - `medium`: validation, mechanical fixes, delivery, report tooling.
 
-Workers never spawn nested agents. The supervisor closes each settled worker's Herdr pane immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis rather than being mistaken for completed panes.
+Workers never spawn nested agents. A Paseo coordinator creates Paseo subagents, Herdr creates non-focused workspaces, tmux creates detached windows, and direct mode runs non-interactively without a terminal manager. The supervisor archives or closes each settled handle immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis.
 
 ### Work packets and bounded deviations
 
@@ -227,7 +229,7 @@ Round one independently reviews the complete baseline-to-worktree state. Critica
 
 Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures use the bounded pipeline-fix path.
 
-Because delivery changes `HEAD`, the graph re-keys validation to the committed tree before completion. Completion then verifies exact plan approval, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker pane, empty actions, and empty blockers. Metrics are generated deterministically.
+Because delivery changes `HEAD`, the graph re-keys validation to the committed tree before completion. Completion then verifies exact plan approval, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically.
 
 ## Final response
 

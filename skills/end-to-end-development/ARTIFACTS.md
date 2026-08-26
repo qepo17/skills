@@ -21,7 +21,7 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 - Repository IDs match `^[a-z0-9][a-z0-9-]*$`; requirement IDs look like `REQ-001`.
 - Paths to repositories, worktrees, artifacts, and logs are absolute. Changed source paths are repository-relative and contain no `..`.
 - Unordered arrays are sorted by stable ID/path. Accepted artifacts are immutable; a retry writes a new file.
-- Only `run.json`, `agents.json`, and `langgraph.sqlite` are mutable. JSON projections use a sibling temporary file and atomic rename. `events.jsonl` is append-only. The SQLite checkpoint stores the execution cursor; `run.json.phase` remains the canonical phase projection used by reconciliation and routing.
+- Only `run.json`, `agents.json`, `langgraph.sqlite`, and active `supervisor/worker-*.json` lifecycle records are mutable. JSON projections use a sibling temporary file and atomic rename. `events.jsonl` and supervisor batch logs are append-only. Worker records become settled evidence after cleanup. The SQLite checkpoint stores the execution cursor; `run.json.phase` remains the canonical phase projection used by reconciliation and routing.
 - JSON contains concise facts, commands, exit codes, hashes, and evidence paths—not secrets, environment values, full diffs, source files, or command output.
 - A complete artifact has no blockers. A blocked artifact has at least one blocker.
 - Older schema-v1 runs without profile fields remain valid and behave as legacy `full` runs when resumed.
@@ -47,8 +47,11 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ├── contract-vN*.json                    # full profile only
 ├── integration-*.json                   # when policy requires it
 ├── report-*.json                        # when policy requires it
-├── supervisor/*.json                    # graph-consumed batch manifests
-├── supervisor/*.jsonl                   # batch-supervisor output
+├── supervisor/manifest-*.json           # graph-consumed batch manifests
+├── supervisor/worker-*.json             # durable backend handles for recovery
+├── supervisor/batch-*.jsonl             # append-only batch outcomes
+├── supervisor/status/*.json             # direct/tmux process exit status
+├── supervisor/logs/*                     # bounded worker stdout/stderr evidence
 └── repos/<repo-id>/
     ├── initial-status.txt
     ├── database-target.json             # migration-capable checks only; no secrets
@@ -107,6 +110,13 @@ The LangGraph control plane is the sole writer after initialization. New runs re
     "coordinator_attempt_budget": 30,
     "auto_resume": true,
     "user_plan_approval_required": true
+  },
+  "worker_execution": {
+    "schema_version": 1,
+    "backend": "direct",
+    "runtime": "pi",
+    "detected_from": "fallback",
+    "evidence": {}
   },
   "request_path": "/absolute/run/request.md",
   "request_sha256": "64-character-sha256",
@@ -181,8 +191,9 @@ The review bundle must visibly contain every recorded repository, canonical path
 
 A next action contains unique ascending `order`, unique `action_id`, phase, nullable repository ID, attempt, sorted input paths, output path, and status (`pending`, `working`, or `blocked`). It records its immutable `assignment_path`. There are no next actions while plan review is pending.
 
-The graph may add these hash-pinned coordinator fields when applicable:
+The graph may add these coordinator fields when applicable:
 
+- `worker_execution`: the automatically detected and pinned backend/runtime plus non-secret probe evidence;
 - `plan_feedback`: path/hash plus sorted affected repository IDs;
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
@@ -228,9 +239,11 @@ Records every session, including failed/replacement workers:
       "stage": "implement",
       "repo_id": "api",
       "attempt": 1,
-      "pane_id": "pane-id",
+      "backend": "tmux",
+      "handle_id": "@12",
       "status": "closed",
-      "pane_closed": true,
+      "cleanup_status": "complete",
+      "cleanup_error": null,
       "started_at": "2026-08-17T08:35:00Z",
       "ended_at": "2026-08-17T08:40:00Z",
       "output_artifact": "/absolute/run/repos/api/implementation-api-packet-001-1.json"
@@ -239,7 +252,7 @@ Records every session, including failed/replacement workers:
 }
 ```
 
-Statuses are `starting`, `working`, `blocked`, `idle`, `failed`, and `closed`. The optional `pane_closed` lifecycle field is authoritative when present, so a failed worker outcome can still record that its completed pane was cleaned up.
+Statuses are `starting`, `working`, `blocked`, `idle`, `failed`, and `closed`. `backend` is `direct`, `paseo`, `herdr`, `tmux`, or a test/legacy adapter name. `handle_id` is opaque to the graph. Cleanup status is `pending`, `retained`, `complete`, or `failed`; completion requires every settled worker to be `complete`. Older schema-v1 Herdr records with `pane_id` and optional `pane_closed` remain valid on resume.
 
 ## Immutable assignment (`assignment`)
 
@@ -301,7 +314,7 @@ Use `medium` for validation, mechanical fixes, delivery, and deterministic repor
 
 The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Regardless of assignment stage, workers use `gpt-5.6-luna` with maximum reasoning. The assignment `thinking` value remains the policy classification and minimum validation level, while the actual launcher configuration is recorded in the supervisor manifest.
 
-Each supervisor worker entry records Herdr `pane_id` and `terminal_id` separately, plus `pane_closed` and `pane_close_error`. Only `pane_id` may be passed to `herdr pane close`. After a worker reaches the settled wait state, its workflow-created pane is closed after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation performs the same close after waiting, including when the worker wrote its artifact before the coordinator stopped.
+Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation reads the same record and performs the same cleanup, including when the worker wrote its artifact before the coordinator stopped.
 
 ## Worker artifact schemas
 

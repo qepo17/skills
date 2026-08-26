@@ -79,6 +79,7 @@ def _result(engine: WorkflowEngine, graph_output: Any | None = None) -> dict[str
         "phase": run["phase"],
         "next_actions": [action["action_id"] for action in run["next_actions"]],
         "blockers": run["blockers"],
+        "worker_execution": run.get("worker_execution"),
     }
     if isinstance(graph_output, dict) and graph_output.get("outcome"):
         result["outcome"] = graph_output["outcome"]

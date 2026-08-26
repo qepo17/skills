@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -108,7 +109,9 @@ class FakePlanningBatch:
                     "output_artifact": str(output),
                     "started_at": "2026-08-22T10:00:00Z",
                     "ended_at": "2026-08-22T10:01:00Z",
-                    "terminal_id": f"pane-{len(self.assignments)}",
+                    "backend": "test",
+                    "handle_id": f"worker-{len(self.assignments)}",
+                    "cleanup_status": "complete",
                     "status": "accepted",
                     "reason": None,
                 }
@@ -673,6 +676,32 @@ class WorkflowEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "E2E_CODEBASE_DESIGN_DIR"):
             engine._resolve_codebase_design_dir()
 
+    def test_bootstrap_preflight_pins_direct_execution_without_a_terminal_manager(
+        self,
+    ) -> None:
+        self.initialize()
+        engine = WorkflowEngine(
+            self.run_dir,
+            skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
+            report_root=self.root / "reports",
+            now=self.now,
+        )
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch(
+                "workflow_engine._git",
+                return_value="https://example.invalid/repository",
+            ),
+        ):
+            error = engine._external_preflight_error(engine.load_run())
+
+        self.assertIsNone(error)
+        execution = engine.load_run()["worker_execution"]
+        self.assertEqual("direct", execution["backend"])
+        self.assertEqual("pi", execution["runtime"])
+        self.assertEqual("fallback", execution["detected_from"])
+
     def test_graph_runs_bootstrap_and_planning_then_interrupts_for_exact_bundle(
         self,
     ) -> None:
@@ -691,6 +720,11 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual("awaiting-user", run["status"])
         self.assertEqual(1, len(fake.assignments))
         self.assertEqual("plan", fake.assignments[0]["stage"])
+        worker = engine.load_agents()["agents"][0]
+        self.assertEqual("test", worker["backend"])
+        self.assertEqual("worker-1", worker["handle_id"])
+        self.assertEqual("complete", worker["cleanup_status"])
+        self.assertNotIn("pane_id", worker)
         self.assertIn("__interrupt__", output)
         payload = output["__interrupt__"][0].value
         self.assertEqual(run["plan_review"]["review_sha256"], payload["review_sha256"])
@@ -715,7 +749,7 @@ class WorkflowEngineTests(unittest.TestCase):
             approved["plan_review"]["approval_text"],
         )
 
-    def test_completion_audit_rejects_a_worker_with_an_open_pane(self) -> None:
+    def test_completion_audit_rejects_a_worker_with_an_open_handle(self) -> None:
         engine = self.initialize()
         agents = engine.load_agents()
         agents["agents"].append(
@@ -724,9 +758,11 @@ class WorkflowEngineTests(unittest.TestCase):
                 "stage": "review-1",
                 "repo_id": "api",
                 "attempt": 1,
-                "pane_id": "pane-open",
+                "backend": "tmux",
+                "handle_id": "@open",
                 "status": "idle",
-                "pane_closed": False,
+                "cleanup_status": "retained",
+                "cleanup_error": None,
                 "started_at": "2026-08-22T10:00:00Z",
                 "ended_at": "2026-08-22T10:01:00Z",
                 "output_artifact": str(self.run_dir / "review.json"),
@@ -734,8 +770,74 @@ class WorkflowEngineTests(unittest.TestCase):
         )
         engine._save_agents(agents)
 
-        with self.assertRaisesRegex(WorkflowError, "worker panes still open"):
+        with self.assertRaisesRegex(WorkflowError, "worker handles still open"):
             engine.phase_complete()
+
+    def test_reconcile_retries_cleanup_and_closes_the_agent_projection(self) -> None:
+        engine = self.initialize()
+        run = engine.load_run()
+        run["worker_execution"] = {
+            "schema_version": 1,
+            "backend": "direct",
+            "runtime": "pi",
+            "detected_from": "fallback",
+            "evidence": {},
+        }
+        engine._save_run(run)
+        agents = engine.load_agents()
+        agents["agents"].append(
+            {
+                "name": "cleanup-retry-worker",
+                "stage": "plan",
+                "repo_id": "api",
+                "attempt": 1,
+                "backend": "direct",
+                "handle_id": "4242",
+                "status": "idle",
+                "cleanup_status": "failed",
+                "cleanup_error": "temporary cleanup failure",
+                "started_at": "2026-08-22T10:00:00Z",
+                "ended_at": "2026-08-22T10:01:00Z",
+                "output_artifact": str(self.run_dir / "unused-plan.json"),
+            }
+        )
+        engine._save_agents(agents)
+        record_path = (
+            self.run_dir
+            / "supervisor"
+            / "worker-"
+            f"{hashlib.sha256('cleanup:retry'.encode()).hexdigest()[:16]}.json"
+        )
+        record_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action_id": "cleanup:retry",
+                    "agent_name": "cleanup-retry-worker",
+                    "backend": "direct",
+                    "runtime": "pi",
+                    "handle_id": "4242",
+                    "started_at": "2026-08-22T10:00:00Z",
+                    "ended_at": "2026-08-22T10:01:00Z",
+                    "status": "settled",
+                    "cleanup_status": "failed",
+                    "cleanup_error": "temporary cleanup failure",
+                    "status_path": str(self.run_dir / "status.json"),
+                    "stdout_path": str(self.run_dir / "stdout.log"),
+                    "stderr_path": str(self.run_dir / "stderr.log"),
+                    "details": {"pid": 4242},
+                    "record_path": str(record_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        engine.reconcile()
+
+        worker = engine.load_agents()["agents"][0]
+        self.assertEqual("complete", worker["cleanup_status"])
+        self.assertEqual("closed", worker["status"])
+        self.assertIsNone(worker["cleanup_error"])
 
     def test_resume_retries_external_blockers_but_not_code_decisions(self) -> None:
         engine = self.initialize()
@@ -809,6 +911,10 @@ class WorkflowEngineTests(unittest.TestCase):
         )
         self.assertIn(["pane", "close", "pane-recovered"], commands)
         self.assertNotIn(["pane", "close", "term-recovered"], commands)
+        recovered_agent = engine.load_agents()["agents"][0]
+        self.assertEqual("herdr", recovered_agent["backend"])
+        self.assertEqual("complete", recovered_agent["cleanup_status"])
+        self.assertNotIn("pane_id", recovered_agent)
 
     def test_reconcile_recovers_completed_plan_without_relaunching_worker(self) -> None:
         fake = FakePlanningBatch()
