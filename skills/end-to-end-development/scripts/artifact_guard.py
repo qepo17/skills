@@ -673,6 +673,31 @@ def validate_run(data: dict[str, Any]) -> None:
         )
         if profile == "fast" and run_risk_flags:
             fail("$.risk_flags", "fast profile requires an empty risk list")
+    worker_execution = data.get("worker_execution")
+    if worker_execution is not None:
+        execution = obj(worker_execution, "$.worker_execution")
+        execution_schema = integer(
+            field(execution, "schema_version", "$.worker_execution"),
+            "$.worker_execution.schema_version",
+            minimum=1,
+        )
+        if execution_schema != 1:
+            fail("$.worker_execution.schema_version", "must equal 1")
+        enum(
+            field(execution, "backend", "$.worker_execution"),
+            {"direct", "herdr", "paseo", "tmux"},
+            "$.worker_execution.backend",
+        )
+        enum(
+            field(execution, "runtime", "$.worker_execution"),
+            {"codex", "pi"},
+            "$.worker_execution.runtime",
+        )
+        string(
+            field(execution, "detected_from", "$.worker_execution"),
+            "$.worker_execution.detected_from",
+        )
+        obj(field(execution, "evidence", "$.worker_execution"), "$.worker_execution.evidence")
     request_path = absolute_path(
         field(data, "request_path", "$"), "$.request_path", must_exist=True, file_only=True
     )
@@ -1049,7 +1074,20 @@ def validate_agents(data: dict[str, Any]) -> None:
         if value is not None:
             repo_id(value, f"{loc}.repo_id")
         integer(field(agent, "attempt", loc), f"{loc}.attempt", minimum=1)
-        string(field(agent, "pane_id", loc), f"{loc}.pane_id")
+        if "handle_id" in agent:
+            string(field(agent, "backend", loc), f"{loc}.backend")
+            string(field(agent, "handle_id", loc), f"{loc}.handle_id")
+            enum(
+                field(agent, "cleanup_status", loc),
+                {"pending", "retained", "complete", "failed"},
+                f"{loc}.cleanup_status",
+            )
+            cleanup_error = agent.get("cleanup_error")
+            if cleanup_error is not None:
+                string(cleanup_error, f"{loc}.cleanup_error", max_length=2000)
+        else:
+            # Schema-v1 Herdr runs recorded pane lifecycle directly.
+            string(field(agent, "pane_id", loc), f"{loc}.pane_id")
         status = enum(field(agent, "status", loc), AGENT_STATUSES, f"{loc}.status")
         timestamp(field(agent, "started_at", loc), f"{loc}.started_at")
         ended_at = field(agent, "ended_at", loc)

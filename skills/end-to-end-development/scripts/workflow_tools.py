@@ -17,7 +17,6 @@ import stat
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,6 +26,7 @@ from typing import Any, Iterable
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
+import worker_supervisor  # noqa: E402
 
 FORCE_FULL_RISKS = {
     "authorization",
@@ -41,8 +41,8 @@ FORCE_FULL_RISKS = {
 }
 
 WORKER_RUNTIMES = {"auto", "codex", "pi"}
-DEFAULT_WORKER_MODEL = "gpt-5.6-luna"
-DEFAULT_WORKER_THINKING = "max"
+DEFAULT_WORKER_MODEL = worker_supervisor.DEFAULT_WORKER_MODEL
+DEFAULT_WORKER_THINKING = worker_supervisor.DEFAULT_WORKER_THINKING
 
 
 def utc_now() -> str:
@@ -310,87 +310,6 @@ def _resolve_worker_runtime(runtime: str = "auto") -> str:
     return selected
 
 
-def _launch_command(
-    assignment_path: Path,
-    assignment: dict[str, Any],
-    *,
-    herdr_binary: str,
-    pi_binary: str,
-    codex_binary: str,
-    worker_runtime: str,
-) -> list[str]:
-    herdr_start = [
-        herdr_binary,
-        "agent",
-        "start",
-        _agent_name(assignment),
-        "--cwd",
-        assignment["cwd"],
-        "--split",
-        "right",
-        "--no-focus",
-        "--",
-    ]
-    if worker_runtime == "codex":
-        return herdr_start + [
-            codex_binary,
-            "exec",
-            "--ephemeral",
-            "--model",
-            DEFAULT_WORKER_MODEL,
-            "--config",
-            f'model_reasoning_effort="{DEFAULT_WORKER_THINKING}"',
-            "--cd",
-            assignment["cwd"],
-            "--dangerously-bypass-approvals-and-sandbox",
-            _worker_prompt(assignment_path),
-        ]
-    return herdr_start + [
-        pi_binary,
-        "--model",
-        f"openai-codex/{DEFAULT_WORKER_MODEL}",
-        "--thinking",
-        DEFAULT_WORKER_THINKING,
-        _worker_prompt(assignment_path),
-    ]
-
-
-def _find_identifier(value: Any, key: str) -> str | None:
-    if isinstance(value, dict):
-        candidate = value.get(key)
-        if isinstance(candidate, str) and candidate:
-            return candidate
-        for child in value.values():
-            found = _find_identifier(child, key)
-            if found:
-                return found
-    if isinstance(value, list):
-        for child in value:
-            found = _find_identifier(child, key)
-            if found:
-                return found
-    return None
-
-
-def _find_pane_id(value: Any) -> str | None:
-    """Return only a Herdr pane ID; terminal IDs cannot address pane commands."""
-    return _find_identifier(value, "pane_id")
-
-
-def _find_terminal_id(value: Any) -> str | None:
-    return _find_identifier(value, "terminal_id")
-
-
-def _run_process(command: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        command,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
-
-
 def _enforce_user_plan_approval(
     run: dict[str, Any],
     assignments: list[tuple[Path, dict[str, Any]]],
@@ -439,6 +358,96 @@ def _enforce_user_plan_approval(
             )
 
 
+def recover_assignment_worker(
+    assignment_path: Path,
+    assignment: dict[str, Any],
+    *,
+    run_dir: Path,
+) -> dict[str, Any] | None:
+    """Adopt and settle a previously launched worker through its recorded backend."""
+    record_path = (
+        run_dir
+        / "supervisor"
+        / worker_supervisor.WorkerSupervisor.record_name(assignment["action_id"])
+    )
+    record: dict[str, Any] | None = None
+    if record_path.is_file():
+        try:
+            value = json.loads(record_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                record = value
+        except (OSError, json.JSONDecodeError):
+            record = None
+    run_path = run_dir / "run.json"
+    run = load_json(run_path) if run_path.is_file() else {}
+    pinned = run.get("worker_execution")
+    if record and isinstance(record.get("backend"), str):
+        backend = record["backend"]
+        runtime = str(record.get("runtime") or "pi")
+        detected_from = "supervisor-record"
+        evidence: dict[str, Any] = {}
+    elif isinstance(pinned, dict):
+        backend = pinned["backend"]
+        runtime = pinned["runtime"]
+        detected_from = pinned.get("detected_from", "run.json")
+        evidence = dict(pinned.get("evidence", {}))
+    else:
+        # Older runs were exclusively Herdr-managed and have no generic record.
+        backend = "herdr"
+        runtime = _resolve_worker_runtime("auto")
+        detected_from = "schema-v1-herdr"
+        evidence = {}
+    context = worker_supervisor.ExecutionContext(
+        backend, runtime, detected_from, evidence
+    )
+    supervisor = worker_supervisor.WorkerSupervisor(
+        run_dir,
+        context,
+        herdr_binary=os.environ.get("E2E_HERDR_BINARY", "herdr"),
+        tmux_binary=os.environ.get("E2E_TMUX_BINARY", "tmux"),
+        paseo_binary=os.environ.get("E2E_PASEO_BINARY", "paseo"),
+    )
+    request = worker_supervisor.WorkerRequest(
+        action_id=assignment["action_id"],
+        agent_name=_agent_name(assignment),
+        assignment_path=assignment_path.resolve(),
+        cwd=Path(assignment["cwd"]),
+        timeout_seconds=assignment["timeout_seconds"],
+        runtime=runtime,
+        prompt=_worker_prompt(assignment_path.resolve()),
+    )
+    recovered = supervisor.recover(request)
+    if recovered is not None:
+        return recovered
+    if record is None and backend == "herdr":
+        return supervisor.recover_legacy_herdr(request)
+    return None
+
+
+def retry_worker_cleanups(*, run_dir: Path) -> list[dict[str, Any]]:
+    """Retry settled backend cleanup independently of pending graph actions."""
+    run_path = run_dir / "run.json"
+    if not run_path.is_file():
+        return []
+    pinned = load_json(run_path).get("worker_execution")
+    if not isinstance(pinned, dict):
+        return []
+    context = worker_supervisor.ExecutionContext(
+        pinned["backend"],
+        pinned["runtime"],
+        pinned.get("detected_from", "run.json"),
+        dict(pinned.get("evidence", {})),
+    )
+    supervisor = worker_supervisor.WorkerSupervisor(
+        run_dir,
+        context,
+        herdr_binary=os.environ.get("E2E_HERDR_BINARY", "herdr"),
+        tmux_binary=os.environ.get("E2E_TMUX_BINARY", "tmux"),
+        paseo_binary=os.environ.get("E2E_PASEO_BINARY", "paseo"),
+    )
+    return supervisor.retry_cleanups()
+
+
 def run_assignment_batch(
     assignment_paths: list[Path],
     *,
@@ -446,7 +455,10 @@ def run_assignment_batch(
     herdr_binary: str = "herdr",
     pi_binary: str = "pi",
     codex_binary: str = "codex",
+    tmux_binary: str = "tmux",
+    paseo_binary: str = "paseo",
     worker_runtime: str = "auto",
+    worker_backend: str = "auto",
     dry_run: bool = False,
     allow_existing: bool = False,
 ) -> tuple[int, dict[str, Any]]:
@@ -478,8 +490,8 @@ def run_assignment_batch(
         loaded.append((path, assignment))
     if len(run_ids) != 1:
         raise ValueError("every assignment in a batch must belong to the same run")
-    resolved_runtime = _resolve_worker_runtime(worker_runtime)
     run_path = run_dir / "run.json"
+    run: dict[str, Any] = {}
     if run_path.exists():
         run = load_json(run_path)
         if run.get("run_id") not in run_ids:
@@ -494,144 +506,95 @@ def run_assignment_batch(
             "project-file writers require run.json with an approved plan review bundle"
         )
 
+    pinned = run.get("worker_execution")
+    if isinstance(pinned, dict):
+        context = worker_supervisor.ExecutionContext(
+            backend=pinned["backend"],
+            runtime=pinned["runtime"],
+            detected_from=pinned.get("detected_from", "run.json"),
+            evidence=dict(pinned.get("evidence", {})),
+        )
+    else:
+        detection_env = dict(os.environ)
+        detection_env.update(
+            {
+                "E2E_HERDR_BINARY": herdr_binary,
+                "E2E_TMUX_BINARY": tmux_binary,
+                "E2E_PASEO_BINARY": paseo_binary,
+            }
+        )
+        context = worker_supervisor.detect_execution_context(
+            environ=detection_env,
+            requested_runtime=worker_runtime,
+            requested_backend=worker_backend,
+        )
+    resolved_runtime = context.runtime
+    supervisor = worker_supervisor.WorkerSupervisor(
+        run_dir,
+        context,
+        pi_binary=pi_binary,
+        codex_binary=codex_binary,
+        herdr_binary=herdr_binary,
+        tmux_binary=tmux_binary,
+        paseo_binary=paseo_binary,
+    )
+    requests = [
+        worker_supervisor.WorkerRequest(
+            action_id=assignment["action_id"],
+            agent_name=_agent_name(assignment),
+            assignment_path=path,
+            cwd=Path(assignment["cwd"]),
+            timeout_seconds=assignment["timeout_seconds"],
+            runtime=resolved_runtime,
+            prompt=_worker_prompt(path),
+        )
+        for path, assignment in loaded
+    ]
+
     if dry_run:
-        for path, assignment in loaded:
+        for request in requests:
+            preview = supervisor.preview(request)
             entries.append(
                 {
-                    "action_id": assignment["action_id"],
-                    "agent_name": _agent_name(assignment),
-                    "assignment_path": str(path),
-                    "command": _launch_command(
-                        path,
-                        assignment,
-                        herdr_binary=herdr_binary,
-                        pi_binary=pi_binary,
-                        codex_binary=codex_binary,
-                        worker_runtime=resolved_runtime,
-                    ),
+                    "action_id": request.action_id,
+                    "agent_name": request.agent_name,
+                    "assignment_path": str(request.assignment_path),
+                    "backend": context.backend,
+                    "command": preview["command"],
                     "runtime": resolved_runtime,
                     "model": DEFAULT_WORKER_MODEL,
                     "thinking": DEFAULT_WORKER_THINKING,
                     "status": "dry-run",
                 }
             )
-        return 0, {"generated_at": utc_now(), "dry_run": True, "workers": entries}
+        return 0, {
+            "generated_at": utc_now(),
+            "dry_run": True,
+            "execution_context": context.as_dict(),
+            "workers": entries,
+        }
 
     log_dir = run_dir / "supervisor"
     log_dir.mkdir(parents=True, exist_ok=True)
     batch_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     batch_log = log_dir / f"batch-{batch_stamp}-{os.getpid()}.jsonl"
-    launched: list[dict[str, Any]] = []
-
-    def log_event(event: dict[str, Any]) -> None:
-        with batch_log.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
-
-    for path, assignment in loaded:
-        name = _agent_name(assignment)
-        command = _launch_command(
-            path,
-            assignment,
-            herdr_binary=herdr_binary,
-            pi_binary=pi_binary,
-            codex_binary=codex_binary,
-            worker_runtime=resolved_runtime,
-        )
-        started_at = utc_now()
-        process = _run_process(command, timeout=30)
-        stdout = process.stdout.decode("utf-8", errors="replace")
-        stderr = process.stderr.decode("utf-8", errors="replace")
-        terminal_id: str | None = None
-        pane_id: str | None = None
-        try:
-            start_value = json.loads(stdout)
-            terminal_id = _find_terminal_id(start_value)
-            pane_id = _find_pane_id(start_value)
-        except json.JSONDecodeError:
-            pass
-        item = {
-            "path": path,
-            "assignment": assignment,
-            "agent_name": name,
-            "started_at": started_at,
-            "terminal_id": terminal_id,
-            "pane_id": pane_id,
-            "start_exit_code": process.returncode,
+    outcomes = supervisor.run_batch(requests)
+    assignments_by_action = {
+        assignment["action_id"]: assignment for _path, assignment in loaded
+    }
+    for outcome in outcomes:
+        assignment = assignments_by_action[outcome["action_id"]]
+        result = {
+            **outcome,
+            "output_artifact": assignment["output_artifact"],
             "runtime": resolved_runtime,
             "model": DEFAULT_WORKER_MODEL,
             "thinking": DEFAULT_WORKER_THINKING,
-        }
-        launched.append(item)
-        log_event(
-            {
-                "at": started_at,
-                "event": "start",
-                "action_id": assignment["action_id"],
-                "agent_name": name,
-                "runtime": resolved_runtime,
-                "model": DEFAULT_WORKER_MODEL,
-                "thinking": DEFAULT_WORKER_THINKING,
-                "exit_code": process.returncode,
-                "stdout": stdout[-2000:],
-                "stderr": stderr[-2000:],
-            }
-        )
-
-    def wait_one(item: dict[str, Any]) -> tuple[dict[str, Any], subprocess.CompletedProcess[bytes] | None, str | None]:
-        if item["start_exit_code"] != 0:
-            return item, None, None
-        assignment = item["assignment"]
-        timeout_ms = assignment["timeout_seconds"] * 1000
-        command = [
-            herdr_binary,
-            "agent",
-            "wait",
-            item["agent_name"],
-            "--status",
-            "idle",
-            "--timeout",
-            str(timeout_ms),
-        ]
-        try:
-            process = _run_process(command, timeout=assignment["timeout_seconds"] + 30)
-            return item, process, None
-        except subprocess.TimeoutExpired as error:
-            return item, None, str(error)
-
-    waits: list[tuple[dict[str, Any], subprocess.CompletedProcess[bytes] | None, str | None]] = []
-    with ThreadPoolExecutor(max_workers=len(launched)) as executor:
-        futures = [executor.submit(wait_one, item) for item in launched]
-        for future in as_completed(futures):
-            waits.append(future.result())
-
-    for item, wait_process, wait_error in sorted(
-        waits, key=lambda result: result[0]["assignment"]["action_id"]
-    ):
-        assignment = item["assignment"]
-        ended_at = utc_now()
-        result: dict[str, Any] = {
-            "action_id": assignment["action_id"],
-            "agent_name": item["agent_name"],
-            "assignment_path": str(item["path"]),
-            "output_artifact": assignment["output_artifact"],
-            "started_at": item["started_at"],
-            "ended_at": ended_at,
-            "terminal_id": item["terminal_id"],
-            "pane_id": item["pane_id"],
-            "pane_closed": False,
-            "pane_close_error": None,
             "status": "rejected",
-            "reason": None,
         }
-        if item["start_exit_code"] != 0:
-            result["reason"] = "agent start failed"
-        elif wait_error is not None:
+        if outcome["timed_out"]:
             result["status"] = "timeout"
-            result["reason"] = wait_error
-        elif wait_process is None or wait_process.returncode != 0:
-            result["status"] = "timeout"
-            result["reason"] = "Herdr wait did not reach idle"
-        else:
+        elif outcome["settled"]:
             output = Path(assignment["output_artifact"])
             try:
                 raw = output.read_bytes()
@@ -643,70 +606,39 @@ def run_assignment_batch(
                     artifact_guard.obj(value, "$")
                 )
                 result["status"] = "accepted"
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, artifact_guard.ValidationError) as error:
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                artifact_guard.ValidationError,
+            ) as error:
                 result["reason"] = str(error)
-        settled = (
-            item["start_exit_code"] == 0
-            and wait_error is None
-            and wait_process is not None
-            and wait_process.returncode == 0
-        )
-        if settled:
-            pane_id = item["pane_id"]
-            if pane_id is None:
-                agent_state = _run_process(
-                    [herdr_binary, "agent", "get", item["agent_name"]], timeout=30
-                )
-                try:
-                    agent_value = json.loads(agent_state.stdout)
-                    pane_id = _find_pane_id(agent_value)
-                    result["terminal_id"] = (
-                        result["terminal_id"] or _find_terminal_id(agent_value)
-                    )
-                except json.JSONDecodeError:
-                    pass
-                result["pane_id"] = pane_id
-            if pane_id is None:
-                result["pane_close_error"] = "Herdr did not report a pane_id"
-            else:
-                close_process = _run_process(
-                    [herdr_binary, "pane", "close", pane_id], timeout=30
-                )
-                result["pane_closed"] = close_process.returncode == 0
-                if close_process.returncode != 0:
-                    close_stderr = close_process.stderr.decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    result["pane_close_error"] = close_stderr or (
-                        f"Herdr pane close exited {close_process.returncode}"
-                    )
         entries.append(result)
-        log_event(
-            {
-                "at": ended_at,
-                "event": "result",
-                "action_id": assignment["action_id"],
-                "agent_name": item["agent_name"],
-                "status": result["status"],
-                "reason": result["reason"],
-                "pane_id": result["pane_id"],
-                "pane_closed": result["pane_closed"],
-                "pane_close_error": result["pane_close_error"],
-                "wait_exit_code": wait_process.returncode if wait_process else None,
-                "wait_stdout": wait_process.stdout.decode("utf-8", errors="replace")[-2000:]
-                if wait_process
-                else "",
-                "wait_stderr": wait_process.stderr.decode("utf-8", errors="replace")[-2000:]
-                if wait_process
-                else "",
-            }
-        )
+        with batch_log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "at": result["ended_at"],
+                        "event": "result",
+                        "action_id": result["action_id"],
+                        "backend": result["backend"],
+                        "handle_id": result["handle_id"],
+                        "status": result["status"],
+                        "reason": result["reason"],
+                        "cleanup_status": result["cleanup_status"],
+                        "cleanup_error": result["cleanup_error"],
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
 
     all_accepted = all(entry["status"] == "accepted" for entry in entries)
     manifest = {
         "generated_at": utc_now(),
         "dry_run": False,
         "batch_log": str(batch_log),
+        "execution_context": context.as_dict(),
         "workers": entries,
     }
     return (0 if all_accepted else 1), manifest
@@ -876,8 +808,16 @@ def build_parser() -> argparse.ArgumentParser:
     batch = subparsers.add_parser("run-batch", help="launch and wait for immutable assignments")
     batch.add_argument("--run-dir", type=Path, required=True)
     batch.add_argument("--herdr", default="herdr")
+    batch.add_argument("--tmux", default="tmux")
+    batch.add_argument("--paseo", default="paseo")
     batch.add_argument("--pi", default="pi")
     batch.add_argument("--codex", default="codex")
+    batch.add_argument(
+        "--worker-backend",
+        choices=["auto", *sorted(worker_supervisor.WORKER_BACKENDS)],
+        default="auto",
+        help=argparse.SUPPRESS,
+    )
     batch.add_argument(
         "--worker-runtime",
         choices=sorted(WORKER_RUNTIMES),
@@ -922,9 +862,12 @@ def main() -> int:
                 args.assignments,
                 run_dir=args.run_dir,
                 herdr_binary=args.herdr,
+                tmux_binary=args.tmux,
+                paseo_binary=args.paseo,
                 pi_binary=args.pi,
                 codex_binary=args.codex,
                 worker_runtime=args.worker_runtime,
+                worker_backend=args.worker_backend,
                 dry_run=args.dry_run,
                 allow_existing=args.allow_existing,
             )

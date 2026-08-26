@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -210,16 +212,20 @@ class BatchSupervisorTests(unittest.TestCase):
         }
         self.write_json(assignment_path, assignment)
 
-        code, manifest = workflow_tools.run_assignment_batch(
-            [assignment_path],
-            run_dir=self.root / "run",
-            worker_runtime="pi",
-            dry_run=True,
-        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            code, manifest = workflow_tools.run_assignment_batch(
+                [assignment_path],
+                run_dir=self.root / "run",
+                worker_runtime="pi",
+                dry_run=True,
+            )
         self.assertEqual(0, code)
         self.assertEqual("dry-run", manifest["workers"][0]["status"])
         command = manifest["workers"][0]["command"]
-        self.assertEqual("herdr", command[0])
+        self.assertEqual("direct", manifest["execution_context"]["backend"])
+        self.assertEqual("pi", command[0])
+        self.assertIn("--print", command)
+        self.assertIn("--no-session", command)
         self.assertIn("--thinking", command)
         self.assertIn("max", command)
         self.assertIn("--model", command)
@@ -267,15 +273,17 @@ class BatchSupervisorTests(unittest.TestCase):
         }
         self.write_json(assignment_path, assignment)
 
-        code, manifest = workflow_tools.run_assignment_batch(
-            [assignment_path],
-            run_dir=self.root / "run",
-            worker_runtime="codex",
-            dry_run=True,
-        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            code, manifest = workflow_tools.run_assignment_batch(
+                [assignment_path],
+                run_dir=self.root / "run",
+                worker_runtime="codex",
+                dry_run=True,
+            )
         self.assertEqual(0, code)
         command = manifest["workers"][0]["command"]
-        self.assertEqual("codex", command[command.index("--") + 1])
+        self.assertEqual("direct", manifest["execution_context"]["backend"])
+        self.assertEqual("codex", command[0])
         self.assertIn("exec", command)
         self.assertIn("--model", command)
         self.assertIn("gpt-5.6-luna", command)
@@ -410,30 +418,32 @@ class BatchSupervisorTests(unittest.TestCase):
             f"log = pathlib.Path({str(command_log)!r})\n"
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if sys.argv[1:3] == ['agent', 'start']:\n"
-            "    print(json.dumps({'result': {'agent': {\n"
-            "        'terminal_id': 'term-test', 'pane_id': 'pane-test'\n"
-            "    }}}))\n"
-            "if sys.argv[1:3] == ['pane', 'close']:\n"
-            "    sys.exit(0 if sys.argv[3] == 'pane-test' else 1)\n"
+            "if sys.argv[1:4] == ['status', 'server', '--json']:\n"
+            "    print(json.dumps({'running': True, 'compatible': True, 'protocol': 20}))\n"
+            "elif sys.argv[1:3] == ['workspace', 'create']:\n"
+            "    print(json.dumps({'result': {'workspace': 'workspace-test', "
+            "'root_pane': {'pane_id': 'pane-test'}}}))\n"
+            "else:\n"
+            "    print(json.dumps({'result': {'ok': True}}))\n"
             "sys.exit(0)\n",
             encoding="utf-8",
         )
         fake_herdr.chmod(0o755)
 
-        code, manifest = workflow_tools.run_assignment_batch(
-            [assignment_path],
-            run_dir=self.root / "run",
-            herdr_binary=str(fake_herdr),
-            allow_existing=True,
-        )
+        with mock.patch.dict(os.environ, {"HERDR_ENV": "1"}, clear=True):
+            code, manifest = workflow_tools.run_assignment_batch(
+                [assignment_path],
+                run_dir=self.root / "run",
+                herdr_binary=str(fake_herdr),
+                allow_existing=True,
+            )
         commands = [json.loads(line) for line in command_log.read_text().splitlines()]
         self.assertEqual(0, code)
         self.assertEqual("accepted", manifest["workers"][0]["status"])
-        self.assertIn(["pane", "close", "pane-test"], commands)
-        self.assertNotIn(["pane", "close", "term-test"], commands)
-        self.assertEqual("pane-test", manifest["workers"][0]["pane_id"])
-        self.assertTrue(manifest["workers"][0]["pane_closed"])
+        self.assertIn(["workspace", "close", "workspace-test"], commands)
+        self.assertNotIn(["pane", "close", "pane-test"], commands)
+        self.assertEqual("herdr", manifest["workers"][0]["backend"])
+        self.assertEqual("complete", manifest["workers"][0]["cleanup_status"])
         self.assertTrue(Path(manifest["batch_log"]).is_file())
 
 

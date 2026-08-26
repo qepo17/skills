@@ -17,11 +17,11 @@ A run-scoped execution lock permits only one advancing graph invocation at a tim
 2. Acquire the repository writer lease when applicable.
 3. Execute the side effect.
 4. Validate the output at the artifact seam.
-5. Close the settled worker by its Herdr `pane_id` (never its `terminal_id`) and record the close result.
+5. Clean the settled worker through its pinned backend handle and record the result.
 6. Record the accepted hash reference and release the lease.
 7. Checkpoint the graph superstep.
 
-On replay, existing valid output is accepted rather than repeated. Crash recovery still waits for and closes a surviving worker pane when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
+On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
 
 ## Executable graph
 
@@ -88,7 +88,9 @@ The coordinator writes a temporary JSON file outside the repository and passes i
 }
 ```
 
-The coordinator must discover all affected repositories before initialization and create one clean dedicated worktree per repository. The initializer verifies the `.git` worktree file, actual branch, baseline, and empty initial status, writes requirements and run state, applies the deterministic profile classifier, and validates the result. The graph's bootstrap node then verifies `HERDR_ENV`, Herdr server health, forge remotes, and provider CLI authentication before scheduling a worker. Initialization never copies `.env` files or creates database targets.
+The coordinator must discover all affected repositories before initialization and create one clean dedicated worktree per repository. The initializer verifies the `.git` worktree file, actual branch, baseline, and empty initial status, writes requirements and run state, applies the deterministic profile classifier, and validates the result. The graph's bootstrap node then detects and pins the active worker environment, verifies its positive probe, and checks forge remotes and provider CLI authentication before scheduling a worker. Initialization never copies `.env` files or creates database targets.
+
+Worker detection requires active-context evidence rather than installed binaries: `PASEO_AGENT_ID` plus a successful parent inspection, `HERDR_ENV=1` plus a compatible server, or `TMUX` plus a successful session probe. Precedence is Paseo, Herdr, tmux, then direct headless execution. A stale marker falls through to the next candidate. `PASEO_HOST` without a parent agent is ignored so a local coordinator never sends hash-pinned absolute paths to an unrelated remote filesystem.
 
 ## CLI interface
 
@@ -157,8 +159,8 @@ The skill uses the locked project in this directory:
 - `langgraph==1.2.11`
 - `langgraph-checkpoint-sqlite==3.1.1`
 
-`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. Workers remain Herdr-managed Pi/Codex sessions launched by `workflow_tools.py run-batch`; LangGraph does not replace Herdr or the worker artifact protocol.
+`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. `workflow_tools.py run-batch` delegates lifecycle to the auto-detected worker supervisor while LangGraph retains the immutable assignment and artifact protocol.
 
 ## Testing seams
 
-`WorkflowEngine` is the module interface. Production injects the real Herdr batch runner; tests inject an in-process batch adapter. Both exercise the same assignment, validation, transition, retry, and approval implementation. Tests should assert observable run/artifact outcomes through this interface rather than reaching into graph internals.
+`WorkflowEngine` is the graph module interface. `WorkerSupervisor` is the execution module interface shared by direct, Paseo, Herdr, and tmux adapters. Production uses auto-detection; tests inject an in-process batch adapter or fake external CLI at the supervisor seam. Tests assert observable run, handle, and artifact outcomes rather than adapter internals.
