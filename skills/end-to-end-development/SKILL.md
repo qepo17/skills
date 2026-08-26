@@ -33,6 +33,7 @@ Workers read only their assigned `schemas/<kind>.md`, never the coordinator docu
 12. **Independent review remains mandatory.** Every profile gets at least one fresh baseline-to-worktree review before delivery.
 13. **Complete-plan approval is an unconditional hard gate.** Implementation cannot begin until a later user message explicitly approves every plan in the exact current hash-pinned review bundle. Pre-approval, silence, generic continuation, partial approval, and stale-bundle approval do not count.
 14. **External side effects are idempotently reconciled.** LangGraph checkpointing does not make workers, commits, pushes, or PR creation exactly-once. Valid existing evidence is recovered instead of repeated.
+15. **Completed worker panes are short-lived.** The supervisor keeps Herdr `pane_id` separate from `terminal_id`, closes every workflow-created pane as soon as its worker settles and its output is captured, and records the close result. Crash recovery applies the same cleanup even when the output artifact already exists. Never report completion while a completed workflow worker pane remains open.
 
 ## Coordinator command interface
 
@@ -210,7 +211,7 @@ Every worker uses `gpt-5.6-luna` with maximum runtime reasoning. Assignment `thi
 - `high`: standard planning/review, implementation, complex fixes;
 - `medium`: validation, mechanical fixes, delivery, report tooling.
 
-Workers never spawn nested agents.
+Workers never spawn nested agents. The supervisor closes each settled worker's Herdr pane immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis rather than being mistaken for completed panes.
 
 ### Work packets and bounded deviations
 
@@ -226,7 +227,7 @@ Round one independently reviews the complete baseline-to-worktree state. Critica
 
 Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures use the bounded pipeline-fix path.
 
-Because delivery changes `HEAD`, the graph re-keys validation to the committed tree before completion. Completion then verifies exact plan approval, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, empty actions, and empty blockers. Metrics are generated deterministically.
+Because delivery changes `HEAD`, the graph re-keys validation to the committed tree before completion. Completion then verifies exact plan approval, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker pane, empty actions, and empty blockers. Metrics are generated deterministically.
 
 ## Final response
 

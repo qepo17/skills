@@ -340,7 +340,7 @@ class WorkflowEngine:
         )
 
     def _wait_for_crash_survivor(self, assignment: dict[str, Any]) -> None:
-        """Wait once for a Herdr worker orphaned by a coordinator crash."""
+        """Wait for an orphaned worker, then close its workflow-created pane."""
         name = workflow_tools._agent_name(assignment)
         herdr = os.environ.get("E2E_HERDR_BINARY", "herdr")
         try:
@@ -355,7 +355,12 @@ class WorkflowEngine:
         if state.returncode != 0:
             return
         try:
-            subprocess.run(
+            state_value = json.loads(state.stdout)
+        except json.JSONDecodeError:
+            state_value = {}
+        pane_id = workflow_tools._find_pane_id(state_value)
+        try:
+            waited = subprocess.run(
                 [
                     herdr,
                     "agent",
@@ -371,8 +376,8 @@ class WorkflowEngine:
                 timeout=assignment["timeout_seconds"] + 30,
             )
         except (OSError, subprocess.TimeoutExpired):
-            pass
-        if Path(assignment["output_artifact"]).exists():
+            return
+        if waited.returncode != 0:
             return
         try:
             current = subprocess.run(
@@ -381,15 +386,22 @@ class WorkflowEngine:
                 capture_output=True,
                 timeout=30,
             )
-            terminal_id = workflow_tools._find_terminal_id(json.loads(current.stdout))
-            if terminal_id:
-                subprocess.run(
-                    [herdr, "pane", "close", terminal_id],
-                    check=False,
-                    capture_output=True,
-                    timeout=30,
+            if current.returncode == 0:
+                pane_id = (
+                    workflow_tools._find_pane_id(json.loads(current.stdout)) or pane_id
                 )
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            pass
+        if pane_id is None:
+            return
+        try:
+            subprocess.run(
+                [herdr, "pane", "close", pane_id],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             return
 
     def resume_external_blockers(self) -> bool:
@@ -425,8 +437,7 @@ class WorkflowEngine:
             if action.get("status") != "working" or not assignment_path:
                 continue
             assignment = _load_json(Path(assignment_path))
-            if not Path(assignment["output_artifact"]).exists():
-                self._wait_for_crash_survivor(assignment)
+            self._wait_for_crash_survivor(assignment)
 
         with RunLock(self.run_dir):
             run = self.load_run()
@@ -478,6 +489,7 @@ class WorkflowEngine:
                             "attempt": assignment["attempt"],
                             "pane_id": agent_name,
                             "status": "closed",
+                            "pane_closed": True,
                             "started_at": recovered_at,
                             "ended_at": recovered_at,
                             "output_artifact": assignment["output_artifact"],
@@ -1034,15 +1046,27 @@ class WorkflowEngine:
                     (item for item in agents["agents"] if item["name"] == agent_name),
                     None,
                 )
+                pane_closed = worker.get("pane_closed")
+                if pane_closed is None:
+                    # Legacy batch adapters owned pane cleanup but did not
+                    # report it separately from the worker outcome.
+                    pane_closed = True
                 agent_record = {
                     "name": agent_name,
                     "stage": assignment["stage"],
                     "repo_id": assignment.get("repo_id"),
                     "attempt": assignment["attempt"],
-                    "pane_id": worker.get("terminal_id") or agent_name,
-                    "status": "closed"
-                    if worker.get("status") == "accepted"
-                    else "failed",
+                    "pane_id": worker.get("pane_id")
+                    or worker.get("terminal_id")
+                    or agent_name,
+                    "status": (
+                        "closed"
+                        if worker.get("status") == "accepted" and pane_closed
+                        else "idle"
+                        if worker.get("status") == "accepted"
+                        else "failed"
+                    ),
+                    "pane_closed": pane_closed,
                     "started_at": worker.get("started_at") or self.now(),
                     "ended_at": worker.get("ended_at") or self.now(),
                     "output_artifact": assignment["output_artifact"],
@@ -2578,6 +2602,17 @@ class WorkflowEngine:
         run = self.load_run()
         if run["next_actions"] or run["blockers"]:
             raise WorkflowError("completion audit found pending actions or blockers")
+        unclosed_agents = [
+            agent["name"]
+            for agent in self.load_agents()["agents"]
+            if agent["status"] in {"starting", "working", "blocked", "idle"}
+            or agent.get("pane_closed") is False
+        ]
+        if unclosed_agents:
+            raise WorkflowError(
+                "completion audit found workflow worker panes still open: "
+                + ", ".join(sorted(unclosed_agents))
+            )
         for repo_id, repository in run["repositories"].items():
             if repository.get("active_writer") is not None:
                 raise WorkflowError(

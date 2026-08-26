@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -714,6 +715,28 @@ class WorkflowEngineTests(unittest.TestCase):
             approved["plan_review"]["approval_text"],
         )
 
+    def test_completion_audit_rejects_a_worker_with_an_open_pane(self) -> None:
+        engine = self.initialize()
+        agents = engine.load_agents()
+        agents["agents"].append(
+            {
+                "name": "open-completed-worker",
+                "stage": "review-1",
+                "repo_id": "api",
+                "attempt": 1,
+                "pane_id": "pane-open",
+                "status": "idle",
+                "pane_closed": False,
+                "started_at": "2026-08-22T10:00:00Z",
+                "ended_at": "2026-08-22T10:01:00Z",
+                "output_artifact": str(self.run_dir / "review.json"),
+            }
+        )
+        engine._save_agents(agents)
+
+        with self.assertRaisesRegex(WorkflowError, "worker panes still open"):
+            engine.phase_complete()
+
     def test_resume_retries_external_blockers_but_not_code_decisions(self) -> None:
         engine = self.initialize()
         evidence = self.run_dir / "logs" / "external.log"
@@ -734,6 +757,58 @@ class WorkflowEngineTests(unittest.TestCase):
         )
         self.assertFalse(engine.resume_external_blockers())
         self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_crash_recovery_closes_a_worker_that_already_wrote_its_output(self) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        run = engine.load_run()
+        assignment_path = engine.build_assignment(
+            stage="plan",
+            repo_id="api",
+            scope="crash-recovery",
+            inputs=[Path(run["request_path"]), Path(run["requirements_path"])],
+            instructions=["Produce a repository plan."],
+        )
+        engine._install_actions([assignment_path])
+        working = engine.load_run()
+        working["next_actions"][0]["status"] = "working"
+        engine._save_run(working)
+        fake(
+            [assignment_path],
+            run_dir=self.run_dir,
+            worker_runtime="pi",
+            allow_existing=False,
+        )
+
+        command_log = self.root / "crash-recovery-herdr.jsonl"
+        fake_herdr = self.root / "fake-crash-recovery-herdr.py"
+        fake_herdr.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"log = pathlib.Path({str(command_log)!r})\n"
+            "with log.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1:3] in (['agent', 'get'], ['agent', 'wait']):\n"
+            "    print(json.dumps({'result': {'agent': {\n"
+            "        'terminal_id': 'term-recovered', 'pane_id': 'pane-recovered'\n"
+            "    }}}))\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        fake_herdr.chmod(0o755)
+
+        with mock.patch.dict(
+            "os.environ", {"E2E_HERDR_BINARY": str(fake_herdr)}
+        ):
+            engine.reconcile()
+
+        commands = (
+            [json.loads(line) for line in command_log.read_text().splitlines()]
+            if command_log.exists()
+            else []
+        )
+        self.assertIn(["pane", "close", "pane-recovered"], commands)
+        self.assertNotIn(["pane", "close", "term-recovered"], commands)
 
     def test_reconcile_recovers_completed_plan_without_relaunching_worker(self) -> None:
         fake = FakePlanningBatch()

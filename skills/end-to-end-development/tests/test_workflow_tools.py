@@ -403,11 +403,19 @@ class BatchSupervisorTests(unittest.TestCase):
         }
         self.write_json(output, result)
         fake_herdr = self.root / "fake-herdr.py"
+        command_log = self.root / "herdr-commands.jsonl"
         fake_herdr.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, sys\n"
+            "import json, pathlib, sys\n"
+            f"log = pathlib.Path({str(command_log)!r})\n"
+            "with log.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:3] == ['agent', 'start']:\n"
-            "    print(json.dumps({'terminal_id': 'pane-test'}))\n"
+            "    print(json.dumps({'result': {'agent': {\n"
+            "        'terminal_id': 'term-test', 'pane_id': 'pane-test'\n"
+            "    }}}))\n"
+            "if sys.argv[1:3] == ['pane', 'close']:\n"
+            "    sys.exit(0 if sys.argv[3] == 'pane-test' else 1)\n"
             "sys.exit(0)\n",
             encoding="utf-8",
         )
@@ -419,9 +427,13 @@ class BatchSupervisorTests(unittest.TestCase):
             herdr_binary=str(fake_herdr),
             allow_existing=True,
         )
+        commands = [json.loads(line) for line in command_log.read_text().splitlines()]
         self.assertEqual(0, code)
         self.assertEqual("accepted", manifest["workers"][0]["status"])
-        self.assertEqual("pane-test", manifest["workers"][0]["terminal_id"])
+        self.assertIn(["pane", "close", "pane-test"], commands)
+        self.assertNotIn(["pane", "close", "term-test"], commands)
+        self.assertEqual("pane-test", manifest["workers"][0]["pane_id"])
+        self.assertTrue(manifest["workers"][0]["pane_closed"])
         self.assertTrue(Path(manifest["batch_log"]).is_file())
 
 

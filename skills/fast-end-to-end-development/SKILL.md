@@ -17,6 +17,12 @@ Resolve `SKILL_DIR` to this skill's directory. Set `RUN_DIR` to the run director
 
 Use `gpt-5.6-luna` with `max` reasoning for the coordinator and every agent session in this workflow. This applies to planning, implementation, the independent review, revision, delivery, and any delegated artifact-rendering work. Do not switch models or lower reasoning effort for a supposedly mechanical stage. When launching agents explicitly, pass the equivalent runtime settings: `model: gpt-5.6-luna` and `reasoning_effort: max` for Codex, or `--model openai-codex/gpt-5.6-luna --thinking max` for Pi.
 
+## Herdr pane lifecycle
+
+When this workflow creates an agent pane through Herdr, record the returned `pane_id` separately from any `terminal_id`. As soon as that agent settles and its required result has been captured, close the workflow-created pane with `herdr pane close <pane_id>` and verify the command succeeds. Do this after planning, review, delivery, or any other delegated stage rather than leaving completed panes visible until the final handoff.
+
+Before reporting completion, account for every Herdr pane created by this run and close any remaining settled pane. Never close the coordinator pane, a pre-existing user pane, or a pane that is still working, blocked, or needed to diagnose a timeout. If a completed pane cannot be closed, report pane cleanup as a blocker instead of making the user infer which pane is still active.
+
 ## Scope gate
 
 Use the fast path for one repository and ordinary application changes. Before editing:
@@ -54,6 +60,7 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 - Capture `git status --short` and the baseline commit before editing. Preserve unrelated user changes; never use `reset --hard`, `clean`, broad checkout, or an overwrite to make the tree convenient.
 - Use a task branch unless the user explicitly supplied a task branch. If unrelated uncommitted changes make branch isolation unsafe, use a dedicated worktree or stop and explain the boundary.
 - Keep one project-file writer. Do not let a reviewer or delivery step edit source files.
+- Close every workflow-created Herdr pane immediately after its agent settles and its result is captured; retain only working, blocked, or timed-out panes that still need attention.
 - Treat the plan as the implementation contract. A simpler equivalent change or focused test is allowed; a new high-cost mechanism, public contract, migration, or unrelated refactor requires escalation.
 - Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a third review/fix cycle.
 - Do not create the PR until the revision gate and required local checks pass. If a post-PR CI failure needs code changes after the one revision is spent, report the blocker and recommend the full workflow.
@@ -126,7 +133,7 @@ The renderer requires non-empty `title`, `summary`, `repository`, and `pr_url` f
 
 ## Completion handoff
 
-Finish only when the PR exists and `pr-explainer.html` validates as a readable file. Report, briefly:
+Finish only when the PR exists, `pr-explainer.html` validates as a readable file, and every completed Herdr pane created by the workflow has been closed. Report, briefly:
 
 - status and PR URL;
 - final commit and check state;

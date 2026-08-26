@@ -230,6 +230,7 @@ Records every session, including failed/replacement workers:
       "attempt": 1,
       "pane_id": "pane-id",
       "status": "closed",
+      "pane_closed": true,
       "started_at": "2026-08-17T08:35:00Z",
       "ended_at": "2026-08-17T08:40:00Z",
       "output_artifact": "/absolute/run/repos/api/implementation-api-packet-001-1.json"
@@ -238,7 +239,7 @@ Records every session, including failed/replacement workers:
 }
 ```
 
-Statuses are `starting`, `working`, `blocked`, `idle`, `failed`, and `closed`.
+Statuses are `starting`, `working`, `blocked`, `idle`, `failed`, and `closed`. The optional `pane_closed` lifecycle field is authoritative when present, so a failed worker outcome can still record that its completed pane was cleaned up.
 
 ## Immutable assignment (`assignment`)
 
@@ -299,6 +300,8 @@ Input references are unique and path-sorted. Every project-file writer in a new 
 Use `medium` for validation, mechanical fixes, delivery, and deterministic report setup; `high` for standard planning/review, implementation, and complex fixes; `xhigh` only for full-profile contract/planning/challenge/review/integration.
 
 The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Regardless of assignment stage, workers use `gpt-5.6-luna` with maximum reasoning. The assignment `thinking` value remains the policy classification and minimum validation level, while the actual launcher configuration is recorded in the supervisor manifest.
+
+Each supervisor worker entry records Herdr `pane_id` and `terminal_id` separately, plus `pane_closed` and `pane_close_error`. Only `pane_id` may be passed to `herdr pane close`. After a worker reaches the settled wait state, its workflow-created pane is closed after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation performs the same close after waiting, including when the worker wrote its artifact before the coordinator stopped.
 
 ## Worker artifact schemas
 
