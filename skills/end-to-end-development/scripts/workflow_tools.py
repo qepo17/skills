@@ -355,22 +355,30 @@ def _launch_command(
     ]
 
 
-def _find_terminal_id(value: Any) -> str | None:
+def _find_identifier(value: Any, key: str) -> str | None:
     if isinstance(value, dict):
-        for key in ("terminal_id", "pane_id"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate:
-                return candidate
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate:
+            return candidate
         for child in value.values():
-            found = _find_terminal_id(child)
+            found = _find_identifier(child, key)
             if found:
                 return found
     if isinstance(value, list):
         for child in value:
-            found = _find_terminal_id(child)
+            found = _find_identifier(child, key)
             if found:
                 return found
     return None
+
+
+def _find_pane_id(value: Any) -> str | None:
+    """Return only a Herdr pane ID; terminal IDs cannot address pane commands."""
+    return _find_identifier(value, "pane_id")
+
+
+def _find_terminal_id(value: Any) -> str | None:
+    return _find_identifier(value, "terminal_id")
 
 
 def _run_process(command: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[bytes]:
@@ -534,16 +542,20 @@ def run_assignment_batch(
         stdout = process.stdout.decode("utf-8", errors="replace")
         stderr = process.stderr.decode("utf-8", errors="replace")
         terminal_id: str | None = None
+        pane_id: str | None = None
         try:
-            terminal_id = _find_terminal_id(json.loads(stdout))
+            start_value = json.loads(stdout)
+            terminal_id = _find_terminal_id(start_value)
+            pane_id = _find_pane_id(start_value)
         except json.JSONDecodeError:
-            terminal_id = None
+            pass
         item = {
             "path": path,
             "assignment": assignment,
             "agent_name": name,
             "started_at": started_at,
             "terminal_id": terminal_id,
+            "pane_id": pane_id,
             "start_exit_code": process.returncode,
             "runtime": resolved_runtime,
             "model": DEFAULT_WORKER_MODEL,
@@ -605,6 +617,9 @@ def run_assignment_batch(
             "started_at": item["started_at"],
             "ended_at": ended_at,
             "terminal_id": item["terminal_id"],
+            "pane_id": item["pane_id"],
+            "pane_closed": False,
+            "pane_close_error": None,
             "status": "rejected",
             "reason": None,
         }
@@ -630,6 +645,41 @@ def run_assignment_batch(
                 result["status"] = "accepted"
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, artifact_guard.ValidationError) as error:
                 result["reason"] = str(error)
+        settled = (
+            item["start_exit_code"] == 0
+            and wait_error is None
+            and wait_process is not None
+            and wait_process.returncode == 0
+        )
+        if settled:
+            pane_id = item["pane_id"]
+            if pane_id is None:
+                agent_state = _run_process(
+                    [herdr_binary, "agent", "get", item["agent_name"]], timeout=30
+                )
+                try:
+                    agent_value = json.loads(agent_state.stdout)
+                    pane_id = _find_pane_id(agent_value)
+                    result["terminal_id"] = (
+                        result["terminal_id"] or _find_terminal_id(agent_value)
+                    )
+                except json.JSONDecodeError:
+                    pass
+                result["pane_id"] = pane_id
+            if pane_id is None:
+                result["pane_close_error"] = "Herdr did not report a pane_id"
+            else:
+                close_process = _run_process(
+                    [herdr_binary, "pane", "close", pane_id], timeout=30
+                )
+                result["pane_closed"] = close_process.returncode == 0
+                if close_process.returncode != 0:
+                    close_stderr = close_process.stderr.decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    result["pane_close_error"] = close_stderr or (
+                        f"Herdr pane close exited {close_process.returncode}"
+                    )
         entries.append(result)
         log_event(
             {
@@ -639,6 +689,9 @@ def run_assignment_batch(
                 "agent_name": item["agent_name"],
                 "status": result["status"],
                 "reason": result["reason"],
+                "pane_id": result["pane_id"],
+                "pane_closed": result["pane_closed"],
+                "pane_close_error": result["pane_close_error"],
                 "wait_exit_code": wait_process.returncode if wait_process else None,
                 "wait_stdout": wait_process.stdout.decode("utf-8", errors="replace")[-2000:]
                 if wait_process
@@ -648,19 +701,6 @@ def run_assignment_batch(
                 else "",
             }
         )
-        if result["status"] == "accepted":
-            terminal_id = item["terminal_id"]
-            if terminal_id is None:
-                agent_state = _run_process(
-                    [herdr_binary, "agent", "get", item["agent_name"]], timeout=30
-                )
-                try:
-                    terminal_id = _find_terminal_id(json.loads(agent_state.stdout))
-                except json.JSONDecodeError:
-                    terminal_id = None
-                result["terminal_id"] = terminal_id
-            if terminal_id:
-                _run_process([herdr_binary, "pane", "close", terminal_id], timeout=30)
 
     all_accepted = all(entry["status"] == "accepted" for entry in entries)
     manifest = {

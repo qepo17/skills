@@ -17,10 +17,11 @@ A run-scoped execution lock permits only one advancing graph invocation at a tim
 2. Acquire the repository writer lease when applicable.
 3. Execute the side effect.
 4. Validate the output at the artifact seam.
-5. Record the accepted hash reference and release the lease.
-6. Checkpoint the graph superstep.
+5. Close the settled worker by its Herdr `pane_id` (never its `terminal_id`) and record the close result.
+6. Record the accepted hash reference and release the lease.
+7. Checkpoint the graph superstep.
 
-On replay, existing valid output is accepted rather than repeated. Invalid or absent output follows the recorded replacement limit.
+On replay, existing valid output is accepted rather than repeated. Crash recovery still waits for and closes a surviving worker pane when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
 
 ## Executable graph
 
