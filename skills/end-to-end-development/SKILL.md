@@ -93,7 +93,13 @@ Inspect without advancing:
 "$ORCHESTRATOR" status "$RUN_DIR"
 ```
 
-Never edit `run.json`, `agents.json`, `events.jsonl`, assignments, or LangGraph SQLite state to repair a run. Diagnose the rejected evidence or use a supported CLI transition. `resume` retries blockers classified as environment, authentication, permission, or infrastructure after the external condition is fixed; it never clears code, dependency, or decision blockers.
+Never edit `run.json`, `agents.json`, `events.jsonl`, assignments, or LangGraph SQLite state to repair a run. Diagnose the rejected evidence or use a supported CLI transition. `resume` retries blockers classified as environment, authentication, permission, or infrastructure after the external condition is fixed; it never clears code, dependency, or decision blockers. If an older engine created a validation assignment without the canonical plan IDs and then emitted the exact validation-coverage blocker, update the engine and use the narrowly guarded recovery command:
+
+```bash
+"$ORCHESTRATOR" retry-validation-evidence "$RUN_DIR" --worker-runtime auto
+```
+
+This command rejects every other blocker and reruns validation with a new plan-hash-bound assignment; it does not weaken ordinary code-blocker handling.
 
 ## Mandatory plan-review interrupt
 

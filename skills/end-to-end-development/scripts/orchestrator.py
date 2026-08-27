@@ -139,6 +139,11 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
     ) as (engine, graph, config):
         if args.command == "resume":
             engine.resume_external_blockers()
+        elif args.command == "retry-validation-evidence":
+            if not engine.retry_validation_evidence():
+                raise WorkflowError(
+                    "run is not blocked by the exact validation-coverage evidence condition"
+                )
         attempt_baseline = len(engine.load_agents()["agents"])
         snapshot = graph.get_state(config)
         if isinstance(graph_input, Command):
@@ -216,6 +221,16 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--report-root", type=Path)
 
+    validation_retry = subparsers.add_parser(
+        "retry-validation-evidence",
+        help="retry an exact validation-coverage blocker after fixing the engine",
+    )
+    validation_retry.add_argument("run_dir", type=Path)
+    validation_retry.add_argument(
+        "--worker-runtime", choices=["auto", "codex", "pi"], default="auto"
+    )
+    validation_retry.add_argument("--report-root", type=Path)
+
     approve = subparsers.add_parser(
         "approve", help="resume an exact pending plan bundle"
     )
@@ -272,6 +287,14 @@ def main() -> int:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": "resume"},
+            )
+        elif args.command == "retry-validation-evidence":
+            output = _invoke(
+                args,
+                {
+                    "run_dir": str(args.run_dir.resolve()),
+                    "last_transition": "retry-validation-evidence",
+                },
             )
         elif args.command == "approve":
             output = _invoke(

@@ -375,6 +375,39 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_validation_evidence(self) -> bool:
+        """Retry only the exact validation-coverage blocker after an engine fix."""
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            if (
+                run["status"] != "blocked"
+                or run["phase"] != "validate"
+                or not run["blockers"]
+            ):
+                return False
+            expected_summaries = {
+                f"Validation for {repo_id} did not cover the current tree and planned checks."
+                for repo_id in run["repositories"]
+            }
+            if any(
+                blocker["kind"] != "code"
+                or blocker["summary"] not in expected_summaries
+                or blocker["required_action"]
+                != "Correct the validation evidence before resuming."
+                for blocker in run["blockers"]
+            ):
+                return False
+            run["status"] = "working"
+            run["blockers"] = []
+            for repository in run["repositories"].values():
+                if repository["status"] == "blocked":
+                    repository["status"] = "pending"
+            self._save_run(run)
+        self._append_event(
+            "resumed", reason="retry-validation-evidence", next_action="validate"
+        )
+        return True
+
     def reconcile(self) -> str:
         """Validate durable facts and recover completed outputs after a crash."""
         cleanup_outcomes = workflow_tools.retry_worker_cleanups(run_dir=self.run_dir)

@@ -865,6 +865,47 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertFalse(engine.resume_external_blockers())
         self.assertEqual("blocked", engine.load_run()["status"])
 
+    def test_explicit_validation_evidence_retry_clears_only_coverage_blocker(
+        self,
+    ) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+        review_hash = engine.load_run()["plan_review"]["review_sha256"]
+        engine.apply_plan_decision(
+            {
+                "decision": "approve",
+                "review_sha256": review_hash,
+                "text": "I approve all plans in this exact complete review bundle.",
+            }
+        )
+        engine._set_phase("validate")
+        engine._block(
+            summary=(
+                "Validation for api did not cover the current tree and planned checks."
+            ),
+            evidence_path=self.run_dir / "run.json",
+            required_action="Correct the validation evidence before resuming.",
+            kind="code",
+            repo_id="api",
+        )
+
+        self.assertTrue(engine.retry_validation_evidence())
+        run = engine.load_run()
+        self.assertEqual("working", run["status"])
+        self.assertEqual([], run["blockers"])
+        self.assertEqual("pending", run["repositories"]["api"]["status"])
+
+        engine._block(
+            summary="A material code decision is required.",
+            evidence_path=self.run_dir / "logs" / "code.log",
+            required_action="Revise the accepted design.",
+            kind="code",
+        )
+        self.assertFalse(engine.retry_validation_evidence())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
     def test_crash_recovery_closes_a_worker_that_already_wrote_its_output(self) -> None:
         fake = FakePlanningBatch()
         engine = self.initialize(fake)
