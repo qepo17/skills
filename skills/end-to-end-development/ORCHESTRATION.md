@@ -21,7 +21,7 @@ A run-scoped execution lock permits only one advancing graph invocation at a tim
 6. Record the accepted hash reference and release the lease.
 7. Checkpoint the graph superstep.
 
-On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
+On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. A worker retained at the timeout boundary is reclassified as settled and cleaned when its durable exit-status file appears later. Invalid or absent output follows the recorded replacement limit.
 
 ## Executable graph
 

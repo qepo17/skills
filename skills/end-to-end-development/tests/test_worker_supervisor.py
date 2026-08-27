@@ -439,6 +439,59 @@ class WorkerCommandTests(unittest.TestCase):
         retried = supervisor.retry_cleanups()
         self.assertEqual("complete", retried[0]["cleanup_status"])
 
+    def test_retry_cleanup_reaps_a_timed_out_worker_after_status_appears(self) -> None:
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("direct", "pi", "fallback", {}),
+        )
+        status_path = self.run_dir / "supervisor" / "status" / "late.json"
+        status_path.parent.mkdir(parents=True)
+        status_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "finished_at": "2026-08-26T10:05:00Z",
+                    "exit_code": 0,
+                    "error": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        record_path = self.run_dir / "supervisor" / supervisor.record_name(
+            "deliver:api:late"
+        )
+        record_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action_id": "deliver:api:late",
+                    "agent_name": "late-worker",
+                    "backend": "direct",
+                    "runtime": "pi",
+                    "handle_id": "4242",
+                    "started_at": "2026-08-26T09:59:00Z",
+                    "ended_at": "2026-08-26T10:00:00Z",
+                    "status": "timeout",
+                    "cleanup_status": "retained",
+                    "cleanup_error": None,
+                    "status_path": str(status_path),
+                    "stdout_path": str(self.run_dir / "stdout.log"),
+                    "stderr_path": str(self.run_dir / "stderr.log"),
+                    "details": {"pid": 4242},
+                    "record_path": str(record_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        outcomes = supervisor.retry_cleanups()
+
+        self.assertEqual(1, len(outcomes))
+        self.assertEqual("complete", outcomes[0]["cleanup_status"])
+        persisted = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual("settled", persisted["status"])
+        self.assertEqual("complete", persisted["cleanup_status"])
+
     def test_herdr_batch_uses_current_workspace_agent_lifecycle(self) -> None:
         runner = FakeCommandRunner(
             {

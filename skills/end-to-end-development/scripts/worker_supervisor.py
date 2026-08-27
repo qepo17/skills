@@ -794,10 +794,30 @@ class WorkerSupervisor:
                 record = json.loads(record_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            late_settled = False
+            if (
+                record.get("status") == "timeout"
+                and record.get("cleanup_status") == "retained"
+            ):
+                try:
+                    status = json.loads(
+                        Path(record["status_path"]).read_text(encoding="utf-8")
+                    )
+                except (KeyError, OSError, json.JSONDecodeError):
+                    status = {}
+                late_settled = bool(status.get("finished_at")) and isinstance(
+                    status.get("exit_code"), int
+                )
             if (
                 record.get("backend") != self.context.backend
-                or record.get("status") not in {"settled", "failed"}
-                or record.get("cleanup_status") not in {"pending", "failed"}
+                or (
+                    record.get("status") not in {"settled", "failed"}
+                    and not late_settled
+                )
+                or (
+                    record.get("cleanup_status") not in {"pending", "failed"}
+                    and not late_settled
+                )
                 or not isinstance(record.get("handle_id"), str)
             ):
                 continue
@@ -810,6 +830,8 @@ class WorkerSupervisor:
                 cleanup_status, cleanup_error = self._cleanup(handle, True)
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                 cleanup_status, cleanup_error = "failed", str(error)
+            if late_settled:
+                record["status"] = "settled"
             record["cleanup_status"] = cleanup_status
             record["cleanup_error"] = cleanup_error
             self._atomic_write(record_path, record)
