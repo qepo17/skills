@@ -7,6 +7,7 @@ Profiled stage fields:
 - contract: optional `contract_revision`, distinct from a worker replacement attempt;
 - plan: optional `plan_revision`; a non-challenge revision also carries `revision_basis` with `kind` and a hash-pinned `artifact`;
 - implementation: one `packet_id` and one to three sorted `task_ids` (up to four for fast);
+- validation: every exact sorted validation ID from the canonical plan, paired with the assigned commands;
 - review fixes: all compatible sorted `finding_ids` for that repository/round;
 - validation fixes: compatible sorted `validation_ids`;
 - round-two review: the sorted finding IDs it verifies.

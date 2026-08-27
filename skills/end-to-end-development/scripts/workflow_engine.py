@@ -375,6 +375,39 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_validation_evidence(self) -> bool:
+        """Retry only the exact validation-coverage blocker after an engine fix."""
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            if (
+                run["status"] != "blocked"
+                or run["phase"] != "validate"
+                or not run["blockers"]
+            ):
+                return False
+            expected_summaries = {
+                f"Validation for {repo_id} did not cover the current tree and planned checks."
+                for repo_id in run["repositories"]
+            }
+            if any(
+                blocker["kind"] != "code"
+                or blocker["summary"] not in expected_summaries
+                or blocker["required_action"]
+                != "Correct the validation evidence before resuming."
+                for blocker in run["blockers"]
+            ):
+                return False
+            run["status"] = "working"
+            run["blockers"] = []
+            for repository in run["repositories"].values():
+                if repository["status"] == "blocked":
+                    repository["status"] = "pending"
+            self._save_run(run)
+        self._append_event(
+            "resumed", reason="retry-validation-evidence", next_action="validate"
+        )
+        return True
+
     def reconcile(self) -> str:
         """Validate durable facts and recover completed outputs after a crash."""
         cleanup_outcomes = workflow_tools.retry_worker_cleanups(run_dir=self.run_dir)
@@ -779,7 +812,7 @@ class WorkflowEngine:
             assignment["task_ids"] = []
         if stage not in {"fix-1", "fix-2", "review-2"}:
             assignment["finding_ids"] = []
-        if stage != "validation-fix":
+        if stage not in {"validate", "validation-fix"}:
             assignment["validation_ids"] = []
         if write:
             review = run.get("plan_review")
@@ -1213,6 +1246,10 @@ class WorkflowEngine:
     def _plan_commands(self, repo_id: str) -> list[str]:
         _, plan = self._current_plan(repo_id)
         return [validation["command"] for validation in plan["validations"]]
+
+    def _plan_validation_ids(self, repo_id: str) -> list[str]:
+        _, plan = self._current_plan(repo_id)
+        return [validation["id"] for validation in plan["validations"]]
 
     def _latest_writer_artifact(
         self, repo_id: str
@@ -2172,8 +2209,11 @@ class WorkflowEngine:
         fingerprint = workflow_tools.worktree_fingerprint(
             Path(run["repositories"][repo_id]["worktree"])
         )
+        plan_path, _ = self._current_plan(repo_id)
         latest_writer = self._latest_writer_artifact(repo_id)
-        context_material = fingerprint
+        context_material = (
+            f"{fingerprint}:validation-ids-v1:{plan_path}:{_sha256(plan_path)}"
+        )
         if latest_writer is not None:
             context_material += f":{latest_writer[0]}:{_sha256(latest_writer[0])}"
         context_hash = hashlib.sha256(context_material.encode()).hexdigest()[:12]
@@ -2184,9 +2224,11 @@ class WorkflowEngine:
             inputs=self._canonical_inputs(run, repo_id),
             instructions=[
                 "Run every assigned focused and broad check once and preserve full output in logs.",
+                "Use the exact assigned validation ID for each planned command.",
                 "Reuse evidence only when validation ID, exact command hash, and tree fingerprint match.",
             ],
             validation_commands=self._plan_commands(repo_id),
+            validation_ids=self._plan_validation_ids(repo_id),
         )
 
     def _failed_validation_ids(self, artifact: dict[str, Any]) -> list[str]:

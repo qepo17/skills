@@ -308,8 +308,13 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                 )
                 fingerprint = self._fingerprint(worktree)
                 records = []
-                for index, command in enumerate(
-                    assignment["validation_commands"], start=1
+                assigned_validations = zip(
+                    assignment["validation_ids"],
+                    assignment["validation_commands"],
+                    strict=True,
+                )
+                for index, (validation_id, command) in enumerate(
+                    assigned_validations, start=1
                 ):
                     evidence = (
                         log_dir / f"validation-{len(self.assignments)}-{index}.log"
@@ -317,7 +322,7 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                     evidence.write_text("pass\n", encoding="utf-8")
                     records.append(
                         {
-                            "id": "API-VAL-001",
+                            "id": validation_id,
                             "command": command,
                             "command_sha256": __import__("hashlib")
                             .sha256(command.encode())
@@ -860,6 +865,47 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertFalse(engine.resume_external_blockers())
         self.assertEqual("blocked", engine.load_run()["status"])
 
+    def test_explicit_validation_evidence_retry_clears_only_coverage_blocker(
+        self,
+    ) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+        review_hash = engine.load_run()["plan_review"]["review_sha256"]
+        engine.apply_plan_decision(
+            {
+                "decision": "approve",
+                "review_sha256": review_hash,
+                "text": "I approve all plans in this exact complete review bundle.",
+            }
+        )
+        engine._set_phase("validate")
+        engine._block(
+            summary=(
+                "Validation for api did not cover the current tree and planned checks."
+            ),
+            evidence_path=self.run_dir / "run.json",
+            required_action="Correct the validation evidence before resuming.",
+            kind="code",
+            repo_id="api",
+        )
+
+        self.assertTrue(engine.retry_validation_evidence())
+        run = engine.load_run()
+        self.assertEqual("working", run["status"])
+        self.assertEqual([], run["blockers"])
+        self.assertEqual("pending", run["repositories"]["api"]["status"])
+
+        engine._block(
+            summary="A material code decision is required.",
+            evidence_path=self.run_dir / "logs" / "code.log",
+            required_action="Revise the accepted design.",
+            kind="code",
+        )
+        self.assertFalse(engine.retry_validation_evidence())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
     def test_crash_recovery_closes_a_worker_that_already_wrote_its_output(self) -> None:
         fake = FakePlanningBatch()
         engine = self.initialize(fake)
@@ -1072,6 +1118,33 @@ class WorkflowEngineTests(unittest.TestCase):
             first_review["review_sha256"], run["plan_review"]["review_sha256"]
         )
         self.assertEqual("awaiting-user", run["status"])
+
+    def test_validation_assignment_propagates_planned_validation_ids(self) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+
+        from workflow_tools import worktree_fingerprint
+
+        fingerprint = worktree_fingerprint(self.worktree)
+        legacy_hash = hashlib.sha256(fingerprint.encode()).hexdigest()[:12]
+        legacy_path = engine.build_assignment(
+            stage="validate",
+            repo_id="api",
+            scope=f"post-implementation-{legacy_hash}",
+            instructions=["Run the planned checks."],
+            validation_commands=engine._plan_commands("api"),
+        )
+        legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        self.assertEqual([], legacy["validation_ids"])
+
+        assignment_path = engine._validation_assignment("api", "post-implementation")
+        assignment = json.loads(assignment_path.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(legacy_path, assignment_path)
+        self.assertEqual(["API-VAL-001"], assignment["validation_ids"])
+        self.assertEqual(["python -m unittest"], assignment["validation_commands"])
 
     def test_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
         fake = FakeSuccessfulBatch(fail_first_validation=True)

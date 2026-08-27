@@ -120,6 +120,14 @@ Resume ordinary recoverable execution:
 "$ORCHESTRATOR" resume "$RUN_DIR" --worker-runtime auto
 ```
 
+After updating an engine that emitted the exact validation-coverage blocker from an ID-less validation assignment, use the guarded recovery transition:
+
+```bash
+"$ORCHESTRATOR" retry-validation-evidence "$RUN_DIR" --worker-runtime auto
+```
+
+It accepts only that exact validate-phase blocker and creates a new assignment bound to the canonical plan hash and validation IDs. It does not clear other code, dependency, or decision blockers.
+
 A pending plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording:
 
 ```bash
