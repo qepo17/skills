@@ -1146,6 +1146,27 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(["API-VAL-001"], assignment["validation_ids"])
         self.assertEqual(["python -m unittest"], assignment["validation_commands"])
 
+    def test_review_assignment_uses_unambiguous_completion_and_status_evidence(
+        self,
+    ) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+
+        assignment_path = engine._review_assignment("api", 1, [])
+        assignment = json.loads(assignment_path.read_text(encoding="utf-8"))
+
+        self.assertIn("round-1-evidence-v1", assignment["action_id"])
+        self.assertIn(
+            "A finished review has status complete even when it reports must-fix findings; use blocked only when the review itself cannot finish.",
+            assignment["instructions"],
+        )
+        self.assertIn(
+            "Write reviewed_status_path as the exact final git status --short output with no commentary.",
+            assignment["instructions"],
+        )
+
     def test_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
         fake = FakeSuccessfulBatch(fail_first_validation=True)
         engine = self.initialize(fake)

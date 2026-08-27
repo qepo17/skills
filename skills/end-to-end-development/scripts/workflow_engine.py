@@ -2338,13 +2338,15 @@ class WorkflowEngine:
         return self.build_assignment(
             stage=stage,
             repo_id=repo_id,
-            scope=f"round-{round_number}",
+            scope=f"round-{round_number}-evidence-v1",
             inputs=self._canonical_inputs(self.load_run(), repo_id),
             instructions=[
                 "Review the complete baseline-to-worktree change independently."
                 if round_number == 1
                 else "Verify only the assigned findings, their fixes, and affected hunks.",
                 "Report actionable correctness/spec findings without duplicating passing tool output.",
+                "A finished review has status complete even when it reports must-fix findings; use blocked only when the review itself cannot finish.",
+                "Write reviewed_status_path as the exact final git status --short output with no commentary.",
             ],
             finding_ids=finding_ids,
         )

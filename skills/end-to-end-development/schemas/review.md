@@ -15,6 +15,8 @@ Each finding contains stable ID, category (`standards` or `spec`), severity, act
 - Do not repeat style findings enforced by passing tooling.
 - Check contract/plan conformance and complexity drift.
 - Reviewers never edit project files.
+- A review that finished examining the assigned tree uses `status: complete`, including when it reports `must-fix` findings. Use `status: blocked` and `blockers` only when the review itself could not finish.
+- `reviewed_status_path` contains only the exact final `git status --short` output for the assigned worktree; keep commentary and conclusions in the review artifact or separate logs.
 
 Validate before returning:
 
