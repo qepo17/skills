@@ -408,6 +408,35 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_dependent_fixes(self) -> bool:
+        """Retry only a fix blocked by a concurrently changed upstream contract."""
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            if (
+                run["status"] != "blocked"
+                or run["phase"] not in {"fix-1", "fix-2"}
+                or not run["blockers"]
+            ):
+                return False
+            if any(
+                blocker["kind"] != "dependency"
+                or "worktree bundle is not the hash-pinned accepted bundle used by"
+                not in blocker["summary"]
+                or not Path(blocker["evidence_path"]).is_file()
+                for blocker in run["blockers"]
+            ):
+                return False
+            run["status"] = "working"
+            run["blockers"] = []
+            for repository in run["repositories"].values():
+                if repository["status"] == "blocked":
+                    repository["status"] = "pending"
+            self._save_run(run)
+        self._append_event(
+            "resumed", reason="retry-dependent-fixes", next_action=run["phase"]
+        )
+        return True
+
     def reconcile(self) -> str:
         """Validate durable facts and recover completed outputs after a crash."""
         cleanup_outcomes = workflow_tools.retry_worker_cleanups(run_dir=self.run_dir)
@@ -2373,41 +2402,106 @@ class WorkflowEngine:
         return self._after_reviews()
 
     def _fix_complete(self, repo_id: str, stage: str, finding_ids: list[str]) -> bool:
-        for _path, artifact, assignment in reversed(
+        return self._latest_complete_fix(repo_id, stage, finding_ids) is not None
+
+    def _latest_complete_fix(
+        self, repo_id: str, stage: str, finding_ids: list[str]
+    ) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
+        for item in reversed(
             self._artifacts(repo_id=repo_id, stage=stage, kind="result")
         ):
+            _path, artifact, assignment = item
             if (
                 artifact.get("status") == "complete"
                 and assignment.get("finding_ids") == finding_ids
             ):
-                return True
-        return False
+                return item
+        return None
+
+    def _contract_dependencies(self) -> dict[str, set[str]]:
+        run = self.load_run()
+        dependencies = {repo_id: set() for repo_id in run["repositories"]}
+        if not run.get("contract_path"):
+            return dependencies
+        contract = _load_json(Path(run["contract_path"]))
+        for dependency in contract.get("dependencies", []):
+            dependencies[dependency["from_repo_id"]].add(
+                dependency["to_repo_id"]
+            )
+        return dependencies
 
     def _phase_fix(self, round_number: int) -> str:
         stage = f"fix-{round_number}"
         run = self.load_run()
-        assignments: list[Path] = []
+        dependencies = self._contract_dependencies()
+        finding_ids_by_repo: dict[str, list[str]] = {}
         for repo_id in sorted(run["repositories"]):
             review_item = self._latest_review(repo_id, round_number)
-            if review_item is None:
+            finding_ids_by_repo[repo_id] = (
+                []
+                if review_item is None
+                else [
+                    finding["id"] for finding in self._must_fix(review_item[1])
+                ]
+            )
+
+        assignments: list[Path] = []
+        for repo_id in sorted(run["repositories"]):
+            ids = finding_ids_by_repo[repo_id]
+            if not ids or self._fix_complete(repo_id, stage, ids):
                 continue
-            findings = self._must_fix(review_item[1])
-            ids = [finding["id"] for finding in findings]
-            if ids and not self._fix_complete(repo_id, stage, ids):
-                assignments.append(
-                    self.build_assignment(
-                        stage=stage,
-                        repo_id=repo_id,
-                        scope="all-findings",
-                        inputs=self._canonical_inputs(run, repo_id),
-                        instructions=[
-                            "Resolve every assigned must-fix finding in one compatible batch.",
-                            "Run affected checks once after all fixes and record every resolution.",
-                        ],
-                        validation_commands=self._plan_commands(repo_id),
-                        finding_ids=ids,
-                    )
+            dependency_fixes: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
+            waiting = False
+            for dependency_repo_id in sorted(dependencies[repo_id]):
+                dependency_ids = finding_ids_by_repo[dependency_repo_id]
+                if not dependency_ids:
+                    continue
+                dependency_fix = self._latest_complete_fix(
+                    dependency_repo_id, stage, dependency_ids
                 )
+                if dependency_fix is None:
+                    waiting = True
+                    break
+                dependency_fixes.append(dependency_fix)
+            if waiting:
+                continue
+
+            dependency_material = ":".join(
+                f"{path}:{_sha256(path)}" for path, _artifact, _assignment in dependency_fixes
+            )
+            dependency_hash = hashlib.sha256(
+                f"dependent-fix-v1:{dependency_material}".encode()
+            ).hexdigest()[:12]
+            inputs = self._canonical_inputs(run, repo_id) + [
+                path for path, _artifact, _assignment in dependency_fixes
+            ]
+            scoped_repositories = []
+            for scoped_repo_id in sorted({repo_id} | dependencies[repo_id]):
+                repository = run["repositories"][scoped_repo_id]
+                scoped_repositories.append(
+                    {
+                        "repo_id": scoped_repo_id,
+                        "root": repository["root"],
+                        "worktree": repository["worktree"],
+                        "access": "write" if scoped_repo_id == repo_id else "read",
+                    }
+                )
+            assignments.append(
+                self.build_assignment(
+                    stage=stage,
+                    repo_id=repo_id,
+                    scope=f"all-findings-{dependency_hash}",
+                    inputs=inputs,
+                    instructions=[
+                        "Resolve every assigned must-fix finding in one compatible batch.",
+                        "Run affected checks once after all fixes and record every resolution.",
+                        "Accepted upstream fix artifacts in the assignment supersede earlier generated-contract provenance; regenerate from the current read-only upstream worktrees.",
+                    ],
+                    validation_commands=self._plan_commands(repo_id),
+                    finding_ids=ids,
+                    extras={"repositories": scoped_repositories},
+                )
+            )
         if assignments:
             artifacts = self._run_with_replacements(assignments)
             for artifact in artifacts:

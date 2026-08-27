@@ -101,6 +101,14 @@ Never edit `run.json`, `agents.json`, `events.jsonl`, assignments, or LangGraph 
 
 This command rejects every other blocker and reruns validation with a new plan-hash-bound assignment; it does not weaken ordinary code-blocker handling.
 
+If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
+
+```bash
+"$ORCHESTRATOR" retry-dependent-fixes "$RUN_DIR" --worker-runtime auto
+```
+
+The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
+
 ## Mandatory plan-review interrupt
 
 When the graph returns `status: awaiting-user` and `phase: plan-review`:

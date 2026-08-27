@@ -128,6 +128,14 @@ After updating an engine that emitted the exact validation-coverage blocker from
 
 It accepts only that exact validate-phase blocker and creates a new assignment bound to the canonical plan hash and validation IDs. It does not clear other code, dependency, or decision blockers.
 
+After updating an engine that ran a dependent fix concurrently with an upstream contract fix and emitted the exact hash-pinned bundle-drift blocker, use:
+
+```bash
+"$ORCHESTRATOR" retry-dependent-fixes "$RUN_DIR" --worker-runtime auto
+```
+
+This guarded transition accepts only that fix-phase blocker. Remaining fixes follow the shared contract's dependency order, receive accepted upstream fix artifacts as hash-pinned inputs, and get read-only access to upstream worktrees.
+
 A pending plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording:
 
 ```bash
