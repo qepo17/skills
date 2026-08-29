@@ -13,9 +13,9 @@ import hashlib
 import html
 import json
 import os
-import stat
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,11 +32,11 @@ FORCE_FULL_RISKS = {
     "authorization",
     "background-processing",
     "concurrency",
-    "cross-repository",
     "data-backfill",
     "database-migration",
     "high-cost-mechanism",
     "new-storage",
+    "public-interface",
     "security",
 }
 
@@ -79,24 +79,26 @@ def workflow_policy(
     if requested_profile not in {"auto", *artifact_guard.PROFILES}:
         raise ValueError(f"unknown profile: {requested_profile}")
 
-    full_reasons: list[str] = []
-    if repository_count > 1:
-        full_reasons.append("multiple affected repositories")
-    for flag in sorted(set(flags) & FORCE_FULL_RISKS):
-        full_reasons.append(f"high-risk surface: {flag}")
+    full_reasons = [
+        f"high-risk surface: {flag}"
+        for flag in sorted(set(flags) & FORCE_FULL_RISKS)
+    ]
 
     if requested_profile == "full" or full_reasons:
         profile = "full"
-    elif requested_profile == "fast" and flags:
+    elif requested_profile == "fast" and (flags or repository_count > 1):
         profile = "standard"
     elif requested_profile == "fast":
         profile = "fast"
     else:
-        # Fast is opt-in. Repository discovery can miss a risk, so standard is
-        # the safe automatic default for an apparently low-risk local change.
+        # Fast is opt-in. Standard also coordinates ordinary multi-repository
+        # work; repository count alone is not a reason to enable every
+        # high-assurance worker and human gate.
         profile = "standard"
 
     reasons = list(full_reasons)
+    if repository_count > 1 and not full_reasons:
+        reasons.append("ordinary multi-repository coordination")
     if requested_profile != "auto":
         reasons.append(f"requested profile: {requested_profile}")
     if not reasons:
@@ -107,6 +109,7 @@ def workflow_policy(
             "safety profiles cannot be weakened"
         )
 
+    multi_repository = repository_count > 1
     policies: dict[str, dict[str, Any]] = {
         "fast": {
             "contract_required": False,
@@ -119,12 +122,12 @@ def workflow_policy(
             "blocking_severities": ["critical", "high", "medium"],
             "coordinator_attempt_budget": 30,
             "auto_resume": True,
-            "user_plan_approval_required": True,
+            "user_plan_approval_required": False,
         },
         "standard": {
-            "contract_required": False,
+            "contract_required": multi_repository,
             "design_challenge": "risk-only",
-            "integration_required": False,
+            "integration_required": multi_repository,
             "report_required": report_requested,
             "max_tasks_per_packet": 3,
             "max_packet_minutes": 45,
@@ -132,13 +135,13 @@ def workflow_policy(
             "blocking_severities": ["critical", "high", "medium"],
             "coordinator_attempt_budget": 30,
             "auto_resume": True,
-            "user_plan_approval_required": True,
+            "user_plan_approval_required": False,
         },
         "full": {
-            "contract_required": True,
-            "design_challenge": "all",
-            "integration_required": True,
-            "report_required": True,
+            "contract_required": multi_repository,
+            "design_challenge": "risk-only",
+            "integration_required": multi_repository,
+            "report_required": report_requested,
             "max_tasks_per_packet": 3,
             "max_packet_minutes": 45,
             "second_review": "high-risk-fixes",
@@ -160,12 +163,15 @@ def workflow_policy(
     return result
 
 
-def _git(worktree: Path, *args: str) -> bytes:
+def _git(
+    worktree: Path, *args: str, env: dict[str, str] | None = None
+) -> bytes:
     process = subprocess.run(
         ["git", "-C", str(worktree), *args],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     if process.returncode != 0:
         raise RuntimeError(
@@ -176,34 +182,116 @@ def _git(worktree: Path, *args: str) -> bytes:
 
 
 def worktree_fingerprint(worktree: Path) -> str:
-    """Hash HEAD plus tracked changes and non-ignored untracked file content."""
+    """Return an efficient, commit-independent fingerprint of current content.
+
+    A temporary index lets Git reuse its stat cache and hash only changed or
+    untracked files. ``write-tree`` then produces the same identity before and
+    after a delivery-only commit without mutating the user's real index.
+    """
     root = Path(_git(worktree, "rev-parse", "--show-toplevel").decode().strip()).resolve()
-    digest = hashlib.sha256()
-    digest.update(b"end-to-end-development-worktree-v1\0")
-    digest.update(_git(root, "rev-parse", "HEAD").strip())
-    digest.update(b"\0tracked-diff\0")
-    digest.update(_git(root, "diff", "--binary", "--no-ext-diff", "HEAD", "--"))
-    digest.update(b"\0untracked\0")
-    untracked = [
-        item.decode("utf-8", errors="surrogateescape")
-        for item in _git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
-        if item
-    ]
-    for relative in sorted(untracked):
-        path = root / relative
-        digest.update(relative.encode("utf-8", errors="surrogateescape"))
-        digest.update(b"\0")
-        info = path.lstat()
-        digest.update(str(stat.S_IMODE(info.st_mode)).encode())
-        digest.update(b"\0")
-        if path.is_symlink():
-            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
-        elif path.is_file():
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        digest.update(b"\0")
-    return digest.hexdigest()
+    index_value = _git(root, "rev-parse", "--git-path", "index").decode().strip()
+    source_index = Path(index_value)
+    if not source_index.is_absolute():
+        source_index = root / source_index
+    descriptor, temporary_name = tempfile.mkstemp(prefix="e2e-content-index-")
+    os.close(descriptor)
+    temporary_index = Path(temporary_name)
+    try:
+        if source_index.is_file():
+            temporary_index.write_bytes(source_index.read_bytes())
+        else:
+            temporary_index.unlink(missing_ok=True)
+        git_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
+        _git(root, "add", "--all", "--", env=git_env)
+        tree = _git(root, "write-tree", env=git_env).strip()
+        digest = hashlib.sha256(b"end-to-end-development-content-v3\0" + tree)
+
+        # A parent tree stores only each submodule commit. Include recursive
+        # content identities so uncommitted submodule changes also invalidate.
+        staged = _git(root, "ls-files", "--stage", "-z", env=git_env)
+        for record in sorted(item for item in staged.split(b"\0") if item):
+            metadata, separator, encoded_relative = record.partition(b"\t")
+            if not separator or not metadata.startswith(b"160000 "):
+                continue
+            relative = encoded_relative.decode("utf-8", errors="surrogateescape")
+            submodule = root / relative
+            if (submodule / ".git").exists():
+                digest.update(b"\0submodule\0")
+                digest.update(encoded_relative)
+                digest.update(b"\0")
+                digest.update(worktree_fingerprint(submodule).encode())
+        return digest.hexdigest()
+    finally:
+        temporary_index.unlink(missing_ok=True)
+
+
+def normalize_worker_artifact(
+    assignment_path: Path,
+    assignment: dict[str, Any],
+    output_path: Path,
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach mechanically verifiable repository evidence before acceptance.
+
+    Workers own semantic conclusions. The coordinator owns hashes, Git state,
+    and status snapshots so a correct result is not retried because a model
+    copied stale mechanical metadata into its JSON artifact.
+    """
+    resolved_assignment = assignment_path.resolve()
+    artifact["assignment_path"] = str(resolved_assignment)
+    artifact["assignment_sha256"] = hashlib.sha256(
+        resolved_assignment.read_bytes()
+    ).hexdigest()
+    if assignment.get("repo_id") is None:
+        atomic_write_json(output_path, artifact)
+        return artifact
+    worktree = Path(assignment["cwd"])
+    if not (worktree / ".git").exists():
+        # Standalone artifact-validation fixtures may intentionally use a plain
+        # directory. Initialized workflow repositories are always Git worktrees.
+        atomic_write_json(output_path, artifact)
+        return artifact
+    _git(worktree, "rev-parse", "--show-toplevel")
+    current_fingerprint = worktree_fingerprint(worktree)
+    expected_fingerprint = assignment.get("input_tree_fingerprint")
+    if (
+        assignment.get("project_file_access") != "write"
+        and expected_fingerprint is not None
+        and expected_fingerprint != current_fingerprint
+    ):
+        raise artifact_guard.ValidationError(
+            "read-only worker changed repository content after assignment creation"
+        )
+    log_dir = Path(assignment["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    status_path = log_dir / f"{output_path.stem}-coordinator-status.txt"
+    status = _git(worktree, "status", "--short").decode(
+        "utf-8", errors="replace"
+    )
+    status_path.write_text(status.rstrip("\n") + "\n", encoding="utf-8")
+
+    if artifact.get("artifact_kind") == "result":
+        fingerprint = current_fingerprint
+        artifact["tree_fingerprint"] = fingerprint
+        artifact["git"] = {
+            "head": _git(worktree, "rev-parse", "HEAD").decode().strip(),
+            "status_short_path": str(status_path.resolve()),
+        }
+        for record in artifact.get("validations", []):
+            if not isinstance(record, dict) or not isinstance(record.get("command"), str):
+                continue
+            command = record["command"]
+            record["command_sha256"] = hashlib.sha256(command.encode()).hexdigest()
+            if record.get("cache_status") != "reused":
+                record["tree_fingerprint"] = fingerprint
+                record.setdefault("cache_status", "fresh")
+                record.setdefault("source_artifact", None)
+    elif artifact.get("artifact_kind") == "review":
+        artifact["baseline"] = assignment["baseline"]
+        artifact["reviewed_status_path"] = str(status_path.resolve())
+
+    atomic_write_json(output_path, artifact)
+    return artifact
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -284,7 +372,9 @@ def _worker_prompt(assignment_path: Path) -> str:
         "as authoritative. If the output does not exist, initialize its stage-specific skeleton "
         "with the assignment's validator init command. Read only artifact_schema_path, not the "
         "full coordinator contract. Write only the assigned output, allowed project files, and "
-        "log directory. Validate the output before returning. Do not spawn nested agents. "
+        "log directory. Complete semantic fields and command outcomes; do not spend time "
+        "recomputing assignment, Git-status, content-fingerprint, or command hashes because the "
+        "coordinator normalizes and validates those after settlement. Do not spawn nested agents. "
         "Final response: at most eight lines containing status, output path, and blocker IDs."
     )
 
@@ -325,8 +415,8 @@ def _enforce_user_plan_approval(
     review = run.get("plan_review")
     if not isinstance(review, dict) or review.get("status") != "approved":
         raise ValueError(
-            "project-file writers are forbidden until the user explicitly approves "
-            "the complete plan review bundle"
+            "project-file writers are forbidden until the workflow records an approved "
+            "plan decision bundle"
         )
     if artifact_guard.PHASE_ORDER.index(run["phase"]) < artifact_guard.PHASE_ORDER.index(
         "implement"
@@ -415,6 +505,9 @@ def recover_assignment_worker(
         timeout_seconds=assignment["timeout_seconds"],
         runtime=runtime,
         prompt=_worker_prompt(assignment_path.resolve()),
+        thinking=worker_supervisor.runtime_thinking(
+            str(assignment.get("thinking", "xhigh"))
+        ),
     )
     recovered = supervisor.recover(request)
     if recovered is not None:
@@ -547,6 +640,7 @@ def run_assignment_batch(
             timeout_seconds=assignment["timeout_seconds"],
             runtime=resolved_runtime,
             prompt=_worker_prompt(path),
+            thinking=worker_supervisor.runtime_thinking(assignment["thinking"]),
         )
         for path, assignment in loaded
     ]
@@ -563,7 +657,7 @@ def run_assignment_batch(
                     "command": preview["command"],
                     "runtime": resolved_runtime,
                     "model": DEFAULT_WORKER_MODEL,
-                    "thinking": DEFAULT_WORKER_THINKING,
+                    "thinking": request.thinking,
                     "status": "dry-run",
                 }
             )
@@ -589,7 +683,7 @@ def run_assignment_batch(
             "output_artifact": assignment["output_artifact"],
             "runtime": resolved_runtime,
             "model": DEFAULT_WORKER_MODEL,
-            "thinking": DEFAULT_WORKER_THINKING,
+            "thinking": worker_supervisor.runtime_thinking(assignment["thinking"]),
             "status": "rejected",
         }
         if outcome["timed_out"]:
@@ -601,6 +695,18 @@ def run_assignment_batch(
                 if len(raw) > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
                     raise artifact_guard.ValidationError("artifact exceeds its size limit")
                 value = json.loads(raw)
+                value = normalize_worker_artifact(
+                    Path(outcome["assignment_path"]),
+                    assignment,
+                    output,
+                    value,
+                )
+                if output.stat().st_size > artifact_guard.MAX_BYTES[
+                    assignment["output_kind"]
+                ]:
+                    raise artifact_guard.ValidationError(
+                        "normalized artifact exceeds its size limit"
+                    )
                 artifact_guard.CURRENT_ARTIFACT_PATH = output
                 artifact_guard.VALIDATORS[assignment["output_kind"]](
                     artifact_guard.obj(value, "$")

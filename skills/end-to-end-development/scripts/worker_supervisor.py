@@ -18,10 +18,23 @@ from typing import Any, Callable, Mapping
 
 DEFAULT_WORKER_MODEL = "gpt-5.6-luna"
 DEFAULT_WORKER_THINKING = "max"
+THINKING_BY_CLASSIFICATION = {
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
 WORKER_BACKENDS = {"direct", "herdr", "paseo", "tmux"}
 WORKER_RUNTIMES = {"codex", "pi"}
 
 RunProcess = Callable[[list[str], float | None], subprocess.CompletedProcess[bytes]]
+
+
+def runtime_thinking(classification: str) -> str:
+    try:
+        return THINKING_BY_CLASSIFICATION[classification]
+    except KeyError as exc:
+        raise ValueError(f"unknown thinking classification: {classification}") from exc
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,7 @@ class WorkerRequest:
     timeout_seconds: int
     runtime: str
     prompt: str
+    thinking: str = DEFAULT_WORKER_THINKING
 
 
 @dataclass(frozen=True)
@@ -252,7 +266,7 @@ def _runtime_command(
             "--model",
             DEFAULT_WORKER_MODEL,
             "--config",
-            f'model_reasoning_effort="{DEFAULT_WORKER_THINKING}"',
+            f'model_reasoning_effort="{request.thinking}"',
             "--cd",
             str(request.cwd),
             "--dangerously-bypass-approvals-and-sandbox",
@@ -267,7 +281,7 @@ def _runtime_command(
         "--model",
         f"openai-codex/{DEFAULT_WORKER_MODEL}",
         "--thinking",
-        DEFAULT_WORKER_THINKING,
+        request.thinking,
         request.prompt,
     ]
 
@@ -337,7 +351,7 @@ class WorkerSupervisor:
                     else f"openai-codex/{DEFAULT_WORKER_MODEL}"
                 ),
                 "--thinking",
-                DEFAULT_WORKER_THINKING,
+                request.thinking,
                 "--cwd",
                 str(request.cwd),
                 request.prompt,
@@ -456,14 +470,14 @@ class WorkerSupervisor:
                 "--model",
                 DEFAULT_WORKER_MODEL,
                 "--config",
-                f'model_reasoning_effort="{DEFAULT_WORKER_THINKING}"',
+                f'model_reasoning_effort="{request.thinking}"',
                 "--dangerously-bypass-approvals-and-sandbox",
             ]
         return [
             "--model",
             f"openai-codex/{DEFAULT_WORKER_MODEL}",
             "--thinking",
-            DEFAULT_WORKER_THINKING,
+            request.thinking,
         ]
 
     def _start_herdr(
@@ -566,7 +580,7 @@ class WorkerSupervisor:
                 else f"openai-codex/{DEFAULT_WORKER_MODEL}"
             ),
             "--thinking",
-            DEFAULT_WORKER_THINKING,
+            request.thinking,
             "--cwd",
             str(request.cwd),
             "--label",
