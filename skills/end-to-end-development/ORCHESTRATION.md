@@ -21,6 +21,8 @@ A run-scoped execution lock permits only one advancing graph invocation at a tim
 6. Record the accepted hash reference and release the lease.
 7. Checkpoint the graph superstep.
 
+At the artifact seam, the coordinator—not the worker—records assignment hashes, Git HEAD/status, content fingerprints, and command hashes. This keeps semantic worker conclusions independent from mechanical metadata and avoids replacing correct work for a stale copied status file.
+
 On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
 
 ## Executable graph
@@ -31,7 +33,7 @@ START
   -> bootstrap
   -> contract?
   -> plan <-> design challenge / bounded revision
-  -> plan_review (dynamic interrupt)
+  -> plan_review? (dynamic interrupt for full; policy decision otherwise)
   -> implement (packet scheduler)
   -> validate <-> validation-fix
   -> review_1 -> fix_1?
@@ -43,7 +45,7 @@ START
   -> END
 ```
 
-Every phase node returns to `reconcile`. Conditional policy is read from the validated `workflow_policy`; disabled phases are not executed. Repository batches are built lexicographically and handed to the existing concurrent `run-batch` supervisor in one call. `reconcile` also enforces `coordinator_attempt_budget` after an atomic batch and ends the current graph invocation with `budget-checkpoint`; the CLI starts a new bounded invocation automatically when policy enables `auto_resume`, without crossing a human interrupt.
+Every phase node returns to `reconcile`. Conditional policy is read from the validated `workflow_policy`; disabled phases are not executed. Fast/standard planning writes and policy-accepts the hash-pinned bundle in one transition, while full pauses at the dynamic interrupt. Repository batches are built lexicographically and handed to the concurrent supervisor in one call. `reconcile` also enforces `coordinator_attempt_budget` after an atomic batch and ends the current graph invocation with `budget-checkpoint`; the CLI starts a new bounded invocation automatically when policy enables `auto_resume`, without crossing a human interrupt.
 
 The graph state is deliberately small:
 
@@ -128,7 +130,7 @@ After updating an engine that emitted the exact validation-coverage blocker from
 
 It accepts only that exact validate-phase blocker and creates a new assignment bound to the canonical plan hash and validation IDs. It does not clear other code, dependency, or decision blockers.
 
-A pending plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording:
+A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 
 ```bash
 "$ORCHESTRATOR" approve "$RUN_DIR" \
@@ -167,7 +169,7 @@ The skill uses the locked project in this directory:
 - `langgraph==1.2.11`
 - `langgraph-checkpoint-sqlite==3.1.1`
 
-`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. `workflow_tools.py run-batch` delegates lifecycle to the auto-detected worker supervisor while LangGraph retains the immutable assignment and artifact protocol.
+`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. `workflow_tools.py run-batch` delegates lifecycle to the auto-detected worker supervisor while LangGraph retains the immutable assignment and artifact protocol. Launchers map assignment reasoning to runtime effort (`medium`, `high`, or `max` for `xhigh`) instead of using maximum reasoning for every stage.
 
 ## Testing seams
 

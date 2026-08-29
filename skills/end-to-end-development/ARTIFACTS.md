@@ -25,7 +25,8 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 - JSON contains concise facts, commands, exit codes, hashes, and evidence paths—not secrets, environment values, full diffs, source files, or command output.
 - A complete artifact has no blockers. A blocked artifact has at least one blocker.
 - Older schema-v1 runs without profile fields remain valid and behave as legacy `full` runs when resumed.
-- New profiled runs set `workflow_policy.user_plan_approval_required: true`. This policy is unconditional and cannot be disabled by a lower-risk profile. On resume, omission of this key in an older profiled run is still treated as approval-required before further project-file work.
+- New fast/standard runs set `workflow_policy.user_plan_approval_required: false`; full sets it to `true`. Every run still records an approved hash-pinned bundle before project-file work. On resume, omission of this key in an older profiled run is treated as approval-required for backward safety.
+- Before validation, the coordinator normalizes mechanical evidence (`assignment_sha256`, Git HEAD/status, content fingerprint, and command hashes). Workers remain responsible for semantic conclusions, command execution results, findings, and blockers.
 
 ## Directory layout
 
@@ -41,10 +42,10 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ├── .orchestrator-execution.lock         # one graph invocation per run
 ├── metrics.json                         # generated at completion
 ├── assignments/<action-id>.json
-├── plan-review-vN.md                    # complete hash-pinned user review bundle
+├── plan-review-vN.md                    # complete hash-pinned plan-decision bundle
 ├── plan-feedback-vN.json                # exact user-requested revision basis
 ├── profile-escalation-*.json            # deterministic escalation evidence
-├── contract-vN*.json                    # full profile only
+├── contract-vN*.json                    # coordinated multi-repository runs only
 ├── integration-*.json                   # when policy requires it
 ├── report-*.json                        # when policy requires it
 ├── supervisor/manifest-*.json           # graph-consumed batch manifests
@@ -109,7 +110,7 @@ The LangGraph control plane is the sole writer after initialization. New runs re
     "blocking_severities": ["critical", "high", "medium"],
     "coordinator_attempt_budget": 30,
     "auto_resume": true,
-    "user_plan_approval_required": true
+    "user_plan_approval_required": false
   },
   "worker_execution": {
     "schema_version": 1,
@@ -159,13 +160,13 @@ The LangGraph control plane is the sole writer after initialization. New runs re
 }
 ```
 
-Profiles are `fast`, `standard`, and `full`. Generate policy with `workflow_tools.py policy`; do not hand-weaken it. Multiple repositories or authorization, security, concurrency, migration, backfill, background-processing, storage, or comparable high-cost risk force `full`.
+Profiles are `fast`, `standard`, and `full`. Generate policy with `workflow_tools.py policy`; do not hand-weaken it. Ordinary multi-repository work uses standard with shared-contract and integration workers. Authorization, security, concurrency, migration, backfill, background-processing, storage, public-interface changes, or comparable high-cost risk force `full`; repository count and `cross-repository` alone do not.
 
-Run phases are `bootstrap`, `contract`, `plan`, `plan-review`, `implement`, `validate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `integrate`, `deliver`, `report`, `complete`, but conditional phases may be skipped according to `workflow_policy`. `plan-review` is never skipped. Repository stage uses the same values. Run status additionally permits `awaiting-user`, exclusively for a pending plan review.
+Run phases are `bootstrap`, `contract`, `plan`, `plan-review`, `implement`, `validate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `integrate`, `deliver`, `report`, `complete`, but conditional phases may be skipped according to `workflow_policy`. Every run creates a plan-decision bundle; only full enters `plan-review`. Repository stage uses the same values. Run status additionally permits `awaiting-user`, exclusively for a pending full review.
 
 A repository always needs a canonical accepted plan after planning. It needs a canonical accepting challenge only when that plan says `design_challenge_required: true`. `accepted_artifacts` at run level stores global contract/integration/report artifacts; repository artifacts remain repository-scoped.
 
-For new runs, `plan_review` is null before the review gate. Once all plans are canonical, it has this shape:
+For new runs, `plan_review` is null before planning completes. Full creates a pending review and interrupts; fast/standard creates the same bundle already approved by workflow policy. The full pending shape is:
 
 ```json
 {
@@ -183,11 +184,12 @@ For new runs, `plan_review` is null before the review gate. Once all plans are c
     }
   },
   "approved_at": null,
-  "approval_text": null
+  "approval_text": null,
+  "approval_source": null
 }
 ```
 
-The review bundle must visibly contain every recorded repository, canonical path, and hash. While pending, the run is `phase: plan-review`, `status: awaiting-user`, with no blockers, next actions, or active writer. Explicit whole-bundle approval changes `plan_review.status` to `approved` and records `approved_at` plus the user's exact non-empty `approval_text`; that update atomically advances the run to `implement`. Any canonical contract/plan/challenge hash change makes the approval stale. “Continue,” pre-authorization, and partial approval never satisfy this gate.
+The review bundle must visibly contain every recorded repository, canonical path, and hash. While a full review is pending, the run is `phase: plan-review`, `status: awaiting-user`, with no blockers, next actions, or active writer. Explicit whole-bundle approval records the user's exact text, `approval_source: user`, and atomically advances to `implement`. Fast/standard instead records `status: approved`, equal request/decision timestamps, `approval_source: workflow-policy`, and `approval_text: "Automatically accepted by the selected low-risk workflow policy."` in the same planning transition. Any canonical contract/plan/challenge hash change makes either decision stale. “Continue,” pre-authorization, and partial approval never satisfy a pending full gate.
 
 A next action contains unique ascending `order`, unique `action_id`, phase, nullable repository ID, attempt, sorted input paths, output path, and status (`pending`, `working`, or `blocked`). It records its immutable `assignment_path`. There are no next actions while plan review is pending.
 
@@ -283,6 +285,7 @@ Read [`schemas/assignment.md`](schemas/assignment.md). New profiled assignments 
   }],
   "baseline": "40-character-git-object-id",
   "preexisting_status_path": "/absolute/run/repos/api/initial-status.txt",
+  "input_tree_fingerprint": null,
   "input_artifacts": [
     {"path": "/absolute/run/plan-review-v1.md", "sha256": "64-character-sha256"},
     {"path": "/absolute/run/repos/api/plan-v1.json", "sha256": "64-character-sha256"},
@@ -292,7 +295,7 @@ Read [`schemas/assignment.md`](schemas/assignment.md). New profiled assignments 
   "requirement_ids": ["REQ-001"],
   "task_ids": ["API-TASK-001", "API-TASK-002"],
   "finding_ids": [],
-  "validation_ids": [],
+  "validation_ids": ["API-VAL-001"],
   "packet_id": "API-PACKET-001",
   "plan_review": {
     "path": "/absolute/run/plan-review-v1.md",
@@ -308,11 +311,11 @@ Read [`schemas/assignment.md`](schemas/assignment.md). New profiled assignments 
 }
 ```
 
-Input references are unique and path-sorted. Every project-file writer in a new run includes the exact approved review bundle in `input_artifacts` and repeats that hashed reference as `plan_review`; the batch supervisor compares it to current run state. A plan revision pins the superseded plan plus exactly one accepted design challenge or coordinator revision basis. Only implementation/fix stages write project files, exactly one repository at a time. Only delivery writes Git/forge. Global assignments use null repository, baseline, and pre-existing status.
+Input references are unique and path-sorted. Every project-file writer in a new run includes the exact approved review bundle—user-approved or policy-approved—in `input_artifacts` and repeats that hashed reference as `plan_review`; the batch supervisor compares it to current run state. A plan revision pins the superseded plan plus exactly one accepted design challenge or coordinator revision basis. Only implementation/fix stages write project files, exactly one repository at a time. Repository-scoped read-only assignments pin the content fingerprint present at assignment creation; the coordinator rejects any acceptance-time change. Only delivery writes Git/forge. Global assignments use null repository, baseline, pre-existing status, and input fingerprint.
 
-Use `medium` for validation, mechanical fixes, delivery, and deterministic report setup; `high` for standard planning/review, implementation, and complex fixes; `xhigh` only for full-profile contract/planning/challenge/review/integration.
+Use `medium` for validation, mechanical fixes, and delivery; `high` for standard planning/review, implementation, and complex fixes; `xhigh` only for full-profile planning/challenge/review/integration.
 
-The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Regardless of assignment stage, workers use `gpt-5.6-luna` with maximum reasoning. The assignment `thinking` value remains the policy classification and minimum validation level, while the actual launcher configuration is recorded in the supervisor manifest.
+The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Workers use `gpt-5.6-luna`; launchers map assignment `medium` and `high` directly and map `xhigh` to runtime `max`. The actual launcher configuration is recorded in the supervisor manifest.
 
 Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation reads the same record and performs the same cleanup, including when the worker wrote its artifact before the coordinator stopped.
 
@@ -322,9 +325,9 @@ Workers use only the schema matching `output_kind`:
 
 | Kind | Schema | Key v2 behavior |
 |---|---|---|
-| `contract` | [`schemas/contract.md`](schemas/contract.md) | Full-profile cross-repository behavior only |
+| `contract` | [`schemas/contract.md`](schemas/contract.md) | Coordinated cross-repository behavior only |
 | `plan` | [`schemas/plan.md`](schemas/plan.md) | Risk flags and bounded work packets |
-| `design-challenge` | [`schemas/design-challenge.md`](schemas/design-challenge.md) | Conditional except full profile |
+| `design-challenge` | [`schemas/design-challenge.md`](schemas/design-challenge.md) | Risk-bearing plans only |
 | `result` | [`schemas/result.md`](schemas/result.md) | Multi-task packets, fix batches, tree-keyed validation |
 | `review` | [`schemas/review.md`](schemas/review.md) | Must-fix/advisory disposition and targeted round two |
 | `integration` | [`schemas/integration.md`](schemas/integration.md) | Conditional, challenge may be explicitly waived |
@@ -365,7 +368,7 @@ Every task belongs to exactly one packet; a packet follows its profile's three-o
 }
 ```
 
-`reused` evidence hash-pins the earlier result artifact. Reuse only when command hash and worktree fingerprint match. Compute the fingerprint with:
+`reused` evidence hash-pins the earlier result artifact. Reuse only when command hash and content fingerprint match. The final implementation/fix writer is assigned every planned validation so its passing evidence can satisfy the gate directly. The fingerprint excludes parent `HEAD`, so an identical delivery commit reuses evidence; file content, mode, symlink, deletion, untracked content, or submodule-state changes invalidate it. Compute it with:
 
 ```bash
 python3 "$SKILL_DIR/scripts/workflow_tools.py" fingerprint <worktree>

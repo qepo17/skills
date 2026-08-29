@@ -194,7 +194,9 @@ class WorkerCommandTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def request(self, runtime: str = "pi") -> worker_supervisor.WorkerRequest:
+    def request(
+        self, runtime: str = "pi", thinking: str = "max"
+    ) -> worker_supervisor.WorkerRequest:
         assignment = self.run_dir / "assignment.json"
         assignment.write_text("{}\n", encoding="utf-8")
         return worker_supervisor.WorkerRequest(
@@ -205,6 +207,7 @@ class WorkerCommandTests(unittest.TestCase):
             timeout_seconds=60,
             runtime=runtime,
             prompt="Execute the immutable assignment.",
+            thinking=thinking,
         )
 
     def test_direct_preview_uses_a_noninteractive_ephemeral_runtime(self) -> None:
@@ -220,6 +223,19 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual("pi-custom", preview["command"][0])
         self.assertIn("--print", preview["command"])
         self.assertIn("--no-session", preview["command"])
+
+    def test_preview_uses_the_assignment_reasoning_level(self) -> None:
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("direct", "pi", "fallback", {}),
+            pi_binary="pi-custom",
+        )
+
+        preview = supervisor.preview(self.request(thinking="medium"))
+
+        thinking_index = preview["command"].index("--thinking") + 1
+        self.assertEqual("medium", preview["command"][thinking_index])
+        self.assertEqual("max", worker_supervisor.runtime_thinking("xhigh"))
 
     def test_tmux_preview_creates_a_detached_window_without_focus(self) -> None:
         supervisor = worker_supervisor.WorkerSupervisor(

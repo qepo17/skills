@@ -18,7 +18,7 @@ import workflow_tools  # noqa: E402
 
 
 class WorkflowPolicyTests(unittest.TestCase):
-    def test_auto_uses_standard_for_low_risk_single_repository(self) -> None:
+    def test_auto_uses_standard_without_a_user_pause_for_low_risk_work(self) -> None:
         result = workflow_tools.workflow_policy(
             repository_count=1,
             risk_flags=[],
@@ -27,17 +27,28 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertFalse(result["workflow_policy"]["contract_required"])
         self.assertEqual(3, result["workflow_policy"]["max_tasks_per_packet"])
         self.assertEqual(30, result["workflow_policy"]["coordinator_attempt_budget"])
-        self.assertTrue(result["workflow_policy"]["user_plan_approval_required"])
+        self.assertFalse(result["workflow_policy"]["user_plan_approval_required"])
 
-    def test_user_plan_approval_policy_cannot_be_disabled(self) -> None:
+    def test_ordinary_multi_repository_work_uses_coordinated_standard(self) -> None:
+        result = workflow_tools.workflow_policy(
+            repository_count=3,
+            risk_flags=["cross-repository"],
+        )
+        self.assertEqual("standard", result["profile"])
+        self.assertTrue(result["workflow_policy"]["contract_required"])
+        self.assertTrue(result["workflow_policy"]["integration_required"])
+        self.assertFalse(result["workflow_policy"]["report_required"])
+        self.assertFalse(result["workflow_policy"]["user_plan_approval_required"])
+
+    def test_full_profile_cannot_disable_user_plan_approval(self) -> None:
         result = workflow_tools.workflow_policy(
             repository_count=1,
-            risk_flags=[],
+            risk_flags=["security"],
         )
         result["workflow_policy"]["user_plan_approval_required"] = False
         with self.assertRaisesRegex(
             artifact_guard.ValidationError,
-            "may not waive user plan approval",
+            "requires explicit user plan approval",
         ):
             artifact_guard.validate_workflow_policy(
                 result["workflow_policy"],
@@ -52,7 +63,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             requested_profile="fast",
         )
         self.assertEqual("full", result["profile"])
-        self.assertTrue(result["workflow_policy"]["contract_required"])
+        self.assertFalse(result["workflow_policy"]["contract_required"])
+        self.assertTrue(result["workflow_policy"]["user_plan_approval_required"])
         self.assertIn("safety profiles cannot be weakened", " ".join(result["profile_reasons"]))
 
     def test_fast_is_available_only_by_explicit_request(self) -> None:
@@ -63,14 +75,15 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual("fast", result["profile"])
         self.assertEqual("none", result["workflow_policy"]["design_challenge"])
+        self.assertFalse(result["workflow_policy"]["user_plan_approval_required"])
 
-    def test_fast_public_interface_request_escalates_to_standard(self) -> None:
+    def test_fast_public_interface_request_escalates_to_full(self) -> None:
         result = workflow_tools.workflow_policy(
             repository_count=1,
             risk_flags=["public-interface"],
             requested_profile="fast",
         )
-        self.assertEqual("standard", result["profile"])
+        self.assertEqual("full", result["profile"])
         self.assertEqual("risk-only", result["workflow_policy"]["design_challenge"])
 
 
@@ -90,7 +103,7 @@ class UserPlanApprovalGuardTests(unittest.TestCase):
         assignment_path = Path("/tmp/implement-api.json")
         assignment = {"project_file_access": "write"}
 
-        with self.assertRaisesRegex(ValueError, "explicitly approves"):
+        with self.assertRaisesRegex(ValueError, "approved plan decision"):
             workflow_tools._enforce_user_plan_approval(
                 run,
                 [(assignment_path, assignment)],
@@ -145,6 +158,87 @@ class WorktreeFingerprintTests(unittest.TestCase):
         (self.repo / "new.txt").unlink()
         self.git_run("git", "checkout", "--", "tracked.txt")
         self.assertEqual(clean, workflow_tools.worktree_fingerprint(self.repo))
+
+    def test_fingerprint_is_stable_when_validated_content_is_committed(self) -> None:
+        (self.repo / "tracked.txt").write_text("delivered\n", encoding="utf-8")
+        before_commit = workflow_tools.worktree_fingerprint(self.repo)
+
+        self.git_run("git", "add", "tracked.txt")
+        self.git_run("git", "commit", "-qm", "deliver tested content")
+
+        self.assertEqual(before_commit, workflow_tools.worktree_fingerprint(self.repo))
+
+    def test_fingerprint_does_not_mutate_the_real_git_index(self) -> None:
+        (self.repo / "tracked.txt").write_text("staged\n", encoding="utf-8")
+        self.git_run("git", "add", "tracked.txt")
+        (self.repo / "tracked.txt").write_text("working\n", encoding="utf-8")
+        before = subprocess.run(
+            ["git", "diff", "--cached", "--binary"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        ).stdout
+
+        workflow_tools.worktree_fingerprint(self.repo)
+
+        after = subprocess.run(
+            ["git", "diff", "--cached", "--binary"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(before, after)
+
+    def test_coordinator_normalizes_mechanical_worker_evidence(self) -> None:
+        assignment_path = Path(self.tempdir.name) / "assignment.json"
+        assignment_path.write_text("{}\n", encoding="utf-8")
+        output_path = Path(self.tempdir.name) / "result.json"
+        log_dir = Path(self.tempdir.name) / "logs"
+        assignment = {
+            "repo_id": "api",
+            "cwd": str(self.repo),
+            "log_dir": str(log_dir),
+            "project_file_access": "none",
+            "input_tree_fingerprint": workflow_tools.worktree_fingerprint(self.repo),
+        }
+        artifact = {
+            "artifact_kind": "result",
+            "validations": [
+                {
+                    "id": "API-VAL-001",
+                    "command": "python -m unittest",
+                }
+            ],
+        }
+
+        normalized = workflow_tools.normalize_worker_artifact(
+            assignment_path,
+            assignment,
+            output_path,
+            artifact,
+        )
+
+        fingerprint = workflow_tools.worktree_fingerprint(self.repo)
+        self.assertEqual(str(assignment_path.resolve()), normalized["assignment_path"])
+        self.assertEqual(fingerprint, normalized["tree_fingerprint"])
+        self.assertEqual(fingerprint, normalized["validations"][0]["tree_fingerprint"])
+        self.assertEqual(
+            hashlib.sha256(b"python -m unittest").hexdigest(),
+            normalized["validations"][0]["command_sha256"],
+        )
+        self.assertTrue(Path(normalized["git"]["status_short_path"]).is_file())
+
+        (self.repo / "tracked.txt").write_text("reviewer mutation\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            artifact_guard.ValidationError,
+            "read-only worker changed repository content",
+        ):
+            workflow_tools.normalize_worker_artifact(
+                assignment_path,
+                assignment,
+                output_path,
+                artifact,
+            )
 
 
 class BatchSupervisorTests(unittest.TestCase):
@@ -227,7 +321,7 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertIn("--print", command)
         self.assertIn("--no-session", command)
         self.assertIn("--thinking", command)
-        self.assertIn("max", command)
+        self.assertIn("medium", command)
         self.assertIn("--model", command)
         self.assertIn("openai-codex/gpt-5.6-luna", command)
         self.assertEqual("pi", manifest["workers"][0]["runtime"])
@@ -287,7 +381,7 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertIn("exec", command)
         self.assertIn("--model", command)
         self.assertIn("gpt-5.6-luna", command)
-        self.assertIn('model_reasoning_effort="max"', command)
+        self.assertIn('model_reasoning_effort="medium"', command)
         self.assertEqual("codex", manifest["workers"][0]["runtime"])
 
     def test_project_writer_batch_requires_run_state_with_plan_approval(self) -> None:
