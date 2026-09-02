@@ -198,6 +198,8 @@ class FakeSuccessfulBatch(FakePlanningBatch):
         *,
         round_one_finding: bool = False,
         fail_first_validation: bool = False,
+        always_fail_validation: bool = False,
+        delivery_code_failures: int = 0,
         migration_capable: bool = False,
         risk_flags: list[str] | None = None,
     ) -> None:
@@ -207,7 +209,10 @@ class FakeSuccessfulBatch(FakePlanningBatch):
         )
         self.round_one_finding = round_one_finding
         self.fail_first_validation = fail_first_validation
+        self.always_fail_validation = always_fail_validation
+        self.delivery_code_failures = delivery_code_failures
         self.validation_attempts = 0
+        self.delivery_attempts = 0
 
     def __call__(
         self,
@@ -280,7 +285,9 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                 (worktree / "feature.txt").write_text("implemented\n", encoding="utf-8")
                 status_path.write_text("?? feature.txt\n", encoding="utf-8")
                 fingerprint = self._fingerprint(worktree)
-                should_fail = self.fail_first_validation and self.validation_attempts == 0
+                should_fail = self.always_fail_validation or (
+                    self.fail_first_validation and self.validation_attempts == 0
+                )
                 self.validation_attempts += 1
                 records = []
                 for index, (validation_id, command) in enumerate(
@@ -336,7 +343,7 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                 )
             elif assignment["stage"] == "validate":
                 self.validation_attempts += 1
-                should_fail = (
+                should_fail = self.always_fail_validation or (
                     self.fail_first_validation and self.validation_attempts == 1
                 )
                 fingerprint = self._fingerprint(worktree)
@@ -515,6 +522,63 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                         "next_action": "validate",
                     }
                 )
+            elif assignment["stage"] == "pipeline-fix":
+                (worktree / "feature.txt").write_text(
+                    "implemented after pipeline fix\n", encoding="utf-8"
+                )
+                status_path.write_text(
+                    self._git(worktree, "status", "--short") + "\n",
+                    encoding="utf-8",
+                )
+                fingerprint = self._fingerprint(worktree)
+                records = []
+                for index, (validation_id, command) in enumerate(
+                    zip(
+                        assignment["validation_ids"],
+                        assignment["validation_commands"],
+                        strict=True,
+                    ),
+                    start=1,
+                ):
+                    evidence = log_dir / f"pipeline-fix-{index}.log"
+                    evidence.write_text("pass\n", encoding="utf-8")
+                    records.append(
+                        {
+                            "id": validation_id,
+                            "command": command,
+                            "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+                            "cwd": str(worktree),
+                            "tree_fingerprint": fingerprint,
+                            "cache_status": "fresh",
+                            "source_artifact": None,
+                            "exit_code": 0,
+                            "result": "pass",
+                            "summary": "Validation passed.",
+                            "log_path": str(evidence),
+                        }
+                    )
+                artifact.update(
+                    {
+                        "summary": "Resolved the change-related pipeline failure.",
+                        "changed_files": ["feature.txt"],
+                        "tree_fingerprint": fingerprint,
+                        "validations": records,
+                        "decisions": [
+                            {
+                                "id": "DEC-PIPELINE-FIX-001",
+                                "kind": "pipeline",
+                                "summary": "Corrected the required-check failure.",
+                                "evidence": "feature.txt",
+                            }
+                        ],
+                        "resolutions": [],
+                        "git": {
+                            "head": self._git(worktree, "rev-parse", "HEAD"),
+                            "status_short_path": str(status_path),
+                        },
+                        "next_action": "deliver",
+                    }
+                )
             elif assignment["stage"] == "integrate":
                 inputs = [
                     Path(reference["path"])
@@ -572,16 +636,21 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                     }
                 )
             elif assignment["stage"] == "deliver":
+                self.delivery_attempts += 1
                 self._git(worktree, "add", "feature.txt")
                 if self._git(worktree, "status", "--short"):
                     self._git(
                         worktree, "commit", "-m", "feat: implement requested behavior"
                     )
                 commit = self._git(worktree, "rev-parse", "HEAD")
-                check_log = log_dir / "required-check.log"
-                check_log.write_text("passed\n", encoding="utf-8")
+                check_log = log_dir / f"required-check-{self.delivery_attempts}.log"
+                check_failed = self.delivery_attempts <= self.delivery_code_failures
+                check_log.write_text(
+                    "failed\n" if check_failed else "passed\n", encoding="utf-8"
+                )
                 artifact.update(
                     {
+                        "status": "blocked" if check_failed else "complete",
                         "branch": self._git(worktree, "branch", "--show-current"),
                         "base_branch": "main",
                         "commits": [commit],
@@ -591,11 +660,23 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                                 "name": "tests",
                                 "url": "https://example.test/check/1",
                                 "required": True,
-                                "state": "passed",
+                                "state": "failed" if check_failed else "passed",
                                 "evidence_path": str(check_log),
                             }
                         ],
-                        "blockers": [],
+                        "blockers": (
+                            [
+                                {
+                                    "id": f"BLOCK-PIPELINE-{self.delivery_attempts:03d}",
+                                    "kind": "code",
+                                    "summary": "A required check failed.",
+                                    "evidence_path": str(check_log),
+                                    "required_action": "Correct the change and rerun delivery.",
+                                }
+                            ]
+                            if check_failed
+                            else []
+                        ),
                     }
                 )
             else:
@@ -1229,11 +1310,32 @@ class WorkflowEngineTests(unittest.TestCase):
         fixes = engine._artifacts(repo_id="api", stage="validation-fix", kind="result")
         self.assertEqual(["API-VAL-001"], fixes[-1][2]["validation_ids"])
 
-    def test_high_review_finding_runs_one_fix_batch_and_targeted_second_review(
-        self,
-    ) -> None:
+    def test_repeated_validation_failure_blocks_after_one_fix_batch(self) -> None:
+        fake = FakeSuccessfulBatch(always_fail_validation=True)
+        engine = self.initialize(fake)
+        graph = build_graph(engine, InMemorySaver())
+        config = {
+            "configurable": {"thread_id": "20260822T100000Z-validation-limit"},
+            "recursion_limit": 150,
+        }
+
+        graph.invoke({"run_dir": str(self.run_dir)}, config=config)
+
+        run = engine.load_run()
+        self.assertEqual("blocked", run["status"])
+        self.assertIn("Validation fix cycles exhausted", run["blockers"][0]["summary"])
+        stages = [assignment["stage"] for assignment in fake.assignments]
+        self.assertEqual(1, stages.count("validation-fix"))
+
+    def test_high_review_finding_runs_one_review_and_one_fix_batch(self) -> None:
         fake = FakeSuccessfulBatch(round_one_finding=True)
         engine = self.initialize(fake)
+        run = engine.load_run()
+        self.assertEqual(1, run["retry_limits"]["review_rounds"])
+        # Prove the hard round limit wins even for a legacy policy that would
+        # otherwise request targeted verification.
+        run["workflow_policy"]["second_review"] = "high-risk-fixes"
+        engine._save_run(run)
         graph = build_graph(engine, InMemorySaver())
         config = {
             "configurable": {"thread_id": "20260822T100000Z-langgraph-test"},
@@ -1244,14 +1346,28 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual("complete", engine.load_run()["status"])
         stages = [assignment["stage"] for assignment in fake.assignments]
         self.assertIn("fix-1", stages)
-        self.assertIn("review-2", stages)
+        self.assertNotIn("review-2", stages)
         self.assertNotIn("fix-2", stages)
         fix_artifacts = engine._artifacts(repo_id="api", stage="fix-1", kind="result")
         self.assertEqual(["API-R1-001"], fix_artifacts[-1][2]["finding_ids"])
-        second_review = engine._latest_review("api", 2)
-        assert second_review is not None
-        self.assertEqual(["API-R1-001"], second_review[1]["verified_finding_ids"])
-        self.assertEqual([], second_review[1]["findings"])
+
+    def test_repeated_pipeline_failure_blocks_after_one_fix_batch(self) -> None:
+        fake = FakeSuccessfulBatch(delivery_code_failures=2)
+        engine = self.initialize(fake)
+        graph = build_graph(engine, InMemorySaver())
+        config = {
+            "configurable": {"thread_id": "20260822T100000Z-pipeline-limit"},
+            "recursion_limit": 150,
+        }
+
+        graph.invoke({"run_dir": str(self.run_dir)}, config=config)
+
+        run = engine.load_run()
+        self.assertEqual("blocked", run["status"])
+        self.assertIn("required check failed", run["blockers"][0]["summary"])
+        stages = [assignment["stage"] for assignment in fake.assignments]
+        self.assertEqual(1, stages.count("pipeline-fix"))
+        self.assertEqual(2, stages.count("deliver"))
 
     def test_full_profile_graph_runs_risk_challenge_and_requested_report(
         self,
@@ -1399,6 +1515,17 @@ class WorkflowEngineTests(unittest.TestCase):
         output = graph.invoke({"run_dir": str(self.run_dir)}, config=config)
 
         run = engine.load_run()
+        self.assertEqual(
+            {
+                "worker_replacements_per_stage": 1,
+                "contract_revisions": 1,
+                "plan_revision_cycles": 1,
+                "validation_fix_cycles": 1,
+                "review_rounds": 1,
+                "pipeline_fix_cycles": 1,
+            },
+            run["retry_limits"],
+        )
         self.assertNotIn("__interrupt__", output)
         self.assertEqual("approved", run["plan_review"]["status"])
         self.assertEqual("workflow-policy", run["plan_review"]["approval_source"])

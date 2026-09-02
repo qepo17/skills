@@ -2398,9 +2398,17 @@ class WorkflowEngine:
         self._set_phase("review-1")
         return "review-1"
 
+    def _review_round_allowed(self, round_number: int) -> bool:
+        # Independent round one remains mandatory for legacy runs that recorded
+        # zero before this field was enforced. Higher rounds honor the pin.
+        limit = max(1, self.load_run()["retry_limits"]["review_rounds"])
+        return round_number <= limit
+
     def _review_assignment(
         self, repo_id: str, round_number: int, finding_ids: list[str]
     ) -> Path:
+        if not self._review_round_allowed(round_number):
+            raise WorkflowError(f"review round {round_number} exceeds the run limit")
         stage = f"review-{round_number}"
         return self.build_assignment(
             stage=stage,
@@ -2496,7 +2504,10 @@ class WorkflowEngine:
 
     def _needs_second_review(self) -> bool:
         run = self.load_run()
-        if run["workflow_policy"]["second_review"] == "never":
+        if (
+            run["retry_limits"]["review_rounds"] < 2
+            or run["workflow_policy"]["second_review"] == "never"
+        ):
             return False
         for repo_id in run["repositories"]:
             review = self._latest_review(repo_id, 1)
@@ -2510,6 +2521,8 @@ class WorkflowEngine:
         return False
 
     def phase_review_2(self) -> str:
+        if not self._review_round_allowed(2):
+            return self._after_reviews()
         assignments: list[Path] = []
         for repo_id in sorted(self.load_run()["repositories"]):
             round_one = self._latest_review(repo_id, 1)
@@ -2535,6 +2548,8 @@ class WorkflowEngine:
         return self._after_reviews()
 
     def phase_fix_2(self) -> str:
+        if not self._review_round_allowed(2):
+            return self._after_reviews()
         outcome = self._phase_fix(2)
         if outcome == "fix-2":
             return outcome
@@ -2909,9 +2924,9 @@ class WorkflowEngine:
                 "worker_replacements_per_stage": 1,
                 "contract_revisions": 1,
                 "plan_revision_cycles": 1,
-                "validation_fix_cycles": 2,
-                "review_rounds": 2,
-                "pipeline_fix_cycles": 2,
+                "validation_fix_cycles": 1,
+                "review_rounds": 1,
+                "pipeline_fix_cycles": 1,
             },
             "repositories": repositories,
             "accepted_artifacts": {},

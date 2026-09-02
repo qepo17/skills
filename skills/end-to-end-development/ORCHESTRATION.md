@@ -35,17 +35,16 @@ START
   -> plan <-> design challenge / bounded revision
   -> plan_review? (dynamic interrupt for full; policy decision otherwise)
   -> implement (packet scheduler)
-  -> validate <-> validation-fix
+  -> validate -> validation-fix? -> validate
   -> review_1 -> fix_1?
-  -> review_2? -> fix_2?
   -> integrate?
-  -> deliver <-> pipeline-fix
+  -> deliver -> pipeline-fix? -> deliver
   -> report?
   -> complete
   -> END
 ```
 
-Every phase node returns to `reconcile`. Conditional policy is read from the validated `workflow_policy`; disabled phases are not executed. Fast/standard planning writes and policy-accepts the hash-pinned bundle in one transition, while full pauses at the dynamic interrupt. Repository batches are built lexicographically and handed to the concurrent supervisor in one call. `reconcile` also enforces `coordinator_attempt_budget` after an atomic batch and ends the current graph invocation with `budget-checkpoint`; the CLI starts a new bounded invocation automatically when policy enables `auto_resume`, without crossing a human interrupt.
+Every phase node returns to `reconcile`. Conditional policy is read from the validated `workflow_policy`; disabled phases are not executed. New runs allow one review, one review-fix batch, one validation-fix batch, and one pipeline-fix batch. A failed check after its fix blocks instead of starting another cycle. The retained `review_2` and `fix_2` nodes exist only to resume older runs whose durable state already permits two rounds. Fast/standard planning writes and policy-accepts the hash-pinned bundle in one transition, while full pauses at the dynamic interrupt. Repository batches are built lexicographically and handed to the concurrent supervisor in one call. `reconcile` also enforces `coordinator_attempt_budget` after an atomic batch and ends the current graph invocation with `budget-checkpoint`; the CLI starts a new bounded invocation automatically when policy enables `auto_resume`, without crossing a human interrupt.
 
 The graph state is deliberately small:
 

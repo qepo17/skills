@@ -1,6 +1,6 @@
 ---
 name: fast-end-to-end-development
-description: "Run a lightweight, artifact-backed development workflow for an ordinary single-repository change: agent planning, implementation, one independent review, one revision pass, and pull-request creation, with an optional self-contained HTML explainer. Use when the user wants a quicker end-to-end coding flow and does not require the full end-to-end-development approval, multi-review, integration, or resumability gates."
+description: "Run a lightweight, artifact-backed development workflow for an ordinary single-repository change: agent planning, implementation, one independent review, one revision pass, and pull-request creation, with an optional self-contained HTML explainer. Use when the user wants a quicker end-to-end coding flow and does not require durable orchestration, high-risk approval, multi-repository integration, or resumability."
 ---
 
 # Fast End-to-End Development
@@ -62,7 +62,7 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 - Keep one project-file writer. Do not let a reviewer or delivery step edit source files.
 - Close every workflow-created Herdr pane immediately after its agent settles and its result is captured; retain only working, blocked, or timed-out panes that still need attention.
 - Treat the plan as the implementation contract. A simpler equivalent change or focused test is allowed; a new high-cost mechanism, public contract, migration, or unrelated refactor requires escalation.
-- Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a third review/fix cycle.
+- Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a second review or revision batch.
 - Do not create the PR until the revision gate and required local checks pass. If a post-PR CI failure needs code changes after the one revision is spent, report the blocker and recommend the full workflow.
 - Keep the HTML explainer derived from accepted artifacts, not from memory or raw transcripts.
 

@@ -27,6 +27,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertFalse(result["workflow_policy"]["contract_required"])
         self.assertEqual(3, result["workflow_policy"]["max_tasks_per_packet"])
         self.assertEqual(30, result["workflow_policy"]["coordinator_attempt_budget"])
+        self.assertEqual("never", result["workflow_policy"]["second_review"])
         self.assertFalse(result["workflow_policy"]["user_plan_approval_required"])
 
     def test_ordinary_multi_repository_work_uses_coordinated_standard(self) -> None:
@@ -64,6 +65,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertEqual("full", result["profile"])
         self.assertFalse(result["workflow_policy"]["contract_required"])
+        self.assertEqual("never", result["workflow_policy"]["second_review"])
         self.assertTrue(result["workflow_policy"]["user_plan_approval_required"])
         self.assertIn("safety profiles cannot be weakened", " ".join(result["profile_reasons"]))
 

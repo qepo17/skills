@@ -500,8 +500,11 @@ def validate_workflow_policy(value: Any, profile: str, location: str) -> dict[st
             )
         if max_tasks != 3:
             fail(f"{location}.max_tasks_per_packet", "full profile uses three-task packets")
-        if second_review != "high-risk-fixes":
-            fail(f"{location}.second_review", "full profile uses targeted high-risk verification")
+        if second_review not in {"never", "high-risk-fixes"}:
+            fail(
+                f"{location}.second_review",
+                "full profile uses one review or legacy targeted high-risk verification",
+            )
         if not approval_required:
             fail(
                 f"{location}.user_plan_approval_required",
@@ -512,8 +515,11 @@ def validate_workflow_policy(value: Any, profile: str, location: str) -> dict[st
             fail(f"{location}.design_challenge", "standard challenges risk-bearing plans")
         if max_tasks != 3:
             fail(f"{location}.max_tasks_per_packet", "standard uses three-task packets")
-        if second_review != "high-risk-fixes":
-            fail(f"{location}.second_review", "standard uses targeted high-risk verification")
+        if second_review not in {"never", "high-risk-fixes"}:
+            fail(
+                f"{location}.second_review",
+                "standard uses one review or legacy targeted high-risk verification",
+            )
     if profile == "fast":
         if contract_required:
             fail(f"{location}.contract_required", "fast profile embeds the local contract in its plan")
@@ -760,7 +766,11 @@ def validate_run(data: dict[str, Any]) -> None:
         "review_rounds",
         "pipeline_fix_cycles",
     ):
-        integer(field(retries, name, "$.retry_limits"), f"$.retry_limits.{name}", minimum=0)
+        integer(
+            field(retries, name, "$.retry_limits"),
+            f"$.retry_limits.{name}",
+            minimum=0,
+        )
 
     repositories = obj(field(data, "repositories", "$"), "$.repositories")
     if not repositories:

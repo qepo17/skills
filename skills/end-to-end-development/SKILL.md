@@ -1,6 +1,6 @@
 ---
 name: end-to-end-development
-description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional approval and challenge gates, reusable validation evidence, bounded remediation, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
+description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional approval and challenge gates, reusable validation evidence, single-pass review and remediation limits, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
 disable-model-invocation: true
 compatibility: Requires uv, Python 3.11+, Git worktrees, Pi or Codex, a repository forge CLI, and the installed codebase-design skill. Paseo, Herdr, and tmux are detected automatically when the coordinator runs inside them; otherwise workers run headlessly. LangGraph dependencies are installed from the locked skill project.
 ---
@@ -25,7 +25,7 @@ Workers read only their assigned `schemas/<kind>.md`, never the coordinator docu
 4. **Follow the selected policy.** Ordinary single- and multi-repository work may use the standard no-pause path. High-risk discovery escalates to full before project-file work.
 5. **One active project-file writer per repository.** The lease protects a role, not an agent identity. Work packets and fix batches preserve it.
 6. **Workers do not mutate coordinator state.** They write only their exact output, allowed project files, and log directory. The graph updates run, agent, event, lease, and checkpoint state.
-7. **Every loop is bounded.** Worker replacement, planning revision, validation fix, review, and pipeline fix limits are enforced by the graph. Never “continue until green.”
+7. **Every loop is bounded.** New runs get one review, one review-fix batch, one validation-fix cycle, and one pipeline-fix cycle. Worker replacement and planning revision limits are also enforced by the graph. Never “continue until green.”
 8. **Preserve evidence, not transcripts.** Full output stays in logs. Artifacts contain commands, hashes, exit codes, concise conclusions, and evidence paths.
 9. **No silent degradation.** Missing, invalid, oversized, stale-tree, or contradictory evidence leaves the gate incomplete.
 10. **Migration safety is mandatory.** The graph must have isolated local/test database-target evidence before migration-capable validation. Never use production, staging, shared, or ambiguous databases; never copy `.env` into a new worktree.
@@ -166,24 +166,26 @@ python3 "$SKILL_DIR/scripts/workflow_tools.py" policy \
 | Complete-plan user approval | policy-accepted | policy-accepted | explicit user approval |
 | Implementation packet | ≤4 tasks | ≤3 tasks | ≤3 tasks |
 | Independent full review | one | one | one |
-| Targeted second review | never | high-risk fixes | high-risk fixes |
+| Targeted second review | never | never | never |
 | Cross-repository integration | no | multi-repository only | multi-repository only |
 | Deterministic HTML report | requested only | requested only | requested only |
 
-Default retry limits remain:
+New runs use these hard stage limits:
 
 ```json
 {
   "worker_replacements_per_stage": 1,
   "contract_revisions": 1,
   "plan_revision_cycles": 1,
-  "validation_fix_cycles": 2,
-  "review_rounds": 2,
-  "pipeline_fix_cycles": 2
+  "validation_fix_cycles": 1,
+  "review_rounds": 1,
+  "pipeline_fix_cycles": 1
 }
 ```
 
-Never modify limits during an active run. The graph checks `coordinator_attempt_budget` after each atomic batch. When reached, it checkpoints at `reconcile`; when `auto_resume` is true the CLI starts a fresh bounded graph invocation from that checkpoint, otherwise it returns `outcome: budget-checkpoint` for a supported later resume. Neither path can cross a pending plan-review interrupt.
+A review may produce one compatible `fix-1` batch, but that fix never starts another review. A validation or required-check failure may produce one compatible fix batch and one check afterward; another failure blocks with preserved evidence. Never modify limits during an active run. Existing durable runs retain their pinned limits when resumed.
+
+The graph checks `coordinator_attempt_budget` after each atomic batch. When reached, it checkpoints at `reconcile`; when `auto_resume` is true the CLI starts a fresh bounded graph invocation from that checkpoint, otherwise it returns `outcome: budget-checkpoint` for a supported later resume. Neither path can cross a pending plan-review interrupt.
 
 ## Executable phase behavior
 
@@ -194,16 +196,16 @@ The compiled graph contains these phase nodes, with `reconcile` between every tr
 3. `plan`, including conditional challenge and one bounded revision
 4. `plan-review`, implemented with LangGraph `interrupt()` only for full; fast/standard records a policy decision and proceeds
 5. `implement`, scheduling topologically eligible work packets
-6. `validate`, with tree-keyed evidence and bounded validation-fix batches
+6. `validate`, with at most one validation-fix batch
 7. `review-1`
-8. `fix-1` when must-fix findings exist
-9. `review-2` only when policy and high-risk fixes require targeted verification
-10. `fix-2` for one verification-regression batch; never round three
-11. `integrate` when policy requires it
-12. `deliver`, with bounded pipeline-fix cycles for change-related failures
-13. post-delivery content-evidence confirmation
-14. `report` when required
-15. `complete`, with final audit and deterministic metrics
+8. `fix-1` when must-fix findings exist, with no follow-up review cycle
+9. `integrate` when policy requires it
+10. `deliver`, with at most one pipeline-fix batch for change-related failures
+11. post-delivery content-evidence confirmation
+12. `report` when required
+13. `complete`, with final audit and deterministic metrics
+
+The graph retains `review-2` and `fix-2` nodes only so older durable runs with a pinned two-round limit can resume safely. New runs never schedule them.
 
 Repository IDs and stable IDs sort lexicographically. Independent repositories launch together through one supervisor batch. Contract dependency evidence is the only reason to serialize repositories.
 
@@ -229,11 +231,11 @@ The plan defines the packet, not individual task, as the implementation unit. A 
 
 The graph computes a content fingerprint independent of commit identity. The final implementation/fix writer runs the complete planned suite, and the graph reuses that evidence only when validation ID, exact command hash, and content fingerprint match. A delivery-only commit therefore causes no duplicate validation; any source change invalidates the evidence. Compatible failures are fixed in one batch and checked once afterward.
 
-Round one independently reviews the complete baseline-to-worktree state. Critical/high actionable findings always block; medium correctness/spec findings normally block; low findings remain advisory. Compatible must-fix findings are resolved in one repository batch. Round two is targeted verification only and cannot become another unrestricted review.
+One fresh worker independently reviews the complete baseline-to-worktree state. Critical/high actionable findings always block; medium correctness/spec findings normally block; low findings remain advisory. Compatible must-fix findings are resolved in one repository batch, affected checks run once, and the workflow proceeds without a second review. An incompatible or still-failing correction blocks instead of opening another remediation loop.
 
 ### Delivery and completion
 
-Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures use the bounded pipeline-fix path.
+Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures get at most one pipeline-fix batch.
 
 After delivery, the graph verifies that the committed content still matches passing evidence rather than invalidating it merely because `HEAD` changed. Completion then verifies the policy-selected plan decision, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically.
 

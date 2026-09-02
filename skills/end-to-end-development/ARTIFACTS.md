@@ -63,8 +63,8 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
     ├── validation-fix-batch-N.json
     ├── review-1.json
     ├── fix-1-batch-N.json
-    ├── review-2.json                    # targeted and conditional
-    ├── fix-2-batch-N.json
+    ├── review-2.json                    # legacy two-round runs only
+    ├── fix-2-batch-N.json               # legacy two-round runs only
     ├── delivery-N.json
     └── logs/
 ```
@@ -106,7 +106,7 @@ The LangGraph control plane is the sole writer after initialization. New runs re
     "report_required": false,
     "max_tasks_per_packet": 3,
     "max_packet_minutes": 45,
-    "second_review": "high-risk-fixes",
+    "second_review": "never",
     "blocking_severities": ["critical", "high", "medium"],
     "coordinator_attempt_budget": 30,
     "auto_resume": true,
@@ -130,9 +130,9 @@ The LangGraph control plane is the sole writer after initialization. New runs re
     "worker_replacements_per_stage": 1,
     "contract_revisions": 1,
     "plan_revision_cycles": 1,
-    "validation_fix_cycles": 2,
-    "review_rounds": 2,
-    "pipeline_fix_cycles": 2
+    "validation_fix_cycles": 1,
+    "review_rounds": 1,
+    "pipeline_fix_cycles": 1
   },
   "repositories": {
     "api": {
@@ -162,7 +162,7 @@ The LangGraph control plane is the sole writer after initialization. New runs re
 
 Profiles are `fast`, `standard`, and `full`. Generate policy with `workflow_tools.py policy`; do not hand-weaken it. Ordinary multi-repository work uses standard with shared-contract and integration workers. Authorization, security, concurrency, migration, backfill, background-processing, storage, public-interface changes, or comparable high-cost risk force `full`; repository count and `cross-repository` alone do not.
 
-Run phases are `bootstrap`, `contract`, `plan`, `plan-review`, `implement`, `validate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `integrate`, `deliver`, `report`, `complete`, but conditional phases may be skipped according to `workflow_policy`. Every run creates a plan-decision bundle; only full enters `plan-review`. Repository stage uses the same values. Run status additionally permits `awaiting-user`, exclusively for a pending full review.
+Run phases are `bootstrap`, `contract`, `plan`, `plan-review`, `implement`, `validate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `integrate`, `deliver`, `report`, `complete`, but conditional phases may be skipped according to `workflow_policy`. New runs schedule only `review-1` and at most one `fix-1` batch; `review-2` and `fix-2` remain valid solely for resuming older two-round runs. Every run creates a plan-decision bundle; only full enters `plan-review`. Repository stage uses the same values. Run status additionally permits `awaiting-user`, exclusively for a pending full review.
 
 A repository always needs a canonical accepted plan after planning. It needs a canonical accepting challenge only when that plan says `design_challenge_required: true`. `accepted_artifacts` at run level stores global contract/integration/report artifacts; repository artifacts remain repository-scoped.
 
@@ -329,7 +329,7 @@ Workers use only the schema matching `output_kind`:
 | `plan` | [`schemas/plan.md`](schemas/plan.md) | Risk flags and bounded work packets |
 | `design-challenge` | [`schemas/design-challenge.md`](schemas/design-challenge.md) | Risk-bearing plans only |
 | `result` | [`schemas/result.md`](schemas/result.md) | Multi-task packets, fix batches, tree-keyed validation |
-| `review` | [`schemas/review.md`](schemas/review.md) | Must-fix/advisory disposition and targeted round two |
+| `review` | [`schemas/review.md`](schemas/review.md) | Must-fix/advisory disposition; legacy targeted round two remains resumable |
 | `integration` | [`schemas/integration.md`](schemas/integration.md) | Conditional, challenge may be explicitly waived |
 | `delivery` | [`schemas/delivery.md`](schemas/delivery.md) | Git/forge evidence |
 | `report` | [`schemas/report.md`](schemas/report.md) | Deterministically generated |
