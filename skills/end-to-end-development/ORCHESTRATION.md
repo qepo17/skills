@@ -23,7 +23,7 @@ A run-scoped execution lock permits only one advancing graph invocation at a tim
 
 At the artifact seam, the coordinator—not the worker—records assignment hashes, Git HEAD/status, content fingerprints, and command hashes. This keeps semantic worker conclusions independent from mechanical metadata and avoids replacing correct work for a stale copied status file.
 
-On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. Invalid or absent output follows the recorded replacement limit.
+On replay, existing valid output is accepted rather than repeated. Crash recovery reads the durable supervisor record, adopts the surviving Paseo agent, Herdr workspace, tmux window, or direct process, and cleans it when settled—even when the artifact was written before the coordinator stopped. A worker retained at the timeout boundary is reclassified as settled and cleaned when its durable exit-status file appears later. Invalid or absent output follows the recorded replacement limit.
 
 ## Executable graph
 
@@ -128,6 +128,14 @@ After updating an engine that emitted the exact validation-coverage blocker from
 ```
 
 It accepts only that exact validate-phase blocker and creates a new assignment bound to the canonical plan hash and validation IDs. It does not clear other code, dependency, or decision blockers.
+
+After updating an engine that ran a dependent fix concurrently with an upstream contract fix and emitted the exact hash-pinned bundle-drift blocker, use:
+
+```bash
+"$ORCHESTRATOR" retry-dependent-fixes "$RUN_DIR" --worker-runtime auto
+```
+
+This guarded transition accepts only that fix-phase blocker. Remaining fixes follow the shared contract's dependency order, receive accepted upstream fix artifacts as hash-pinned inputs, and get read-only access to upstream worktrees.
 
 A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 

@@ -1057,6 +1057,41 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertFalse(engine.retry_validation_evidence())
         self.assertEqual("blocked", engine.load_run()["status"])
 
+    def test_explicit_dependent_fix_retry_clears_only_contract_drift_blocker(
+        self,
+    ) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+        self.assertEqual("approved", engine.load_run()["plan_review"]["status"])
+        engine._set_phase("fix-1")
+        evidence = self.run_dir / "logs" / "contract-drift.log"
+        engine._block(
+            summary=(
+                "The current API worktree bundle is not the hash-pinned accepted "
+                "bundle used by the UI generated types."
+            ),
+            evidence_path=evidence,
+            required_action="Regenerate the dependent consumer.",
+            kind="dependency",
+            repo_id="api",
+        )
+
+        self.assertTrue(engine.retry_dependent_fixes())
+        run = engine.load_run()
+        self.assertEqual("working", run["status"])
+        self.assertEqual([], run["blockers"])
+
+        engine._block(
+            summary="A package dependency decision is required.",
+            evidence_path=self.run_dir / "logs" / "dependency.log",
+            required_action="Revise the plan.",
+            kind="dependency",
+        )
+        self.assertFalse(engine.retry_dependent_fixes())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
     def test_crash_recovery_closes_a_worker_that_already_wrote_its_output(self) -> None:
         fake = FakePlanningBatch()
         engine = self.initialize(fake)
@@ -1292,6 +1327,27 @@ class WorkflowEngineTests(unittest.TestCase):
 
         self.assertEqual(["API-VAL-001"], assignment["validation_ids"])
         self.assertEqual(["python -m unittest"], assignment["validation_commands"])
+
+    def test_review_assignment_uses_unambiguous_completion_and_status_evidence(
+        self,
+    ) -> None:
+        fake = FakePlanningBatch()
+        engine = self.initialize(fake)
+        engine.phase_bootstrap()
+        engine.phase_plan()
+
+        assignment_path = engine._review_assignment("api", 1, [])
+        assignment = json.loads(assignment_path.read_text(encoding="utf-8"))
+
+        self.assertIn("round-1-evidence-v1", assignment["action_id"])
+        self.assertIn(
+            "A finished review has status complete even when it reports must-fix findings; use blocked only when the review itself cannot finish.",
+            assignment["instructions"],
+        )
+        self.assertIn(
+            "Write reviewed_status_path as the exact final git status --short output with no commentary.",
+            assignment["instructions"],
+        )
 
     def test_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
         fake = FakeSuccessfulBatch(fail_first_validation=True)

@@ -144,6 +144,11 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                 raise WorkflowError(
                     "run is not blocked by the exact validation-coverage evidence condition"
                 )
+        elif args.command == "retry-dependent-fixes":
+            if not engine.retry_dependent_fixes():
+                raise WorkflowError(
+                    "run is not blocked by the exact cross-repository fix dependency condition"
+                )
         attempt_baseline = len(engine.load_agents()["agents"])
         snapshot = graph.get_state(config)
         if isinstance(graph_input, Command):
@@ -231,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validation_retry.add_argument("--report-root", type=Path)
 
+    dependent_fix_retry = subparsers.add_parser(
+        "retry-dependent-fixes",
+        help="retry fixes after an accepted upstream contract fix",
+    )
+    dependent_fix_retry.add_argument("run_dir", type=Path)
+    dependent_fix_retry.add_argument(
+        "--worker-runtime", choices=["auto", "codex", "pi"], default="auto"
+    )
+    dependent_fix_retry.add_argument("--report-root", type=Path)
+
     approve = subparsers.add_parser(
         "approve", help="resume an exact pending plan bundle"
     )
@@ -294,6 +309,14 @@ def main() -> int:
                 {
                     "run_dir": str(args.run_dir.resolve()),
                     "last_transition": "retry-validation-evidence",
+                },
+            )
+        elif args.command == "retry-dependent-fixes":
+            output = _invoke(
+                args,
+                {
+                    "run_dir": str(args.run_dir.resolve()),
+                    "last_transition": "retry-dependent-fixes",
                 },
             )
         elif args.command == "approve":
