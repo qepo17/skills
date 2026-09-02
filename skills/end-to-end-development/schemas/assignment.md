@@ -10,7 +10,7 @@ Profiled stage fields:
 - validation: every exact sorted validation ID from the canonical plan, paired with the assigned commands;
 - review fixes: all compatible sorted `finding_ids` for that repository/round plus every planned validation ID/command;
 - validation fixes: compatible sorted `validation_ids`;
-- round-two review: the sorted finding IDs it verifies.
+- legacy round-two review: the sorted finding IDs it verifies; new runs do not schedule this stage.
 
 Thinking routing:
 
