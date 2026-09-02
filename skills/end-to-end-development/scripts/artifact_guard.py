@@ -125,7 +125,9 @@ RISK_FLAGS = {
     "public-interface",
     "security",
 }
-HIGH_RISK_FLAGS = RISK_FLAGS
+# Cross-repository scope needs coordination, but is not by itself a costly or
+# dangerous mechanism. It therefore does not force a design-critic worker.
+HIGH_RISK_FLAGS = RISK_FLAGS - {"cross-repository"}
 THINKING_LEVELS = {"medium", "high", "xhigh"}
 DECISION_KINDS = {
     "implementation",
@@ -481,39 +483,43 @@ def validate_workflow_policy(value: Any, profile: str, location: str) -> dict[st
     if attempt_budget > 60:
         fail(f"{location}.coordinator_attempt_budget", "must be at most 60")
     boolean(field(policy, "auto_resume", location), f"{location}.auto_resume")
-    if "user_plan_approval_required" in policy and not boolean(
-        policy["user_plan_approval_required"],
-        f"{location}.user_plan_approval_required",
-    ):
-        fail(
+    approval_required = True
+    if "user_plan_approval_required" in policy:
+        approval_required = boolean(
+            policy["user_plan_approval_required"],
             f"{location}.user_plan_approval_required",
-            "must be true when present; new runs may not waive user plan approval",
         )
 
     if profile == "full":
-        if not contract_required:
-            fail(f"{location}.contract_required", "full profile requires a shared contract")
-        if challenge_policy != "all":
-            fail(f"{location}.design_challenge", "full profile must challenge every plan")
-        if not integration_required:
-            fail(f"{location}.integration_required", "full profile requires integration")
-        if not report_required:
-            fail(f"{location}.report_required", "full profile requires a report")
+        # Older full runs used `all`; new runs use risk-only. Both remain
+        # resumable, while high-risk plans are independently required to opt in.
+        if challenge_policy not in {"all", "risk-only"}:
+            fail(
+                f"{location}.design_challenge",
+                "full profile challenges risk-bearing plans",
+            )
         if max_tasks != 3:
             fail(f"{location}.max_tasks_per_packet", "full profile uses three-task packets")
-        if second_review != "high-risk-fixes":
-            fail(f"{location}.second_review", "full profile uses targeted high-risk verification")
+        if second_review not in {"never", "high-risk-fixes"}:
+            fail(
+                f"{location}.second_review",
+                "full profile uses one review or legacy targeted high-risk verification",
+            )
+        if not approval_required:
+            fail(
+                f"{location}.user_plan_approval_required",
+                "full profile requires explicit user plan approval",
+            )
     if profile == "standard":
-        if contract_required:
-            fail(f"{location}.contract_required", "standard embeds its local contract in the plan")
         if challenge_policy != "risk-only":
             fail(f"{location}.design_challenge", "standard challenges risk-bearing plans")
-        if integration_required:
-            fail(f"{location}.integration_required", "standard is single-repository")
         if max_tasks != 3:
             fail(f"{location}.max_tasks_per_packet", "standard uses three-task packets")
-        if second_review != "high-risk-fixes":
-            fail(f"{location}.second_review", "standard uses targeted high-risk verification")
+        if second_review not in {"never", "high-risk-fixes"}:
+            fail(
+                f"{location}.second_review",
+                "standard uses one review or legacy targeted high-risk verification",
+            )
     if profile == "fast":
         if contract_required:
             fail(f"{location}.contract_required", "fast profile embeds the local contract in its plan")
@@ -627,8 +633,19 @@ def validate_plan_review(
 
     approved_at = field(review, "approved_at", location)
     approval_text = field(review, "approval_text", location)
+    approval_source = review.get("approval_source")
+    if approval_source is not None:
+        approval_source = enum(
+            approval_source,
+            {"user", "workflow-policy"},
+            f"{location}.approval_source",
+        )
     if review_status == "pending":
-        if approved_at is not None or approval_text is not None:
+        if (
+            approved_at is not None
+            or approval_text is not None
+            or approval_source is not None
+        ):
             fail(location, "pending plan review must not contain approval evidence")
     else:
         parsed_approved_at = timestamp(approved_at, f"{location}.approved_at")
@@ -749,13 +766,29 @@ def validate_run(data: dict[str, Any]) -> None:
         "review_rounds",
         "pipeline_fix_cycles",
     ):
-        integer(field(retries, name, "$.retry_limits"), f"$.retry_limits.{name}", minimum=0)
+        integer(
+            field(retries, name, "$.retry_limits"),
+            f"$.retry_limits.{name}",
+            minimum=0,
+        )
 
     repositories = obj(field(data, "repositories", "$"), "$.repositories")
     if not repositories:
         fail("$.repositories", "must not be empty")
-    if profile is not None and len(repositories) > 1 and profile != "full":
-        fail("$.profile", "multi-repository runs require the full profile")
+    if profile is not None and len(repositories) > 1:
+        assert workflow_policy is not None
+        if profile == "fast":
+            fail("$.profile", "fast profile is limited to one repository")
+        if not workflow_policy["contract_required"]:
+            fail(
+                "$.workflow_policy.contract_required",
+                "multi-repository runs require a shared contract",
+            )
+        if not workflow_policy["integration_required"]:
+            fail(
+                "$.workflow_policy.integration_required",
+                "multi-repository runs require integration verification",
+            )
     if list(repositories) != sorted(repositories):
         fail("$.repositories", "keys must be sorted lexicographically")
     for key, raw in repositories.items():
@@ -978,7 +1011,7 @@ def validate_run(data: dict[str, Any]) -> None:
         if phase != "plan-review" or plan_review_status != "pending":
             fail(
                 "$.status",
-                "awaiting-user is reserved for a pending mandatory plan review",
+                "awaiting-user is reserved for a pending full-profile plan review",
             )
         if actions:
             fail("$.next_actions", "must be empty during the user plan-review hard stop")
@@ -1200,6 +1233,15 @@ def validate_assignment(data: dict[str, Any]) -> None:
             file_only=True,
         )
 
+    input_tree_fingerprint = data.get("input_tree_fingerprint")
+    if input_tree_fingerprint is not None:
+        sha256(input_tree_fingerprint, "$.input_tree_fingerprint")
+        if assigned_repo is None or project_access == "write":
+            fail(
+                "$.input_tree_fingerprint",
+                "is valid only for repository-scoped read-only assignments",
+            )
+
     input_artifacts = array(field(data, "input_artifacts", "$"), "$.input_artifacts")
     if not input_artifacts:
         fail("$.input_artifacts", "must not be empty")
@@ -1363,6 +1405,14 @@ def validate_assignment(data: dict[str, Any]) -> None:
             fail("$.finding_ids", "is not valid for this stage")
         if stage == "validation-fix" and not assigned_validation_ids:
             fail("$.validation_ids", "validation fix batches require at least one validation ID")
+        evidence_stages = {"implement", "validate", "fix-1", "fix-2", "pipeline-fix"}
+        if stage in evidence_stages and len(assigned_validation_ids) != len(
+            data["validation_commands"]
+        ):
+            fail(
+                "$.validation_ids",
+                "must pair one planned validation ID with every assigned command",
+            )
     output_kind = enum(
         field(data, "output_kind", "$"),
         {
@@ -1610,7 +1660,13 @@ def validate_plan(data: dict[str, Any]) -> None:
                 "$.requirements_sha256",
                 f"expected {expected_requirements_hash} from the assigned requirements",
             )
-        expected_contract_count = 1 if assignment_profile == "full" else 0
+        expected_contract_count = (
+            1
+            if assignment_data.get(
+                "contract_required", assignment_profile == "full"
+            )
+            else 0
+        )
         if len(contract_inputs) != expected_contract_count:
             fail(
                 "$.assignment_path",
@@ -1627,20 +1683,26 @@ def validate_plan(data: dict[str, Any]) -> None:
                 "$.contract_sha256",
                 "must match the contract selected by the workflow profile",
             )
-    if assignment_profile == "full" and not challenge_required:
+    challenge_policy = assignment_data.get(
+        "design_challenge_policy", "all" if assignment_profile == "full" else "risk-only"
+    )
+    if challenge_policy == "all" and not challenge_required:
         fail(
             "$.design_challenge_required",
-            "full-profile plans require a design challenge",
+            "the assignment policy requires a design challenge",
         )
 
     validations = array(field(data, "validations", "$"), "$.validations")
     validation_ids: list[str] = []
+    validation_commands: list[str] = []
     has_migration_capable_validation = False
     for index, raw in enumerate(validations):
         loc = f"$.validations[{index}]"
         validation = obj(raw, loc)
         validation_ids.append(string(field(validation, "id", loc), f"{loc}.id"))
-        string(field(validation, "command", loc), f"{loc}.command", max_length=2000)
+        validation_commands.append(
+            string(field(validation, "command", loc), f"{loc}.command", max_length=2000)
+        )
         absolute_path(field(validation, "cwd", loc), f"{loc}.cwd", must_exist=True, directory_only=True)
         enum(field(validation, "scope", loc), {"focused", "broad", "integration"}, f"{loc}.scope")
         migration_capable = boolean(
@@ -1649,6 +1711,8 @@ def validate_plan(data: dict[str, Any]) -> None:
         has_migration_capable_validation = has_migration_capable_validation or migration_capable
     if validation_ids != sorted(validation_ids) or len(validation_ids) != len(set(validation_ids)):
         fail("$.validations", "validation IDs must be unique and sorted")
+    if len(validation_commands) != len(set(validation_commands)):
+        fail("$.validations", "validation commands must be unique")
     if (
         assignment_profile is not None
         and has_migration_capable_validation
@@ -2415,6 +2479,32 @@ def validate_result(data: dict[str, Any]) -> None:
     )
     if profiled and status == "complete" and data["stage"] == "validate" and not validation_records:
         fail("$.validations", "a complete validation result must contain evidence")
+    if profiled and status == "complete" and data["stage"] in {
+        "implement",
+        "validate",
+        "fix-1",
+        "fix-2",
+        "pipeline-fix",
+    }:
+        expected_evidence = set(
+            zip(
+                assignment.get("validation_ids", []),
+                assignment.get("validation_commands", []),
+                strict=True,
+            )
+        )
+        actual_evidence = {
+            (record.get("id"), record.get("command"))
+            for record in validation_records
+            if isinstance(record, dict)
+        }
+        missing_evidence = expected_evidence - actual_evidence
+        if missing_evidence:
+            fail(
+                "$.validations",
+                "missing assigned validation evidence: "
+                f"{sorted(validation_id for validation_id, _ in missing_evidence)}",
+            )
 
     decisions = array(field(data, "decisions", "$"), "$.decisions")
     for index, raw in enumerate(decisions):
@@ -2923,7 +3013,7 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
                     else None
                 ),
                 "risk_flags": [],
-                "design_challenge_required": assignment.get("profile") == "full",
+                "design_challenge_required": False,
                 "tasks": [],
                 "work_packets": [],
                 "validations": [],

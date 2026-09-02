@@ -1,13 +1,13 @@
 ---
 name: end-to-end-development
-description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional gates, explicit approval of the complete plan bundle, bounded work packets and remediation, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
+description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional approval and challenge gates, reusable validation evidence, single-pass review and remediation limits, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
 disable-model-invocation: true
 compatibility: Requires uv, Python 3.11+, Git worktrees, Pi or Codex, a repository forge CLI, and the installed codebase-design skill. Paseo, Herdr, and tmux are detected automatically when the coordinator runs inside them; otherwise workers run headlessly. LangGraph dependencies are installed from the locked skill project.
 ---
 
 # End-to-End Development
 
-Use the bundled **LangGraph workflow as the sole orchestration engine**. The current Pi/Codex agent performs only request/repository discovery, dedicated-worktree creation, bootstrap-spec construction, presentation of the plan-review interrupt, and concise presentation of terminal status. Do not manually choose phases, construct assignments, supervise workers, manage retries, mutate `run.json`, or bypass graph routing.
+Use the bundled **LangGraph workflow as the sole orchestration engine**. The current Pi/Codex agent performs only request/repository discovery, dedicated-worktree creation, bootstrap-spec construction, presentation of a high-risk plan-review interrupt when requested by policy, and concise presentation of terminal status. Do not manually choose phases, construct assignments, supervise workers, manage retries, mutate `run.json`, or bypass graph routing.
 
 Resolve `SKILL_DIR` to this directory. Before a new run or resume, read:
 
@@ -22,16 +22,16 @@ Workers read only their assigned `schemas/<kind>.md`, never the coordinator docu
 1. **One executable state machine.** LangGraph owns phase selection, conditional routing, retries, interrupts, fan-out/fan-in, writer leases, and completion. Never reimplement those decisions in the coordinator conversation.
 2. **Evidence is hash-pinned.** A result, validation, finding, blocker, approval, delivery, or next action is known only after it exists in validated durable state or an immutable artifact.
 3. **Reconcile before action.** Every graph path starts by reconciling run artifacts with output files and external state. Resume from artifacts, never conversation memory.
-4. **Follow the selected policy.** Conditional gates may be skipped only because the validated `workflow_policy` permits it. Profiles can escalate and never silently de-escalate.
+4. **Follow the selected policy.** Ordinary single- and multi-repository work may use the standard no-pause path. High-risk discovery escalates to full before project-file work.
 5. **One active project-file writer per repository.** The lease protects a role, not an agent identity. Work packets and fix batches preserve it.
 6. **Workers do not mutate coordinator state.** They write only their exact output, allowed project files, and log directory. The graph updates run, agent, event, lease, and checkpoint state.
-7. **Every loop is bounded.** Worker replacement, planning revision, validation fix, review, and pipeline fix limits are enforced by the graph. Never “continue until green.”
+7. **Every loop is bounded.** New runs get one review, one review-fix batch, one validation-fix cycle, and one pipeline-fix cycle. Worker replacement and planning revision limits are also enforced by the graph. Never “continue until green.”
 8. **Preserve evidence, not transcripts.** Full output stays in logs. Artifacts contain commands, hashes, exit codes, concise conclusions, and evidence paths.
 9. **No silent degradation.** Missing, invalid, oversized, stale-tree, or contradictory evidence leaves the gate incomplete.
 10. **Migration safety is mandatory.** The graph must have isolated local/test database-target evidence before migration-capable validation. Never use production, staging, shared, or ambiguous databases; never copy `.env` into a new worktree.
 11. **No undeclared high-cost mechanism.** Stop rather than invent a trigger, database function/procedure, backfill, background/event flow, cache, seam/adapter, storage system, or comparable mechanism absent from the approved plan.
 12. **Independent review remains mandatory.** Every profile gets at least one fresh baseline-to-worktree review before delivery.
-13. **Complete-plan approval is an unconditional hard gate.** Implementation cannot begin until a later user message explicitly approves every plan in the exact current hash-pinned review bundle. Pre-approval, silence, generic continuation, partial approval, and stale-bundle approval do not count.
+13. **High-risk plan approval is a hard gate.** Full-profile implementation cannot begin until a later user message explicitly approves every plan in the exact current hash-pinned review bundle. Fast/standard policy records an automatic hash-pinned decision without pausing; discovery of a high-risk surface invalidates it and escalates before implementation.
 14. **External side effects are idempotently reconciled.** LangGraph checkpointing does not make workers, commits, pushes, or PR creation exactly-once. Valid existing evidence is recovered instead of repeated.
 15. **Completed worker handles are short-lived.** The supervisor records an opaque backend handle, cleans it as soon as its worker settles and its output is captured, and records the result. Crash recovery uses the pinned backend to apply the same cleanup even when the output artifact already exists. Never report completion while a settled workflow worker remains open.
 
@@ -52,7 +52,7 @@ Do not invoke `workflow_tools.py run-batch` directly during a graph-managed run.
 Treat skill arguments plus relevant user conversation as the complete request.
 
 1. Discover every affected repository and every material risk before creating run state.
-2. Ask the user only when repository identity or a material product choice cannot be established from the request and repository evidence. The later plan-review interrupt is always mandatory.
+2. Ask the user only when repository identity or a material product choice cannot be established from the request and repository evidence. A later plan-review interrupt is mandatory only if policy selects full.
 3. Create one dedicated worktree per repository, preferring Worktrunk:
 
    ```bash
@@ -75,7 +75,7 @@ Treat skill arguments plus relevant user conversation as the complete request.
    "$ORCHESTRATOR" run "$RUN_DIR" --worker-runtime auto
    ```
 
-The command runs until completion, a validated blocker, or the plan-review LangGraph interrupt.
+The command runs until completion, a validated blocker, or a full-profile plan-review LangGraph interrupt.
 
 ### Resume
 
@@ -85,7 +85,7 @@ For an explicit run directory:
 "$ORCHESTRATOR" resume <absolute-run-directory> --worker-runtime auto
 ```
 
-If the user says only “continue,” search the durable root for incomplete runs whose repository roots contain the current directory. Resume only when exactly one matches; otherwise list candidates. If that run is awaiting plan review, **do not call `resume`**: re-present the current bundle and request explicit whole-bundle approval or changes.
+If the user says only “continue,” search the durable root for incomplete runs whose repository roots contain the current directory. Resume only when exactly one matches; otherwise list candidates. If that full-profile run is awaiting plan review, **do not call `resume`**: re-present the current bundle and request explicit whole-bundle approval or changes.
 
 Inspect without advancing:
 
@@ -109,9 +109,9 @@ If a dependent fix was started concurrently with an upstream contract fix and st
 
 The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
 
-## Mandatory plan-review interrupt
+## Full-profile plan-review interrupt
 
-When the graph returns `status: awaiting-user` and `phase: plan-review`:
+Fast and standard runs still emit a complete hash-pinned review bundle, but policy accepts it atomically without a user pause. When a full-profile graph returns `status: awaiting-user` and `phase: plan-review`:
 
 1. Read `plan_review.path` and verify the reported SHA-256 still matches.
 2. Present the bundle path, hash, and concise per-repository task/packet/risk/validation summaries.
@@ -165,33 +165,35 @@ python3 "$SKILL_DIR/scripts/workflow_tools.py" policy \
   [--profile auto|fast|standard|full] [--report]
 ```
 
-`fast` is opt-in. `standard` is the automatic low-risk single-repository default. Multiple repositories or authorization, security, concurrency, migration, backfill, background processing, new storage, or another high-cost mechanism force `full`. Planning can escalate the profile when it discovers risk.
+`fast` is opt-in. `standard` is the automatic ordinary-work default, including coordinated multi-repository changes. Authorization, security, concurrency, migration, backfill, background processing, new storage, public-interface changes, or another high-cost mechanism force `full`. Planning can escalate before implementation when it discovers risk. Repository count and the `cross-repository` flag alone do not force full.
 
 | Gate | Fast | Standard | Full |
 |---|---|---|---|
-| Shared contract | embedded in plan | embedded in plan | worker required |
-| Design challenge | none unless discovery escalates | risk-only | every plan |
-| Complete-plan user approval | required | required | required |
+| Shared contract | embedded in plan | multi-repository only | multi-repository only |
+| Design challenge | none unless discovery escalates | risk-only | risk-only |
+| Complete-plan user approval | policy-accepted | policy-accepted | explicit user approval |
 | Implementation packet | ≤4 tasks | ≤3 tasks | ≤3 tasks |
 | Independent full review | one | one | one |
-| Targeted second review | never | high-risk fixes | high-risk fixes |
-| Cross-repository integration | no | no | required |
-| Deterministic HTML report | requested only | requested only | required |
+| Targeted second review | never | never | never |
+| Cross-repository integration | no | multi-repository only | multi-repository only |
+| Deterministic HTML report | requested only | requested only | requested only |
 
-Default retry limits remain:
+New runs use these hard stage limits:
 
 ```json
 {
   "worker_replacements_per_stage": 1,
   "contract_revisions": 1,
   "plan_revision_cycles": 1,
-  "validation_fix_cycles": 2,
-  "review_rounds": 2,
-  "pipeline_fix_cycles": 2
+  "validation_fix_cycles": 1,
+  "review_rounds": 1,
+  "pipeline_fix_cycles": 1
 }
 ```
 
-Never modify limits during an active run. The graph checks `coordinator_attempt_budget` after each atomic batch. When reached, it checkpoints at `reconcile`; when `auto_resume` is true the CLI starts a fresh bounded graph invocation from that checkpoint, otherwise it returns `outcome: budget-checkpoint` for a supported later resume. Neither path can cross a pending plan-review interrupt.
+A review may produce one compatible `fix-1` batch, but that fix never starts another review. A validation or required-check failure may produce one compatible fix batch and one check afterward; another failure blocks with preserved evidence. Never modify limits during an active run. Existing durable runs retain their pinned limits when resumed.
+
+The graph checks `coordinator_attempt_budget` after each atomic batch. When reached, it checkpoints at `reconcile`; when `auto_resume` is true the CLI starts a fresh bounded graph invocation from that checkpoint, otherwise it returns `outcome: budget-checkpoint` for a supported later resume. Neither path can cross a pending plan-review interrupt.
 
 ## Executable phase behavior
 
@@ -200,18 +202,18 @@ The compiled graph contains these phase nodes, with `reconcile` between every tr
 1. `bootstrap`, auto-detecting and pinning the worker backend/runtime, then verifying Git worktrees, forge remotes, and forge CLI authentication
 2. `contract` when policy requires it
 3. `plan`, including conditional challenge and one bounded revision
-4. `plan-review`, implemented with LangGraph `interrupt()`
+4. `plan-review`, implemented with LangGraph `interrupt()` only for full; fast/standard records a policy decision and proceeds
 5. `implement`, scheduling topologically eligible work packets
-6. `validate`, with tree-keyed evidence and bounded validation-fix batches
+6. `validate`, with at most one validation-fix batch
 7. `review-1`
-8. `fix-1` when must-fix findings exist
-9. `review-2` only when policy and high-risk fixes require targeted verification
-10. `fix-2` for one verification-regression batch; never round three
-11. `integrate` when policy requires it
-12. `deliver`, with bounded pipeline-fix cycles for change-related failures
-13. post-delivery current-tree validation
-14. `report` when required
-15. `complete`, with final audit and deterministic metrics
+8. `fix-1` when must-fix findings exist, with no follow-up review cycle
+9. `integrate` when policy requires it
+10. `deliver`, with at most one pipeline-fix batch for change-related failures
+11. post-delivery content-evidence confirmation
+12. `report` when required
+13. `complete`, with final audit and deterministic metrics
+
+The graph retains `review-2` and `fix-2` nodes only so older durable runs with a pinned two-round limit can resume safely. New runs never schedule them.
 
 Repository IDs and stable IDs sort lexicographically. Independent repositories launch together through one supervisor batch. Contract dependency evidence is the only reason to serialize repositories.
 
@@ -221,11 +223,11 @@ The graph constructs immutable assignments and invokes the supervisor internally
 
 `--worker-runtime auto` inherits a Paseo parent's Pi/Codex provider when present, otherwise follows the coordinator: Codex when `CODEX_THREAD_ID` is present and Pi by default. `E2E_COORDINATOR_RUNTIME` remains an internal diagnostic override, not required user setup.
 
-Every worker uses `gpt-5.6-luna` with maximum runtime reasoning. Assignment `thinking` remains the policy classification:
+Every worker uses `gpt-5.6-luna` with assignment-proportional runtime reasoning:
 
-- `xhigh`: full contract, planning, design challenge, review, integration;
-- `high`: standard planning/review, implementation, complex fixes;
-- `medium`: validation, mechanical fixes, delivery, report tooling.
+- `xhigh` (runtime `max`): full planning, design challenge, review, and integration;
+- `high`: standard planning/review, implementation, and complex fixes;
+- `medium`: validation, mechanical fixes, and delivery.
 
 Workers never spawn nested agents. A Paseo coordinator creates Paseo subagents, Herdr creates non-focused workspaces, tmux creates detached windows, and direct mode runs non-interactively without a terminal manager. The supervisor archives or closes each settled handle immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis.
 
@@ -235,15 +237,15 @@ The plan defines the packet, not individual task, as the implementation unit. A 
 
 ### Validation and review
 
-The graph computes the exact Git worktree fingerprint and reuses passing validation only when validation ID, exact command hash, and tree fingerprint match accepted evidence. Compatible failures are fixed in one batch and checked once afterward.
+The graph computes a content fingerprint independent of commit identity. The final implementation/fix writer runs the complete planned suite, and the graph reuses that evidence only when validation ID, exact command hash, and content fingerprint match. A delivery-only commit therefore causes no duplicate validation; any source change invalidates the evidence. Compatible failures are fixed in one batch and checked once afterward.
 
-Round one independently reviews the complete baseline-to-worktree state. Critical/high actionable findings always block; medium correctness/spec findings normally block; low findings remain advisory. Compatible must-fix findings are resolved in one repository batch. Round two is targeted verification only and cannot become another unrestricted review.
+One fresh worker independently reviews the complete baseline-to-worktree state. Critical/high actionable findings always block; medium correctness/spec findings normally block; low findings remain advisory. Compatible must-fix findings are resolved in one repository batch, affected checks run once, and the workflow proceeds without a second review. An incompatible or still-failing correction blocks instead of opening another remediation loop.
 
 ### Delivery and completion
 
-Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures use the bounded pipeline-fix path.
+Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures get at most one pipeline-fix batch.
 
-Because delivery changes `HEAD`, the graph re-keys validation to the committed tree before completion. Completion then verifies exact plan approval, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically.
+After delivery, the graph verifies that the committed content still matches passing evidence rather than invalidating it merely because `HEAD` changed. Completion then verifies the policy-selected plan decision, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically.
 
 ## Final response
 

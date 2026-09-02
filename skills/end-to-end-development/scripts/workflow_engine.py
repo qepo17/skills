@@ -698,6 +698,7 @@ class WorkflowEngine:
         }:
             return "xhigh"
         if stage in {
+            "contract",
             "plan",
             "design-challenge",
             "implement",
@@ -705,6 +706,7 @@ class WorkflowEngine:
             "review-2",
             "fix-1",
             "fix-2",
+            "integrate",
         }:
             return "high"
         return "medium"
@@ -817,6 +819,11 @@ class WorkflowEngine:
             "preexisting_status_path": repository["initial_status_path"]
             if repository
             else None,
+            "input_tree_fingerprint": (
+                workflow_tools.worktree_fingerprint(Path(repository["worktree"]))
+                if repository and not write
+                else None
+            ),
             "input_artifacts": references,
             "requirement_ids": self._requirement_ids(repo_id),
             "task_ids": sorted(task_ids),
@@ -841,7 +848,14 @@ class WorkflowEngine:
             assignment["task_ids"] = []
         if stage not in {"fix-1", "fix-2", "review-2"}:
             assignment["finding_ids"] = []
-        if stage not in {"validate", "validation-fix"}:
+        if stage not in {
+            "implement",
+            "validate",
+            "validation-fix",
+            "fix-1",
+            "fix-2",
+            "pipeline-fix",
+        }:
             assignment["validation_ids"] = []
         if write:
             review = run.get("plan_review")
@@ -912,6 +926,14 @@ class WorkflowEngine:
         if len(raw) > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
             raise artifact_guard.ValidationError("artifact exceeds its size limit")
         artifact = json.loads(raw)
+        artifact = workflow_tools.normalize_worker_artifact(
+            Path(artifact["assignment_path"]),
+            assignment,
+            output_path,
+            artifact,
+        )
+        if output_path.stat().st_size > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
+            raise artifact_guard.ValidationError("normalized artifact exceeds its size limit")
         artifact_guard.CURRENT_ARTIFACT_PATH = output_path
         artifact_guard.VALIDATORS[assignment["output_kind"]](
             artifact_guard.obj(artifact, "$")
@@ -1305,21 +1327,20 @@ class WorkflowEngine:
             )
             for validation in self._current_plan(repo_id)[1]["validations"]
         }
-        for item in reversed(
-            self._artifacts(repo_id=repo_id, stage="validate", kind="result")
-        ):
-            _, artifact, assignment = item
+        for item in reversed(self._artifacts(repo_id=repo_id, kind="result")):
+            path, artifact, assignment = item
             if (
                 artifact.get("status") != "complete"
                 or artifact.get("tree_fingerprint") != fingerprint
             ):
                 continue
-            if latest_writer is not None and not self._assignment_pins(
-                assignment,
-                latest_writer[0],
-                _sha256(latest_writer[0]),
-            ):
-                continue
+            if latest_writer is not None and path.resolve() != latest_writer[0].resolve():
+                if not self._assignment_pins(
+                    assignment,
+                    latest_writer[0],
+                    _sha256(latest_writer[0]),
+                ):
+                    continue
             evidence = {
                 (record["id"], record.get("command_sha256"))
                 for record in artifact.get("validations", [])
@@ -1663,7 +1684,11 @@ class WorkflowEngine:
             inputs = [Path(run["request_path"]), Path(run["requirements_path"])]
             if run.get("contract_path"):
                 inputs.append(Path(run["contract_path"]))
-            extras: dict[str, Any] = {"plan_revision": revision}
+            extras: dict[str, Any] = {
+                "plan_revision": revision,
+                "contract_required": run["workflow_policy"]["contract_required"],
+                "design_challenge_policy": run["workflow_policy"]["design_challenge"],
+            }
             if previous_path and basis:
                 basis_kind, basis_path = basis
                 inputs.extend([previous_path, basis_path])
@@ -1912,10 +1937,9 @@ class WorkflowEngine:
         run = self.load_run()
         if not all(self._plan_ready(run, repo_id) for repo_id in run["repositories"]):
             return "plan"
-        self._prepare_plan_review(run)
-        return "plan-review"
+        return self._prepare_plan_review(run)
 
-    def _prepare_plan_review(self, run: dict[str, Any]) -> None:
+    def _prepare_plan_review(self, run: dict[str, Any]) -> str:
         versions = [
             int(match.group(1))
             for path in self.run_dir.glob("plan-review-v*.md")
@@ -1923,10 +1947,13 @@ class WorkflowEngine:
         ]
         version = max(versions, default=0) + 1
         path = self.run_dir / f"plan-review-v{version}.md"
+        approval_required = run["workflow_policy"].get(
+            "user_plan_approval_required", True
+        )
         lines = [
             f"# Plan review — {run['run_id']} (v{version})",
             "",
-            "This bundle is complete and hash-pinned. Approval applies only to this exact bundle.",
+            "This bundle is complete and hash-pinned.",
             "",
             "## Requirements",
         ]
@@ -1993,33 +2020,49 @@ class WorkflowEngine:
                 "design_challenge_path": repository.get("design_challenge_path"),
                 "design_challenge_sha256": repository.get("design_challenge_sha256"),
             }
-        lines.extend(
-            [
-                "",
-                "## Approval",
-                "Approve all plans in this exact review bundle, or send the changes you want.",
-            ]
-        )
+        if approval_required:
+            lines.extend(
+                [
+                    "",
+                    "## Approval",
+                    "Approve all plans in this exact review bundle, or send the changes you want.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## Policy decision",
+                    "The selected low-risk policy accepts this bundle without a user pause.",
+                ]
+            )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        decided_at = self.now()
         review = {
-            "status": "pending",
-            "requested_at": self.now(),
+            "status": "pending" if approval_required else "approved",
+            "requested_at": decided_at,
             "review_path": str(path.resolve()),
             "review_sha256": _sha256(path),
             "contract_sha256": run.get("contract_sha256"),
             "plans": plans,
-            "approved_at": None,
-            "approval_text": None,
+            "approved_at": None if approval_required else decided_at,
+            "approval_text": (
+                None
+                if approval_required
+                else "Automatically accepted by the selected low-risk workflow policy."
+            ),
+            "approval_source": None if approval_required else "workflow-policy",
         }
+        next_phase = "plan-review" if approval_required else "implement"
         with RunLock(self.run_dir):
             current = self.load_run()
-            current["phase"] = "plan-review"
-            current["status"] = "awaiting-user"
+            current["phase"] = next_phase
+            current["status"] = "awaiting-user" if approval_required else "working"
             current["plan_review"] = review
             current["next_actions"] = []
             current["blockers"] = []
             for repository in current["repositories"].values():
-                repository["stage"] = "plan-review"
+                repository["stage"] = next_phase
                 repository["status"] = "pending"
                 repository["active_writer"] = None
             self._save_run(current)
@@ -2027,8 +2070,16 @@ class WorkflowEngine:
             "plan-review-requested",
             artifact=str(path.resolve()),
             bundle_sha256=review["review_sha256"],
-            next_action=None,
+            next_action=None if approval_required else "implement",
         )
+        if not approval_required:
+            self._append_event(
+                "plan-approved",
+                approval_text=review["approval_text"],
+                approval_source="workflow-policy",
+                next_action="implement",
+            )
+        return next_phase
 
     def plan_review_payload(self) -> dict[str, Any]:
         run = self.load_run()
@@ -2078,6 +2129,7 @@ class WorkflowEngine:
                 run["plan_review"]["status"] = "approved"
                 run["plan_review"]["approved_at"] = self.now()
                 run["plan_review"]["approval_text"] = text
+                run["plan_review"]["approval_source"] = "user"
                 run["phase"] = "implement"
                 run["status"] = "working"
                 for repository in run["repositories"].values():
@@ -2187,17 +2239,29 @@ class WorkflowEngine:
             if not eligible:
                 continue
             packet = sorted(eligible, key=lambda item: item["id"])[0]
-            validations = {
+            validation_ids = {
                 task_validation
                 for task in plan["tasks"]
                 if task["id"] in packet["task_ids"]
                 for task_validation in task["validation_ids"]
             }
-            commands = [
-                validation["command"]
+            # The final writer runs the complete planned suite. Its evidence is
+            # therefore reusable by the validation gate and after a delivery-
+            # only commit; earlier packets keep their checks focused.
+            if len(completed) + 1 == len(plan["work_packets"]):
+                validation_ids = {
+                    validation["id"] for validation in plan["validations"]
+                }
+            selected_validations = [
+                validation
                 for validation in plan["validations"]
-                if validation["id"] in validations
+                if validation["id"] in validation_ids
             ]
+            if any(
+                validation["migration_capable"] for validation in selected_validations
+            ) and not self._migration_guard(repo_id):
+                return "blocked"
+            commands = [validation["command"] for validation in selected_validations]
             assignments.append(
                 self.build_assignment(
                     stage="implement",
@@ -2209,6 +2273,9 @@ class WorkflowEngine:
                         "Stop rather than introduce an undeclared high-cost mechanism or material contract change.",
                     ],
                     validation_commands=commands,
+                    validation_ids=[
+                        validation["id"] for validation in selected_validations
+                    ],
                     task_ids=packet["task_ids"],
                     packet_id=packet["id"],
                 )
@@ -2360,9 +2427,17 @@ class WorkflowEngine:
         self._set_phase("review-1")
         return "review-1"
 
+    def _review_round_allowed(self, round_number: int) -> bool:
+        # Independent round one remains mandatory for legacy runs that recorded
+        # zero before this field was enforced. Higher rounds honor the pin.
+        limit = max(1, self.load_run()["retry_limits"]["review_rounds"])
+        return round_number <= limit
+
     def _review_assignment(
         self, repo_id: str, round_number: int, finding_ids: list[str]
     ) -> Path:
+        if not self._review_round_allowed(round_number):
+            raise WorkflowError(f"review round {round_number} exceeds the run limit")
         stage = f"review-{round_number}"
         return self.build_assignment(
             stage=stage,
@@ -2498,6 +2573,7 @@ class WorkflowEngine:
                         "Accepted upstream fix artifacts in the assignment supersede earlier generated-contract provenance; regenerate from the current read-only upstream worktrees.",
                     ],
                     validation_commands=self._plan_commands(repo_id),
+                    validation_ids=self._plan_validation_ids(repo_id),
                     finding_ids=ids,
                     extras={"repositories": scoped_repositories},
                 )
@@ -2524,7 +2600,10 @@ class WorkflowEngine:
 
     def _needs_second_review(self) -> bool:
         run = self.load_run()
-        if run["workflow_policy"]["second_review"] == "never":
+        if (
+            run["retry_limits"]["review_rounds"] < 2
+            or run["workflow_policy"]["second_review"] == "never"
+        ):
             return False
         for repo_id in run["repositories"]:
             review = self._latest_review(repo_id, 1)
@@ -2538,6 +2617,8 @@ class WorkflowEngine:
         return False
 
     def phase_review_2(self) -> str:
+        if not self._review_round_allowed(2):
+            return self._after_reviews()
         assignments: list[Path] = []
         for repo_id in sorted(self.load_run()["repositories"]):
             round_one = self._latest_review(repo_id, 1)
@@ -2563,6 +2644,8 @@ class WorkflowEngine:
         return self._after_reviews()
 
     def phase_fix_2(self) -> str:
+        if not self._review_round_allowed(2):
+            return self._after_reviews()
         outcome = self._phase_fix(2)
         if outcome == "fix-2":
             return outcome
@@ -2666,6 +2749,7 @@ class WorkflowEngine:
                                 "Run affected local validation once; do not modify delivery/Git state.",
                             ],
                             validation_commands=self._plan_commands(repo_id),
+                            validation_ids=self._plan_validation_ids(repo_id),
                         )
                     )
                     continue
@@ -2679,7 +2763,8 @@ class WorkflowEngine:
                         return "blocked"
             return "deliver"
 
-        # Delivery changes HEAD. Re-key validation to the committed tree before completion.
+        # A delivery-only commit preserves the content fingerprint, so passing
+        # writer evidence is reused. Any pipeline source change still invalidates it.
         outcome = self._run_validation_wave(run["repositories"], "post-delivery")
         if outcome == "blocked":
             return "blocked"
@@ -2935,9 +3020,9 @@ class WorkflowEngine:
                 "worker_replacements_per_stage": 1,
                 "contract_revisions": 1,
                 "plan_revision_cycles": 1,
-                "validation_fix_cycles": 2,
-                "review_rounds": 2,
-                "pipeline_fix_cycles": 2,
+                "validation_fix_cycles": 1,
+                "review_rounds": 1,
+                "pipeline_fix_cycles": 1,
             },
             "repositories": repositories,
             "accepted_artifacts": {},

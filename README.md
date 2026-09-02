@@ -8,7 +8,7 @@ Two Agent Skills for taking software changes from request to pull request:
 | Skill | Use it for |
 | --- | --- |
 | `fast-end-to-end-development` | A small or medium, low-risk change in one repository with one plan, review, and revision pass. |
-| `end-to-end-development` | Higher-risk or multi-repository work that needs durable orchestration, explicit plan approval, bounded retries, and resumability. |
+| `end-to-end-development` | Durable single- or multi-repository orchestration with one review/remediation pass, automatic low-risk plan decisions, and explicit approval only for high-risk work. |
 
 The repository follows the [Agent Skills specification](https://agentskills.io/specification) and uses the conventional `skills/<name>/SKILL.md` catalog layout supported by [`npx skills`](https://github.com/vercel-labs/skills).
 
@@ -65,10 +65,10 @@ npx skills update --global end-to-end-development fast-end-to-end-development
 ### Fast workflow
 
 - Git and the target repository's forge CLI, such as `gh`
-- Python 3 for the bundled HTML explainer renderer
+- Python 3 when the optional HTML explainer is requested
 - An agent runtime capable of running independent agent sessions
 
-### Full workflow
+### Durable workflow
 
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
@@ -77,9 +77,9 @@ npx skills update --global end-to-end-development fast-end-to-end-development
 - The target repository's forge CLI
 - The `codebase-design` skill
 
-The full workflow automatically uses Paseo when invoked by a Paseo parent agent, Herdr when invoked inside Herdr, or tmux when invoked inside tmux. Otherwise it runs workers directly in headless mode; users do not configure a terminal manager. The detected backend is pinned for resumability.
+The durable workflow automatically uses Paseo when invoked by a Paseo parent agent, Herdr when invoked inside Herdr, or tmux when invoked inside tmux. Otherwise it runs workers directly in headless mode; users do not configure a terminal manager. The detected backend is pinned for resumability. New runs use one independent review, at most one review-fix batch, one validation-fix batch, and one pipeline-fix batch. Ordinary multi-repository work stays on the standard profile; authorization, security, migrations, public-interface changes, and other high-cost surfaces escalate to full and pause for plan approval.
 
-The full workflow finds `codebase-design` beside the installed skill and in common Pi/Codex global skill directories. Set `E2E_CODEBASE_DESIGN_DIR` when it lives elsewhere. The workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
+The durable workflow finds `codebase-design` beside the installed skill and in common Pi/Codex global skill directories. Set `E2E_CODEBASE_DESIGN_DIR` when it lives elsewhere. The workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
 
 ## Repository layout
 

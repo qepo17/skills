@@ -1,13 +1,13 @@
 ---
 name: fast-end-to-end-development
-description: "Run a lightweight, artifact-backed development workflow for an ordinary single-repository change: agent planning, implementation, one independent review, one revision pass, pull-request creation, and a self-contained HTML PR explainer. Use when the user wants a quicker end-to-end coding flow and does not require the full end-to-end-development approval, multi-review, integration, or resumability gates."
+description: "Run a lightweight, artifact-backed development workflow for an ordinary single-repository change: agent planning, implementation, one independent review, one revision pass, and pull-request creation, with an optional self-contained HTML explainer. Use when the user wants a quicker end-to-end coding flow and does not require durable orchestration, high-risk approval, multi-repository integration, or resumability."
 ---
 
 # Fast End-to-End Development
 
 Use this skill for a small or medium change that should move from request to pull request in one bounded pass:
 
-`plan → implement → review once → revise once → create PR → render HTML explainer`
+`plan → implement → review once → revise once → create PR → [optional HTML explainer]`
 
 The current agent owns the run. Keep the process fast by removing Herdr worker orchestration, multi-profile policy selection, mandatory plan-approval pauses, integration workers, and retry loops. Keep the safety that matters: preserve pre-existing work, inspect repository instructions, record evidence, use a fresh reviewer, cap remediation at one batch, and stop on material ambiguity or high-risk scope.
 
@@ -15,7 +15,7 @@ Resolve `SKILL_DIR` to this skill's directory. Set `RUN_DIR` to the run director
 
 ## Agent runtime
 
-Use `gpt-5.6-luna` with `max` reasoning for the coordinator and every agent session in this workflow. This applies to planning, implementation, the independent review, revision, delivery, and any delegated artifact-rendering work. Do not switch models or lower reasoning effort for a supposedly mechanical stage. When launching agents explicitly, pass the equivalent runtime settings: `model: gpt-5.6-luna` and `reasoning_effort: max` for Codex, or `--model openai-codex/gpt-5.6-luna --thinking max` for Pi.
+Use `gpt-5.6-luna` with effort proportional to the work: `high` for planning, implementation, review, and revision; `medium` for delivery or artifact rendering. Mechanical Git, forge, and renderer commands do not need a delegated model session. When launching an agent explicitly, pass the corresponding Codex `reasoning_effort` or Pi `--thinking` value.
 
 ## Herdr pane lifecycle
 
@@ -50,8 +50,8 @@ Keep concise evidence there; keep full command output in a `logs/` child directo
 | `review.md` | Exactly one independent review, findings, severity, and evidence |
 | `revision.md` | Finding dispositions, any fixes, and post-revision checks |
 | `delivery.md` | Commit, branch, PR URL, and forge/check status |
-| `pr-explainer.json` | Sanitized structured input for the HTML renderer |
-| `pr-explainer.html` | Self-contained human-readable PR explainer |
+| `pr-explainer.json` | When requested: sanitized structured input for the HTML renderer |
+| `pr-explainer.html` | When requested: self-contained human-readable PR explainer |
 
 Do not put secrets, environment values, full diffs, or unbounded terminal transcripts in these artifacts. Record commands, exit codes, short conclusions, hashes, and paths instead.
 
@@ -62,7 +62,7 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 - Keep one project-file writer. Do not let a reviewer or delivery step edit source files.
 - Close every workflow-created Herdr pane immediately after its agent settles and its result is captured; retain only working, blocked, or timed-out panes that still need attention.
 - Treat the plan as the implementation contract. A simpler equivalent change or focused test is allowed; a new high-cost mechanism, public contract, migration, or unrelated refactor requires escalation.
-- Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a third review/fix cycle.
+- Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a second review or revision batch.
 - Do not create the PR until the revision gate and required local checks pass. If a post-PR CI failure needs code changes after the one revision is spent, report the blocker and recommend the full workflow.
 - Keep the HTML explainer derived from accepted artifacts, not from memory or raw transcripts.
 
@@ -117,9 +117,9 @@ Before delivery, verify the diff contains only task changes, no secrets, and no 
 
 Use the forge's normal authentication and PR tooling. Do not amend or force-push unrelated history. If the forge rejects delivery for authentication, permission, or infrastructure reasons, preserve the artifacts and report the exact next action.
 
-### 6. Render the PR explainer in HTML
+### 6. Optionally render the PR explainer in HTML
 
-After the PR exists, write a sanitized `pr-explainer.json` from the plan, implementation, review, revision, and delivery artifacts. Render a self-contained HTML file:
+Run this step only when the user requested an HTML report/explainer. After the PR exists, write a sanitized `pr-explainer.json` from the plan, implementation, review, revision, and delivery artifacts. Render a self-contained HTML file:
 
 ```bash
 python3 "$SKILL_DIR/scripts/render_pr_explainer.py" \
@@ -133,14 +133,14 @@ The renderer requires non-empty `title`, `summary`, `repository`, and `pr_url` f
 
 ## Completion handoff
 
-Finish only when the PR exists, `pr-explainer.html` validates as a readable file, and every completed Herdr pane created by the workflow has been closed. Report, briefly:
+Finish only when the PR exists, any requested `pr-explainer.html` validates as a readable file, and every completed Herdr pane created by the workflow has been closed. Report, briefly:
 
 - status and PR URL;
 - final commit and check state;
-- run directory and HTML artifact path;
+- run directory and HTML artifact path when requested;
 - unresolved advisory findings or blockers, if any.
 
-If any gate fails, do not claim completion. Leave the durable artifacts in place and state the exact resume action or escalation to the full `end-to-end-development` skill.
+If any gate fails, do not claim completion. Leave the durable artifacts in place and state the exact resume action or escalation to the full `end-to-end-development` skill. Absence of an unrequested HTML explainer is not a failed gate.
 
 ## Bundled resource
 
