@@ -19,10 +19,10 @@ from typing import Any, Callable, Mapping
 DEFAULT_WORKER_MODEL = "gpt-6-astra"
 DEFAULT_WORKER_THINKING = "xhigh"
 THINKING_BY_CLASSIFICATION = {
-    "medium": DEFAULT_WORKER_THINKING,
-    "high": DEFAULT_WORKER_THINKING,
-    "xhigh": DEFAULT_WORKER_THINKING,
-    "max": DEFAULT_WORKER_THINKING,
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "xhigh",  # legacy alias, never sent to Pi/Codex as 'max'
 }
 WORKER_BACKENDS = {"direct", "herdr", "paseo", "tmux"}
 WORKER_RUNTIMES = {"codex", "pi"}
@@ -30,9 +30,12 @@ WORKER_RUNTIMES = {"codex", "pi"}
 RunProcess = Callable[[list[str], float | None], subprocess.CompletedProcess[bytes]]
 
 
-def runtime_thinking(classification: str) -> str:
+def runtime_thinking(classification: str, *, policy: str = "stage-v1") -> str:
+    if policy not in {"stage-v1", "legacy-xhigh"}:
+        raise ValueError(f"unsupported worker reasoning policy: {policy}")
     try:
-        return THINKING_BY_CLASSIFICATION[classification]
+        selected = THINKING_BY_CLASSIFICATION[classification]
+        return DEFAULT_WORKER_THINKING if policy == "legacy-xhigh" else selected
     except KeyError as exc:
         raise ValueError(f"unknown thinking classification: {classification}") from exc
 
@@ -424,6 +427,8 @@ class WorkerSupervisor:
             "agent_name": request.agent_name,
             "backend": self.context.backend,
             "runtime": request.runtime,
+            "model": DEFAULT_WORKER_MODEL,
+            "thinking": request.thinking,
             "handle_id": None,
             "started_at": self._now(),
             "ended_at": None,

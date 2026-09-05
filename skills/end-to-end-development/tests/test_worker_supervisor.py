@@ -239,8 +239,63 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual("xhigh", preview["command"][thinking_index])
         for classification in ("medium", "high", "xhigh", "max"):
             self.assertEqual(
-                "xhigh", worker_supervisor.runtime_thinking(classification)
+                "xhigh", worker_supervisor.runtime_thinking(classification, policy="legacy-xhigh")
             )
+
+    def test_stage_reasoning_reaches_pi_and_codex_commands(self) -> None:
+        for runtime in ("pi", "codex"):
+            for level in ("medium", "high", "xhigh"):
+                with self.subTest(runtime=runtime, level=level):
+                    supervisor = worker_supervisor.WorkerSupervisor(
+                        self.run_dir,
+                        worker_supervisor.ExecutionContext("direct", runtime, "test", {}),
+                    )
+                    thinking = worker_supervisor.runtime_thinking(level)
+                    command = supervisor.preview(self.request(runtime, thinking))["command"]
+                    if runtime == "pi":
+                        self.assertEqual(level, command[command.index("--thinking") + 1])
+                    else:
+                        self.assertIn(f'model_reasoning_effort="{level}"', command)
+
+    def test_reasoning_reaches_paseo_and_herdr_launchers(self) -> None:
+        for backend in ("paseo", "herdr"):
+            for runtime in ("pi", "codex"):
+                for level in ("medium", "high", "xhigh"):
+                    with self.subTest(backend=backend, runtime=runtime, level=level):
+                        runner = FakeCommandRunner({
+                            "paseo run": (0, {"id": "worker-1"}),
+                            "paseo wait": (0, {"status": "idle"}),
+                            "paseo archive": (0, {"archived": True}),
+                            "herdr workspace create": (0, {"workspace_id": "w1", "pane_id": "p1"}),
+                            "herdr workspace close": (0, {"closed": True}),
+                            "herdr agent": (0, {"status": "idle"}),
+                        })
+                        supervisor = worker_supervisor.WorkerSupervisor(
+                            self.run_dir, worker_supervisor.ExecutionContext(backend, runtime, "test", {}),
+                            run_process=runner,
+                        )
+                        result = supervisor.run_batch([self.request(runtime, level)])[0]
+                        self.assertTrue(result["settled"])
+                        launch = next(c for c in runner.commands if c[1:2] == ["run"] or c[1:3] == ["agent", "start"])
+                        if backend == "herdr" and runtime == "codex":
+                            self.assertIn(f'model_reasoning_effort="{level}"', launch)
+                        else:
+                            self.assertEqual(level, launch[launch.index("--thinking") + 1])
+
+    def test_tmux_reasoning_is_preserved_in_the_detached_command(self) -> None:
+        for runtime in ("pi", "codex"):
+            for level in ("medium", "high", "xhigh"):
+                supervisor = worker_supervisor.WorkerSupervisor(
+                    self.run_dir, worker_supervisor.ExecutionContext("tmux", runtime, "test", {}),
+                )
+                command = supervisor.preview(self.request(runtime, level))["command"][-1]
+                expected = f"--thinking {level}" if runtime == "pi" else f'model_reasoning_effort="{level}"'
+                self.assertIn(expected, command)
+
+    def test_unknown_reasoning_policy_never_silently_changes_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported worker reasoning policy"):
+            worker_supervisor.runtime_thinking("medium", policy="unavailable")
+        self.assertEqual("xhigh", worker_supervisor.runtime_thinking("max"))
 
     def test_tmux_preview_creates_a_detached_window_without_focus(self) -> None:
         supervisor = worker_supervisor.WorkerSupervisor(

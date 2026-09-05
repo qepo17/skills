@@ -7,8 +7,11 @@ before returning control to the coordinator.
 
 from __future__ import annotations
 
+import argparse
+import copy
 import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -147,11 +150,24 @@ CURRENT_ARTIFACT_PATH: Path | None = None
 
 
 class ValidationError(Exception):
-    pass
+    """A readable failure with machine-checkable recovery classification."""
+
+    def __init__(self, message: str, *, code: str = "invalid-evidence", path: str = "$") -> None:
+        super().__init__(message)
+        self.code = code
+        self.path = path
 
 
-def fail(location: str, message: str) -> NoReturn:
-    raise ValidationError(f"{location}: {message}")
+def fail(location: str, message: str, *, code: str = "invalid-evidence") -> NoReturn:
+    raise ValidationError(f"{location}: {message}", code=code, path=location)
+
+
+def rejection_details(error: Exception) -> dict[str, str]:
+    if isinstance(error, ValidationError):
+        return {"error_code": error.code, "error_path": error.path}
+    if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)):
+        return {"error_code": "invalid-json", "error_path": "$"}
+    return {"error_code": "execution", "error_path": "$"}
 
 
 def obj(value: Any, location: str) -> dict[str, Any]:
@@ -168,7 +184,10 @@ def array(value: Any, location: str) -> list[Any]:
 
 def field(mapping: dict[str, Any], name: str, location: str) -> Any:
     if name not in mapping:
-        fail(location, f"missing required field {name!r}")
+        raise ValidationError(
+            f"{location}: missing required field {name!r}",
+            code="missing-field", path=f"{location}.{name}",
+        )
     return mapping[name]
 
 
@@ -668,6 +687,7 @@ def validate_run(data: dict[str, Any]) -> None:
     timestamp(field(data, "updated_at", "$"), "$.updated_at")
     status = enum(field(data, "status", "$"), RUN_STATUSES, "$.status")
     phase = enum(field(data, "phase", "$"), PHASES, "$.phase")
+    enum(data.get("worker_reasoning_policy", "legacy-xhigh"), {"stage-v1", "legacy-xhigh"}, "$.worker_reasoning_policy")
     profile_value = data.get("profile")
     profile: str | None = None
     workflow_policy: dict[str, Any] | None = None
@@ -758,6 +778,9 @@ def validate_run(data: dict[str, Any]) -> None:
             fail("$.contract_sha256", f"expected {actual_contract_hash} from contract_path")
 
     retries = obj(field(data, "retry_limits", "$"), "$.retry_limits")
+    repair_limit = integer(retries.get("artifact_repairs_per_action", 0), "$.retry_limits.artifact_repairs_per_action", minimum=0)
+    if repair_limit > 1:
+        fail("$.retry_limits.artifact_repairs_per_action", "must be at most one")
     for name in (
         "worker_replacements_per_stage",
         "contract_revisions",
@@ -960,6 +983,15 @@ def validate_run(data: dict[str, Any]) -> None:
             contract_hash=contract_hash,
         )
 
+    pending_refresh = obj(data.get("pending_delivery_refresh", {}), "$.pending_delivery_refresh")
+    for repository_id, reference in pending_refresh.items():
+        location = f"$.pending_delivery_refresh.{repository_id}"
+        if repository_id not in repositories:
+            fail(location, "unknown repository")
+        hashed_file_reference(reference, location)
+        if reference not in repositories[repository_id]["accepted_artifacts"].values():
+            fail(location, "must pin an accepted delivery observation")
+
     global_accepted = data.get("accepted_artifacts", {})
     global_accepted_object = obj(global_accepted, "$.accepted_artifacts")
     global_accepted_kinds: set[str] = set()
@@ -1040,6 +1072,8 @@ def validate_run(data: dict[str, Any]) -> None:
                 f"{wrong_stage_repositories}",
             )
     if status == "complete":
+        if pending_refresh:
+            fail("$.pending_delivery_refresh", "completion requires fresh delivery observations after recovery")
         if phase != "complete":
             fail("$.phase", "must be complete when run status is complete")
         if actions:
@@ -1136,6 +1170,17 @@ def validate_assignment(data: dict[str, Any]) -> None:
     string(field(data, "action_id", "$"), "$.action_id", max_length=200)
     timestamp(field(data, "created_at", "$"), "$.created_at")
     stage = enum(field(data, "stage", "$"), ASSIGNMENT_STAGES, "$.stage")
+    execution_mode = enum(data.get("execution_mode", "worker"), {"worker", "artifact-repair", "command"}, "$.execution_mode")
+    if execution_mode == "command" and stage != "deliver":
+        fail("$.execution_mode", "only delivery uses command assignments")
+    verify_only = boolean(data.get("verify_only", False), "$.verify_only")
+    if verify_only and execution_mode != "command":
+        fail("$.verify_only", "read-only delivery verification requires a command assignment")
+    if data.get("delivery_evidence_version", 1) not in {1, 2}:
+        fail("$.delivery_evidence_version", "unsupported delivery evidence version")
+    check_timeout = integer(data.get("check_timeout_seconds", 1800), "$.check_timeout_seconds", minimum=0)
+    if check_timeout > 1800:
+        fail("$.check_timeout_seconds", "must be at most 1800 seconds")
     integer(field(data, "attempt", "$"), "$.attempt", minimum=1)
     profile_value = data.get("profile")
     profile = enum(profile_value, PROFILES, "$.profile") if profile_value is not None else None
@@ -1144,10 +1189,15 @@ def validate_assignment(data: dict[str, Any]) -> None:
         assigned_repo = repo_id(assigned_repo, "$.repo_id")
     absolute_path(field(data, "cwd", "$"), "$.cwd", must_exist=True, directory_only=True)
     thinking = enum(field(data, "thinking", "$"), THINKING_LEVELS, "$.thinking")
+    enum(data.get("reasoning_policy", "legacy-xhigh"), {"stage-v1", "legacy-xhigh"}, "$.reasoning_policy")
     if stage == "design-challenge" and thinking == "medium":
         fail("$.thinking", "design-challenge assignments require high or xhigh")
-    if stage == "implement" and thinking == "medium":
+    repair_mode = data.get("execution_mode") == "artifact-repair"
+    if stage == "implement" and thinking == "medium" and not repair_mode:
         fail("$.thinking", "implementation assignments require high or xhigh")
+    if (data.get("reasoning_policy") == "stage-v1" and not repair_mode and thinking == "medium"
+            and stage in {"validation-fix", "pipeline-fix", "fix-1", "fix-2"}):
+        fail("$.thinking", "source-writing fix assignments require high or xhigh")
     if profile == "full" and stage in {
         "contract",
         "plan",
@@ -1168,8 +1218,9 @@ def validate_assignment(data: dict[str, Any]) -> None:
         field(data, "forge_access", "$"), {"none", "write"}, "$.forge_access"
     )
     if stage == "deliver":
-        if git_access != "write" or forge_access != "write":
-            fail("$", "delivery assignments require Git and forge write access")
+        expected_access = "none" if verify_only else "write"
+        if git_access != expected_access or forge_access != expected_access:
+            fail("$", f"delivery assignment requires {expected_access} Git/forge write access")
         if project_access != "none":
             fail("$.project_file_access", "delivery assignments may not edit project files")
     elif git_access != "none" or forge_access != "none":
@@ -1413,6 +1464,8 @@ def validate_assignment(data: dict[str, Any]) -> None:
                 "$.validation_ids",
                 "must pair one planned validation ID with every assigned command",
             )
+    if repair_mode:
+        validate_repair_assignment(data)
     output_kind = enum(
         field(data, "output_kind", "$"),
         {
@@ -2586,6 +2639,8 @@ def validate_result(data: dict[str, Any]) -> None:
     next_action = field(data, "next_action", "$")
     if next_action is not None:
         string(next_action, "$.next_action", max_length=300)
+    if assignment.get("execution_mode") == "artifact-repair":
+        validate_repaired_payload(assignment, data)
 
 
 def validate_review(data: dict[str, Any]) -> None:
@@ -2874,6 +2929,37 @@ def validate_delivery(data: dict[str, Any]) -> None:
             fail("$.pr_url", "is required for complete delivery")
         if any(state != "passed" for state in required_states):
             fail("$.checks", "all required checks must pass for complete delivery")
+    assignment = load_json_object(data["assignment_path"], "$.assignment_path")
+    if assignment.get("delivery_evidence_version", 1) == 2:
+        policy = obj(field(data, "check_policy", "$"), "$.check_policy")
+        policy_status = enum(field(policy, "status", "$.check_policy"), {"required", "not-configured", "unknown"}, "$.check_policy.status")
+        required_checks = array(field(policy, "required_checks", "$.check_policy"), "$.check_policy.required_checks")
+        evidence = array(field(policy, "evidence", "$.check_policy"), "$.check_policy.evidence")
+        for index, reference in enumerate(evidence):
+            hashed_file_reference(reference, f"$.check_policy.evidence[{index}]")
+        if data.get("command_evidence") is not None:
+            hashed_file_reference(data["command_evidence"], "$.command_evidence")
+        for key in ("head_sha", "pushed_head_sha", "checked_head_sha"):
+            value = field(data, key, "$")
+            if value is not None:
+                sha(value, f"$.{key}")
+        if status == "complete":
+            head = sha(data["head_sha"], "$.head_sha")
+            if head != data["pushed_head_sha"] or head != data["checked_head_sha"] or head != commits[-1]:
+                fail("$.checked_head_sha", "local, pushed, checked, and delivered head must match")
+            if policy_status == "unknown" or not evidence:
+                fail("$.check_policy", "complete delivery requires positive check-policy evidence")
+            if (policy_status == "required") != bool(required_checks):
+                fail("$.check_policy", "required-check policy contradicts its identities")
+            for required_check in required_checks:
+                name = string(field(required_check, "name", "$.check_policy.required_checks"), "$.check_policy.required_checks.name")
+                app_id = required_check.get("app_id")
+                if app_id is not None:
+                    integer(app_id, "$.check_policy.required_checks.app_id", minimum=1)
+                matches = [check for check in checks if check["name"] == name and check["required"]
+                           and (app_id is None or check.get("app_id") == app_id)]
+                if not matches or any(check["state"] != "passed" for check in matches):
+                    fail("$.checks", f"required check {name!r} is absent or not passing on this head")
 
 
 def validate_report(data: dict[str, Any]) -> None:
@@ -2928,6 +3014,10 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
         "assignment_path": str(assignment_path.resolve()),
         "assignment_sha256": assignment_hash,
     }
+    if assignment.get("execution_mode") == "artifact-repair":
+        source = load_json_object(assignment["repair_of"]["artifact"]["path"], "$.repair_of.artifact")
+        source.update(common)
+        return source
     created_at = _utc_now()
     repo = assignment.get("repo_id")
     baseline = assignment.get("baseline")
@@ -3117,6 +3207,9 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
                 "blockers": [],
             }
         )
+        if assignment.get("delivery_evidence_version", 1) == 2:
+            common.update(head_sha=None, pushed_head_sha=None, checked_head_sha=None,
+                          check_policy={"status": "unknown", "required_checks": [], "evidence": []})
     elif kind == "report":
         common.update(
             {
@@ -3133,6 +3226,139 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
     else:  # pragma: no cover - guarded by assignment validation
         fail("$.output_kind", f"cannot initialize unsupported kind {kind}")
     return common
+
+
+def repairable_result(data: dict[str, Any], output_path: Path) -> list[int]:
+    """Validate an otherwise intact blocked result without guessing its missing kinds.
+
+    The temporary enum values are used only for schema checking and never written
+    or accepted. The repair worker must supply an evidence-backed classification.
+    """
+    if data.get("artifact_kind") != "result" or data.get("status") != "blocked":
+        fail("$.status", "only intact blocked results are eligible for artifact repair")
+    missing = [
+        index for index, blocker in enumerate(array(field(data, "blockers", "$"), "$.blockers"))
+        if isinstance(blocker, dict) and "kind" not in blocker
+    ]
+    if not missing:
+        fail("$.blockers", "no missing blocker classification to repair")
+    candidate = copy.deepcopy(data)
+    for index in missing:
+        candidate["blockers"][index]["kind"] = "decision"
+    global CURRENT_ARTIFACT_PATH
+    previous = CURRENT_ARTIFACT_PATH
+    CURRENT_ARTIFACT_PATH = output_path
+    try:
+        validate_result(candidate)
+    finally:
+        CURRENT_ARTIFACT_PATH = previous
+    return missing
+
+
+def validate_repair_assignment(data: dict[str, Any]) -> None:
+    repair = obj(field(data, "repair_of", "$"), "$.repair_of")
+    original_path = hashed_file_reference(field(repair, "assignment", "$.repair_of"), "$.repair_of.assignment")
+    original = load_json_object(original_path, "$.repair_of.assignment")
+    if original.get("execution_mode") == "artifact-repair":
+        fail("$.repair_of", "recursive artifact repair is forbidden")
+    validate_assignment(original)
+    if original["output_kind"] != "result":
+        fail("$.repair_of", "only result artifacts can be repaired")
+    for key in ("stage", "repo_id", "run_id", "attempt", "cwd", "baseline", "requirement_ids",
+                "task_ids", "finding_ids", "validation_ids", "validation_commands", "packet_id", "input_artifacts"):
+        if data.get(key) != original.get(key):
+            fail(f"$.{key}", "repair must preserve the original assignment scope")
+    if any(data[key] != "none" for key in ("project_file_access", "git_access", "forge_access")):
+        fail("$.execution_mode", "artifact repair may not write project, Git, or forge state")
+    if data["thinking"] != "medium" or data["timeout_seconds"] > 300:
+        fail("$.execution_mode", "artifact repair requires medium reasoning and at most 300 seconds")
+    if data["repositories"] != [{**repo, "access": "read"} for repo in original["repositories"]]:
+        fail("$.repositories", "repair must preserve the original repository paths")
+    if data["output_artifact"] == original["output_artifact"]:
+        fail("$.output_artifact", "repair requires a new immutable output path")
+    artifact_path = hashed_file_reference(field(repair, "artifact", "$.repair_of"), "$.repair_of.artifact")
+    if Path(artifact_path).resolve() != Path(original["output_artifact"]).resolve():
+        fail("$.repair_of.artifact", "must reference the original assignment output")
+    for index, reference in enumerate(array(field(repair, "evidence", "$.repair_of"), "$.repair_of.evidence")):
+        hashed_file_reference(reference, f"$.repair_of.evidence[{index}]")
+    states = obj(field(repair, "repository_states", "$.repair_of"), "$.repair_of.repository_states")
+    if set(states) != {repo["repo_id"] for repo in original["repositories"]}:
+        fail("$.repair_of.repository_states", "must pin every originally accessible repository")
+    for state in states.values():
+        for key in ("fingerprint", "index_sha256"):
+            sha256(field(state, key, "$.repair_of.repository_states"), f"$.repair_of.repository_states.{key}")
+        sha(field(state, "head", "$.repair_of.repository_states"), "$.repair_of.repository_states.head")
+        string(field(state, "branch", "$.repair_of.repository_states"), "$.repair_of.repository_states.branch")
+    if data.get("input_tree_fingerprint") != states[data["repo_id"]]["fingerprint"]:
+        fail("$.input_tree_fingerprint", "must match the pinned post-writer state")
+    original_artifact = load_json_object(artifact_path, "$.repair_of.artifact")
+    repairable_result(original_artifact, Path(artifact_path))
+
+
+def validate_repaired_payload(assignment: dict[str, Any], data: dict[str, Any]) -> None:
+    """A classification repair cannot rewrite prior facts or manufacture a pass."""
+    original = load_json_object(assignment["repair_of"]["artifact"]["path"], "$.repair_of.artifact")
+    candidate = copy.deepcopy(data)
+    if len(candidate.get("blockers", [])) != len(original["blockers"]):
+        fail("$.repair_of", "artifact-only repair changed existing semantic evidence")
+    for index, blocker in enumerate(original["blockers"]):
+        if "kind" not in blocker:
+            candidate["blockers"][index].pop("kind", None)
+    # These fields are owned by the coordinator, not the semantic worker.
+    for payload in (original, candidate):
+        for key in ("assignment_path", "assignment_sha256", "git", "tree_fingerprint"):
+            payload.pop(key, None)
+        for validation in payload.get("validations", []):
+            for key in ("command_sha256", "tree_fingerprint"):
+                validation.pop(key, None)
+    if candidate != original:
+        fail("$.repair_of", "artifact-only repair changed existing semantic evidence")
+
+
+def record_blocker(
+    assignment_path: Path, *, kind: str, summary: str, evidence_path: Path,
+    required_action: str, blocker_id: str | None = None,
+) -> Path:
+    """Construct a blocker only in a live assignment's unaccepted output."""
+    assignment_path = assignment_path.resolve()
+    assignment = load_json_object(str(assignment_path), "$.assignment")
+    validate_assignment(assignment)
+    if assignment.get("execution_mode") == "artifact-repair":
+        fail("$.execution_mode", "repair may classify existing blockers only, not append new ones")
+    run_dir = assignment_path.parent.parent
+    run = load_json_object(str(run_dir / "run.json"), "$.run")
+    output = Path(assignment["output_artifact"])
+    if assignment_path.parent.name != "assignments" or not output.resolve().is_relative_to(run_dir):
+        fail("$.output_artifact", "output must belong to this run")
+    if run.get("run_id") != assignment["run_id"] or not any(
+        action.get("assignment_path") == str(assignment_path)
+        and action.get("output_artifact") == str(output)
+        for action in run.get("next_actions", [])
+    ):
+        fail("$.output_artifact", "blocker output is not an active assignment")
+    references = list(run.get("accepted_artifacts", {}).values())
+    for repository in run.get("repositories", {}).values():
+        references.extend(repository.get("accepted_artifacts", {}).values())
+    if any(Path(ref["path"]).resolve() == output.resolve() for ref in references):
+        fail("$.output_artifact", "refusing to change an accepted artifact")
+    data = load_json_object(str(output), "$.output")
+    if (data.get("assignment_path") != str(assignment_path)
+            or data.get("assignment_sha256") != hashlib.sha256(assignment_path.read_bytes()).hexdigest()
+            or data.get("artifact_kind") != assignment["output_kind"]):
+        fail("$.output_artifact", "output identity does not match the assignment")
+    blockers = array(field(data, "blockers", "$"), "$.blockers")
+    identifier = blocker_id or f"BLOCK-{len(blockers) + 1:03d}"
+    blockers.append({"id": identifier, "kind": kind, "summary": summary,
+                     "evidence_path": str(evidence_path.resolve()), "required_action": required_action})
+    validate_blockers(blockers)
+    data["status"] = "blocked"
+    serialized = json.dumps(data, indent=2) + "\n"
+    if len(serialized.encode()) > MAX_BYTES[assignment["output_kind"]]:
+        fail("$.output_artifact", "blocker output exceeds the artifact size limit")
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary.write_text(serialized, encoding="utf-8")
+    temporary.replace(output)
+    return output
 
 
 def initialize_artifact(assignment_path: Path) -> Path:
@@ -3175,6 +3401,24 @@ def usage() -> NoReturn:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "block":
+        parser = argparse.ArgumentParser(description="Record a typed blocker in an active assignment")
+        parser.add_argument("assignment", type=Path)
+        parser.add_argument("--kind", required=True, choices=sorted(BLOCKER_KINDS))
+        parser.add_argument("--summary", required=True)
+        parser.add_argument("--evidence-path", required=True, type=Path)
+        parser.add_argument("--required-action", required=True)
+        parser.add_argument("--id", dest="blocker_id")
+        args = parser.parse_args(sys.argv[2:])
+        try:
+            output = record_blocker(args.assignment, kind=args.kind, summary=args.summary,
+                                    evidence_path=args.evidence_path, required_action=args.required_action,
+                                    blocker_id=args.blocker_id)
+        except (OSError, ValidationError) as error:
+            print(f"INVALID {args.assignment}: {error}", file=sys.stderr)
+            return 1
+        print(f"BLOCKED {output}")
+        return 0
     if len(sys.argv) == 3 and sys.argv[1] == "init":
         assignment_path = Path(sys.argv[2])
         try:

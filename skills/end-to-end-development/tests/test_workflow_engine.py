@@ -652,7 +652,7 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                     {
                         "status": "blocked" if check_failed else "complete",
                         "branch": self._git(worktree, "branch", "--show-current"),
-                        "base_branch": "main",
+                        "base_branch": json.loads((run_dir / "run.json").read_text())["repositories"][assignment["repo_id"]]["base_branch"],
                         "commits": [commit],
                         "pr_url": "https://example.test/pull/1",
                         "checks": [
@@ -679,6 +679,12 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                         ),
                     }
                 )
+                if assignment.get("delivery_evidence_version") == 2:
+                    artifact.update(
+                        head_sha=commit, pushed_head_sha=commit, checked_head_sha=commit if not check_failed else None,
+                        check_policy={"status": "required", "required_checks": [{"name": "tests", "app_id": None}],
+                                      "evidence": [{"path": str(check_log), "sha256": hashlib.sha256(check_log.read_bytes()).hexdigest()}]},
+                    )
             else:
                 raise AssertionError(
                     f"unexpected fake assignment: {assignment['stage']}"
@@ -716,6 +722,78 @@ class FakeSuccessfulBatch(FakePlanningBatch):
         from workflow_tools import worktree_fingerprint
 
         return worktree_fingerprint(worktree)
+
+
+class MissingBlockerKindBatch(FakeSuccessfulBatch):
+    """Reproduce a settled writer whose only invalid field is blocker.kind."""
+
+    def __init__(self, *, repair_change: str | None = None) -> None:
+        super().__init__()
+        self.repair_change = repair_change
+        self.source_writes = 0
+        self.repairs = 0
+
+    def __call__(self, assignment_paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(assignment_paths[0].read_text())
+        if assignment.get("execution_mode") == "artifact-repair":
+            self.assignments.append(assignment)
+            self.repairs += 1
+            original = Path(assignment["repair_of"]["artifact"]["path"])
+            artifact = json.loads(original.read_text())
+            artifact["assignment_path"] = str(assignment_paths[0])
+            artifact["assignment_sha256"] = hashlib.sha256(assignment_paths[0].read_bytes()).hexdigest()
+            artifact["blockers"][0]["kind"] = "environment"
+            if self.repair_change == "status":
+                artifact["status"] = "complete"
+                artifact["blockers"] = []
+            elif self.repair_change == "source":
+                (Path(assignment["cwd"]) / "feature.txt").write_text("unauthorized repair\n")
+            elif self.repair_change in {"invalid", "crash-after-invalid"}:
+                del artifact["blockers"][0]["kind"]
+            elif self.repair_change == "evidence":
+                Path(artifact["blockers"][0]["evidence_path"]).write_text("changed evidence\n")
+            elif self.repair_change == "index":
+                self._git(Path(assignment["cwd"]), "add", "feature.txt")
+            elif self.repair_change == "head":
+                self._git(Path(assignment["cwd"]), "commit", "--allow-empty", "-qm", "unauthorized repair")
+            elif self.repair_change == "branch":
+                self._git(Path(assignment["cwd"]), "branch", "-m", "unauthorized-repair")
+            output = Path(assignment["output_artifact"])
+            output.write_text(json.dumps(artifact) + "\n")
+            if self.repair_change in {"crash-after-output", "crash-after-invalid", "crash-without-output"}:
+                if self.repair_change == "crash-without-output":
+                    output.unlink()
+                self.repair_change = None
+                raise KeyboardInterrupt("simulated coordinator interruption")
+            return 0, {"workers": [{
+                "action_id": assignment["action_id"],
+                "agent_name": f"repair-{self.repairs}",
+                "status": "accepted", "cleanup_status": "complete",
+                "started_at": "2026-08-22T10:00:00Z",
+                "ended_at": "2026-08-22T10:01:00Z",
+            }]}
+        code, manifest = super().__call__(assignment_paths, **kwargs)
+        if assignment["stage"] == "implement":
+            self.source_writes += 1
+            output = Path(assignment["output_artifact"])
+            artifact = json.loads(output.read_text())
+            evidence = Path(assignment["log_dir"]) / "environment.log"
+            evidence.write_text("The isolated test service is unavailable.\n")
+            artifact.update(status="blocked", blockers=[{
+                "id": "BLOCK-001",
+                "summary": "The isolated test service is unavailable.",
+                "evidence_path": str(evidence),
+                "required_action": "Restore the isolated test service, then resume.",
+            }])
+            if self.repair_change == "missing-evidence":
+                evidence.unlink()
+            elif self.repair_change == "contradictory":
+                artifact["status"] = "complete"
+            output.write_text(json.dumps(artifact) + "\n")
+            if self.repair_change == "crash-after-writer":
+                self.repair_change = None
+                raise KeyboardInterrupt("writer settled before its rejection was recorded")
+        return code, manifest
 
 
 class WorkflowEngineTests(unittest.TestCase):
@@ -828,6 +906,364 @@ class WorkflowEngineTests(unittest.TestCase):
             report_root=self.root / "reports",
             now=self.now,
         )
+
+    def test_engine_normalizes_assignment_metadata_from_its_own_intent(self) -> None:
+        batch = FakeSuccessfulBatch()
+        def stale_metadata(paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+            code, manifest = batch(paths, **kwargs)
+            for path in paths:
+                output = Path(json.loads(path.read_text())["output_artifact"])
+                artifact = json.loads(output.read_text())
+                artifact["assignment_path"] = str(self.root / "nonexistent-assignment.json")
+                output.write_text(json.dumps(artifact))
+            return code, manifest
+        engine = self.initialize(stale_metadata)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "assignment-metadata"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+
+    def test_missing_blocker_kind_repairs_output_without_replaying_source(self) -> None:
+        batch = MissingBlockerKindBatch()
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "missing-kind"}, "recursion_limit": 150},
+        )
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual("implemented\n", (self.worktree / "feature.txt").read_text())
+        run = engine.load_run()
+        self.assertEqual("blocked", run["status"])
+        self.assertEqual("environment", run["blockers"][0]["kind"])
+        repair = next(a for a in batch.assignments if a.get("execution_mode") == "artifact-repair")
+        self.assertEqual("none", repair["project_file_access"])
+        self.assertEqual("none", repair["git_access"])
+        self.assertEqual("none", repair["forge_access"])
+        original = json.loads(Path(repair["repair_of"]["artifact"]["path"]).read_text())
+        self.assertNotIn("kind", original["blockers"][0])
+
+    def assert_repair_is_rejected(self, change: str) -> None:
+        batch = MissingBlockerKindBatch(repair_change=change)
+        engine = self.initialize(batch)
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "unsafe-repair"}, "recursion_limit": 150}
+        graph.invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertEqual("decision", engine.load_run()["blockers"][0]["kind"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertFalse(engine.resume_external_blockers())
+        graph.invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual(1, batch.repairs)
+
+    def test_repair_cannot_turn_blocked_work_into_success(self) -> None:
+        self.assert_repair_is_rejected("status")
+
+    def test_repair_cannot_change_project_content(self) -> None:
+        self.assert_repair_is_rejected("source")
+
+    def test_repair_cannot_change_the_git_index(self) -> None:
+        self.assert_repair_is_rejected("index")
+
+    def test_repair_cannot_change_referenced_evidence(self) -> None:
+        self.assert_repair_is_rejected("evidence")
+
+    def test_repair_cannot_change_head(self) -> None:
+        self.assert_repair_is_rejected("head")
+
+    def test_repair_cannot_rename_the_task_branch(self) -> None:
+        self.assert_repair_is_rejected("branch")
+
+    def test_ineligible_missing_kind_does_not_replay_source(self) -> None:
+        for change in ("missing-evidence", "contradictory"):
+            with self.subTest(change=change):
+                self.run_dir = self.root / change
+                (self.worktree / "feature.txt").unlink(missing_ok=True)
+                batch = MissingBlockerKindBatch(repair_change=change)
+                engine = self.initialize(batch)
+                build_graph(engine, InMemorySaver()).invoke(
+                    {"run_dir": str(self.run_dir)},
+                    {"configurable": {"thread_id": change}, "recursion_limit": 150},
+                )
+                self.assertEqual("decision", engine.load_run()["blockers"][0]["kind"])
+                self.assertEqual(1, batch.source_writes)
+                self.assertEqual(0, batch.repairs)
+
+    def test_invalid_repair_does_not_start_another_repair_or_source_writer(self) -> None:
+        self.assert_repair_is_rejected("invalid")
+
+    def test_repair_written_before_a_crash_is_recovered_without_relaunch(self) -> None:
+        batch = MissingBlockerKindBatch(repair_change="crash-after-output")
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "repair-crash"}, "recursion_limit": 150}
+        with self.assertRaises(KeyboardInterrupt):
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual("environment", engine.load_run()["blockers"][0]["kind"])
+
+    def test_failed_repair_crash_never_relaunches_or_resets_its_attempt(self) -> None:
+        for change in ("crash-after-invalid", "crash-without-output"):
+            with self.subTest(change=change):
+                self.run_dir = self.root / change
+                batch = MissingBlockerKindBatch(repair_change=change)
+                # The previous subcase's task file is only disposable fixture data.
+                (self.worktree / "feature.txt").unlink(missing_ok=True)
+                engine = self.initialize(batch)
+                config = {"configurable": {"thread_id": change}, "recursion_limit": 150}
+                with self.assertRaises(KeyboardInterrupt):
+                    build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+                self.assertEqual(1, batch.source_writes)
+                self.assertEqual(1, batch.repairs)
+                self.assertEqual("decision", engine.load_run()["blockers"][0]["kind"])
+
+    def test_malformed_writer_output_recovers_after_a_crash_without_source_replay(self) -> None:
+        batch = MissingBlockerKindBatch(repair_change="crash-after-writer")
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "writer-crash"}, "recursion_limit": 150}
+        with self.assertRaises(KeyboardInterrupt):
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual("environment", engine.load_run()["blockers"][0]["kind"])
+
+    def test_external_resume_after_valid_repair_preserves_original_evidence(self) -> None:
+        batch = MissingBlockerKindBatch()
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "external-repair-resume"}, "recursion_limit": 150}
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        repair = next(a for a in batch.assignments if a.get("execution_mode") == "artifact-repair")
+        original = repair["repair_of"]["artifact"]
+        self.assertTrue(engine.resume_external_blockers())
+        replacement = FakeSuccessfulBatch()
+        engine.batch_runner = replacement
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        writer = next(a for a in replacement.assignments if a["stage"] == "implement")
+        original_assignment = json.loads(Path(repair["repair_of"]["assignment"]["path"]).read_text())
+        self.assertNotEqual(original_assignment["action_id"], writer["action_id"])
+        self.assertNotEqual(original["path"], writer["output_artifact"])
+        self.assertEqual(original["sha256"], hashlib.sha256(Path(original["path"]).read_bytes()).hexdigest())
+
+    def test_legacy_runs_keep_their_original_replacement_policy(self) -> None:
+        batch = MissingBlockerKindBatch()
+        engine = self.initialize(batch)
+        run = engine.load_run()
+        del run["retry_limits"]["artifact_repairs_per_action"]
+        engine._save_run(run)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "legacy-rejection"}, "recursion_limit": 150},
+        )
+        self.assertEqual(2, batch.source_writes)
+        self.assertEqual(0, batch.repairs)
+        self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
+
+    def test_new_runs_pin_reasoning_and_source_fixes_never_use_medium(self) -> None:
+        import workflow_tools
+        batch = FakeSuccessfulBatch(round_one_finding=True, fail_first_validation=True, delivery_code_failures=1)
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "reasoning-policy"}, "recursion_limit": 150},
+        )
+        self.assertEqual("stage-v1", engine.load_run()["worker_reasoning_policy"])
+        for stage in ("validation-fix", "pipeline-fix", "fix-1"):
+            assignment = next(a for a in batch.assignments if a["stage"] == stage)
+            self.assertEqual("high", assignment["thinking"])
+            self.assertEqual("high", workflow_tools.effective_thinking(assignment, engine.load_run()))
+        self.assertEqual("xhigh", workflow_tools.effective_thinking({"thinking": "medium"}, {}))
+        self.assertEqual("high", workflow_tools.effective_thinking({"thinking": "high"}, {"worker_reasoning_policy": "stage-v1"}))
+
+    def github_engine(self, batch: FakeSuccessfulBatch, *, state: str = "success", crash: str | None = None,
+                      failures: int = 0) -> tuple[WorkflowEngine, Any]:
+        from test_delivery_tools import FakeGitHub
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        FakeSuccessfulBatch._git(self.worktree, "remote", "add", "origin", "git@github.com:example/task.git")
+        self.write_spec()
+        spec = json.loads(self.spec.read_text())
+        spec["repositories"][0]["delivery_check_timeout_seconds"] = 0
+        self.spec.write_text(json.dumps(spec))
+        forge = FakeGitHub(self.worktree)
+        forge.check_state, forge.crash_after, forge.failures_remaining = state, crash, failures
+        engine = WorkflowEngine.initialize(
+            spec_path=self.spec, run_dir=self.run_dir, skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir, batch_runner=batch,
+            delivery_runner=forge, now=self.now,
+        )
+        return engine, forge
+
+    def test_github_delivery_needs_no_delivery_or_duplicate_validation_worker(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "command-delivery"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1"], [a["stage"] for a in batch.assignments])
+        self.assertEqual(3, len(engine.load_agents()["agents"]))
+        self.assertEqual(1, forge.create_count)
+        metrics = json.loads((self.run_dir / "metrics.json").read_text())
+        self.assertEqual(1, metrics["command_attempts"])
+
+    def test_command_delivery_uses_one_pipeline_fix_then_reconciles_the_same_pr(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch, failures=1)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "command-fix"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, sum(a["stage"] == "pipeline-fix" for a in batch.assignments))
+        self.assertEqual(1, forge.create_count)
+
+    def test_pending_command_delivery_does_not_spend_a_code_fix(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, _ = self.github_engine(batch, state="pending")
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "command-pending"}, "recursion_limit": 150},
+        )
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
+        self.assertFalse(any(a["stage"] == "pipeline-fix" for a in batch.assignments))
+
+    def assert_command_crash_recovers(self, crash: str) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch, crash=crash)
+        config = {"configurable": {"thread_id": "command-crash"}, "recursion_limit": 150}
+        with self.assertRaises(KeyboardInterrupt):
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        head = FakeSuccessfulBatch._git(self.worktree, "rev-parse", "HEAD")
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(head, FakeSuccessfulBatch._git(self.worktree, "rev-parse", "HEAD"))
+        self.assertEqual(1, forge.create_count)
+        self.assertEqual(3, len(engine.load_agents()["agents"]))
+
+    def test_command_reconciles_a_commit_completed_before_interruption(self) -> None:
+        self.assert_command_crash_recovers("commit")
+
+    def test_command_reconciles_a_push_completed_before_interruption(self) -> None:
+        self.assert_command_crash_recovers("push")
+
+    def test_command_reconciles_a_pr_created_before_interruption(self) -> None:
+        self.assert_command_crash_recovers("pr-create")
+
+    def test_command_reconciles_checks_completed_before_interruption(self) -> None:
+        self.assert_command_crash_recovers("checks")
+
+    def test_delivery_artifact_recovery_refreshes_forge_evidence(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch)
+        execute = engine._execute_delivery_command
+        def crash_after_output(path: Path, **kwargs: Any) -> dict[str, Any]:
+            execute(path, **kwargs)
+            raise KeyboardInterrupt("delivery artifact persisted before acceptance")
+        config = {"configurable": {"thread_id": "stale-delivery"}, "recursion_limit": 150}
+        with mock.patch.object(engine, "_execute_delivery_command", side_effect=crash_after_output):
+            with self.assertRaises(KeyboardInterrupt):
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        assignment = json.loads(Path(engine.load_run()["next_actions"][0]["assignment_path"]).read_text())
+        previous = json.loads(Path(assignment["output_artifact"]).read_text())
+        previous_evidence = previous["command_evidence"]
+        forge.required.append({"context": "new-required", "app": None})
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
+        self.assertEqual(previous_evidence["sha256"], hashlib.sha256(Path(previous_evidence["path"]).read_bytes()).hexdigest())
+        self.assertEqual(1, forge.create_count)
+        self.assertFalse(any(a["stage"] == "pipeline-fix" for a in batch.assignments))
+
+    def test_crash_after_delivery_acceptance_still_refreshes_before_completion(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch)
+        append = engine._append_event
+        def crash_after_acceptance(event: str, **kwargs: Any) -> None:
+            append(event, **kwargs)
+            if event == "artifact-accepted" and kwargs.get("action_id", "").startswith("deliver:"):
+                raise KeyboardInterrupt("delivery accepted before completion")
+        config = {"configurable": {"thread_id": "accepted-delivery-crash"}, "recursion_limit": 150}
+        with mock.patch.object(engine, "_append_event", side_effect=crash_after_acceptance):
+            with self.assertRaises(KeyboardInterrupt):
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        old = engine._latest_delivery("api")
+        old_hash = hashlib.sha256(old[0].read_bytes()).hexdigest()
+        forge.required.append({"context": "new-required", "app": None})
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertEqual(old_hash, hashlib.sha256(old[0].read_bytes()).hexdigest())
+        self.assertEqual(1, forge.create_count)
+
+    def test_checkpoint_replay_does_not_execute_after_recovery_blocks(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch)
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "blocked-checkpoint"}, "recursion_limit": 150}
+        append = engine._append_event
+        def crash(event: str, **kwargs: Any) -> None:
+            append(event, **kwargs)
+            if event == "artifact-accepted" and kwargs.get("action_id", "").startswith("deliver:"):
+                raise KeyboardInterrupt("accepted delivery checkpoint")
+        with mock.patch.object(engine, "_append_event", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                graph.invoke({"run_dir": str(self.run_dir)}, config)
+        forge.check_state = "pending"
+        engine.reconcile()  # Same explicit preflight as the durable CLI.
+        self.assertEqual("blocked", engine.load_run()["status"])
+        command_count = len(forge.commands)
+        graph.invoke(None, config)
+        self.assertEqual(command_count, len(forge.commands))
+        self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_completed_delivery_refresh_survives_other_pending_actions(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch)
+        config = {"configurable": {"thread_id": "mixed-delivery-recovery"}, "recursion_limit": 150}
+        append = engine._append_event
+        def crash(event: str, **kwargs: Any) -> None:
+            append(event, **kwargs)
+            if event == "artifact-accepted" and kwargs.get("action_id", "").startswith("deliver:"):
+                raise KeyboardInterrupt("accepted delivery before peers settled")
+        with mock.patch.object(engine, "_append_event", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        # Any independently pending action must not erase the delivery refresh
+        # obligation. A validation-only peer keeps this fixture source-neutral.
+        peer = engine._validation_assignment("api", "independent-recovery-peer")
+        engine._install_actions([peer])
+        forge.required.append({"context": "new-required", "app": None})
+        engine.reconcile()
+        self.assertTrue(engine.load_run()["next_actions"])
+        batch([peer], run_dir=self.run_dir, worker_runtime="pi", allow_existing=False)
+        engine.reconcile(refresh_completed=False)
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
+        self.assertEqual(1, forge.create_count)
+
+    def test_delivery_recovered_code_failure_keeps_its_pipeline_fix(self) -> None:
+        batch = FakeSuccessfulBatch()
+        engine, forge = self.github_engine(batch, failures=1)
+        execute = engine._execute_delivery_command
+        def crash_after_output(path: Path, **kwargs: Any) -> dict[str, Any]:
+            execute(path, **kwargs)
+            raise KeyboardInterrupt("failed check artifact persisted before phase handling")
+        config = {"configurable": {"thread_id": "recovered-code-failure"}, "recursion_limit": 150}
+        with mock.patch.object(engine, "_execute_delivery_command", side_effect=crash_after_output):
+            with self.assertRaises(KeyboardInterrupt):
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, sum(a["stage"] == "pipeline-fix" for a in batch.assignments))
+        self.assertEqual(1, forge.create_count)
 
     def test_missing_codebase_design_dependency_reports_install_action(self) -> None:
         engine = WorkflowEngine(
@@ -1574,6 +2010,7 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(
             {
                 "worker_replacements_per_stage": 1,
+                "artifact_repairs_per_action": 1,
                 "contract_revisions": 1,
                 "plan_revision_cycles": 1,
                 "validation_fix_cycles": 1,

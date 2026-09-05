@@ -1,6 +1,6 @@
 # End-to-End Development Coordinator Artifact Contract
 
-This file is normative for the LangGraph control plane. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read only the stage-specific file under [`schemas/`](schemas/), initialized from their immutable assignment with:
+This file is normative for the LangGraph control plane. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read the stage-specific file under [`schemas/`](schemas/) and its linked [blocker contract](schemas/blockers.md), initialized from their immutable assignment with:
 
 ```bash
 python3 "$SKILL_DIR/scripts/artifact_guard.py" init <assignment-path>
@@ -26,6 +26,7 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 - A complete artifact has no blockers. A blocked artifact has at least one blocker.
 - Older schema-v1 runs without profile fields remain valid and behave as legacy `full` runs when resumed.
 - New fast/standard runs set `workflow_policy.user_plan_approval_required: false`; full sets it to `true`. Every run still records an approved hash-pinned bundle before project-file work. On resume, omission of this key in an older profiled run is treated as approval-required for backward safety.
+- New runs pin `worker_reasoning_policy: stage-v1`, `retry_limits.artifact_repairs_per_action: 1`, and repository `delivery_executor` (`github-command` or `worker`), `delivery_repository`, `delivery_evidence_version: 2`, and `delivery_check_timeout_seconds` (0–1800). Missing fields retain legacy xhigh/no-repair/worker/version-1 behavior; never mutate pinned policies in an active run.
 - Before validation, the coordinator normalizes mechanical evidence (`assignment_sha256`, Git HEAD/status, content fingerprint, and command hashes). Workers remain responsible for semantic conclusions, command execution results, findings, and blockers.
 
 ## Directory layout
@@ -128,6 +129,7 @@ The LangGraph control plane is the sole writer after initialization. New runs re
   "plan_review": null,
   "retry_limits": {
     "worker_replacements_per_stage": 1,
+    "artifact_repairs_per_action": 1,
     "contract_revisions": 1,
     "plan_revision_cycles": 1,
     "validation_fix_cycles": 1,
@@ -313,11 +315,23 @@ Read [`schemas/assignment.md`](schemas/assignment.md). New profiled assignments 
 
 Input references are unique and path-sorted. Every project-file writer in a new run includes the exact approved review bundle—user-approved or policy-approved—in `input_artifacts` and repeats that hashed reference as `plan_review`; the batch supervisor compares it to current run state. A plan revision pins the superseded plan plus exactly one accepted design challenge or coordinator revision basis. Only implementation/fix stages write project files, exactly one repository at a time. Repository-scoped read-only assignments pin the content fingerprint present at assignment creation; the coordinator rejects any acceptance-time change. Only delivery writes Git/forge. Global assignments use null repository, baseline, pre-existing status, and input fingerprint.
 
-Assignment `thinking` remains a policy classification: use `medium` for validation, mechanical fixes, and delivery; `high` for standard planning/review, implementation, and complex fixes; and `xhigh` only for full-profile planning/challenge/review/integration.
+New assignments pin `reasoning_policy: stage-v1`: use `medium` for artifact-only repair, validation-only work, and fallback delivery; `high` for ordinary planning/review and every source writer; `xhigh` for full-profile contract/planning/challenge/review/integration. Legacy policy remains `legacy-xhigh` when not explicitly versioned.
 
-The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Workers use `gpt-6-astra`; launchers normalize every supported assignment classification to runtime `xhigh`. The actual launcher configuration is recorded in the supervisor manifest.
+The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Workers keep `gpt-6-astra`, honoring the stage level. The actual configuration is recorded in the manifest and handle record for recovery. Deterministic commands do not create agent records.
 
 Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation reads the same record and performs the same cleanup, including when the worker wrote its artifact before the coordinator stopped.
+
+### Artifact-only assignments
+
+An `execution_mode: artifact-repair` assignment keeps the original result stage, IDs, commands, and canonical inputs but grants no project/Git/forge write access. It has a new action/output path, medium reasoning, and a 300-second timeout. `repair_of` contains hashed `assignment`, `artifact`, and `evidence` references plus `repository_states` keyed by repository ID (`fingerprint`, `head`, `branch`, `index_sha256`). The index hash represents staged entries, not volatile stat-cache bytes.
+
+`run.json.artifact_repairs` maps the original action ID to a hashed repair assignment and its `resume_generation`, persisted before launch. Its `launch_started_at` claim is saved before entering the supervisor: after a crash, adopt/wait for surviving work and accept a valid output, but never relaunch a claimed repair with missing/invalid output. An indeterminate launch blocks conservatively. `external_resume_generation` advances only on supported explicit external-condition resume; crash recovery never replenishes the one-repair allowance. Accepted repairs remain immutable. Only previously missing blocker kinds and coordinator-owned metadata can differ from the original payload. Genuine blocked outcomes remain blocked; arbitrary field edits, changed input/evidence/Git state, or invalid/ambiguous classification do not become replacement source work.
+
+### Command delivery evidence
+
+New GitHub delivery uses `execution_mode: command` and `delivery_evidence_version: 2`. The graph persists ordinary action intent, a portable input JSON, command logs/results, and a delivery artifact; it does not construct an agent handle. Active output projections may be completed during recovery, preserving prior snapshots and unique command result files; accepted artifacts remain immutable. Recovered complete outputs require fresh read-only forge queries, and cold recovery after acceptance schedules a new `verify_only: true` command assignment with no Git/forge write access. `pending_delivery_refresh` hash-pins accepted observations that need refresh after cold recovery. It survives other repositories' active actions and is cleared only when a new command artifact bound to the old observation is accepted; completion rejects an outstanding refresh. Blocked recovered CI failures retain the ordinary bounded fix route. A saved graph node cannot execute after recovery blocks or supersedes its intent. Command manifests have a separate `commands` array. Other forges retain worker execution.
+
+Version-2 delivery adds `head_sha`, `pushed_head_sha`, `checked_head_sha`, and `check_policy` (`status`, `required_checks` with name/app identity, hashed `evidence`). Complete results require all heads to equal the final commit/current worktree and every required identity to be present and passing. Explicit absence is `not-configured`; empty current checks, permission failures, and unknown policy are not absence. Scripted artifacts also bind `command_evidence` and record `delivery_outcome` (`complete`, `pending`, or `blocked`). A pending outcome maps to an infrastructure blocker, not a code-fix attempt. Evidence follows [schemas/delivery.md](schemas/delivery.md).
 
 ## Worker artifact schemas
 
@@ -395,7 +409,9 @@ Critical/high actionable findings always block. Medium correctness findings norm
 
 ## `events.jsonl`
 
-One compact transition per line. Allowed names are `run-created`, `agent-started`, `agent-closed`, `artifact-accepted`, `artifact-rejected`, `phase-changed`, `writer-acquired`, `writer-released`, `plan-review-requested`, `plan-approved`, `plan-changes-requested`, `blocked`, `resumed`, and `completed`.
+One compact transition per line. Allowed names are `run-created`, `agent-started`, `agent-closed`, `artifact-accepted`, `artifact-rejected`, `phase-changed`, `writer-acquired`, `writer-released`, `plan-review-requested`, `plan-approved`, `plan-changes-requested`, `blocked`, `resumed`, and `completed`; deterministic delivery also emits `command-started`.
+
+`artifact-rejected` records `error_code` and `error_path` when available. Metrics count `command_attempts` separately from `worker_attempts`.
 
 ```json
 {"at":"2026-08-17T09:00:00Z","run_id":"20260817T083000Z-rate-management","event":"plan-review-requested","phase":"plan-review","artifact":"/absolute/run/plan-review-v1.md","next_action":null}

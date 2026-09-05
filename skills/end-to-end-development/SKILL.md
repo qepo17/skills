@@ -15,7 +15,7 @@ Resolve `SKILL_DIR` to this directory. Before a new run or resume, read:
 2. [ARTIFACTS.md](ARTIFACTS.md) completely;
 3. [SIMPLICITY-CHALLENGE.md](SIMPLICITY-CHALLENGE.md) only when explaining or diagnosing a challenged plan.
 
-Workers read only their assigned `schemas/<kind>.md`, never the coordinator documents.
+Workers read their assigned `schemas/<kind>.md` and its linked [blocker contract](schemas/blockers.md), never the coordinator documents.
 
 ## Non-negotiable invariants
 
@@ -183,6 +183,7 @@ New runs use these hard stage limits:
 ```json
 {
   "worker_replacements_per_stage": 1,
+  "artifact_repairs_per_action": 1,
   "contract_revisions": 1,
   "plan_revision_cycles": 1,
   "validation_fix_cycles": 1,
@@ -223,9 +224,13 @@ The graph constructs immutable assignments and invokes the supervisor internally
 
 `--worker-runtime auto` inherits a Paseo parent's Pi/Codex provider when present, otherwise follows the coordinator: Codex when `CODEX_THREAD_ID` is present and Pi by default. `E2E_COORDINATOR_RUNTIME` remains an internal diagnostic override, not required user setup.
 
-Every worker uses `gpt-6-astra` with runtime `xhigh` reasoning. Assignment `thinking` remains a durable policy classification (`xhigh` for full planning, design challenge, review, and integration; `high` for standard planning/review, implementation, and complex fixes; `medium` for validation, mechanical fixes, and delivery), but the launcher normalizes every classification to `xhigh`.
+Workers keep `gpt-6-astra`. New runs pin `worker_reasoning_policy: stage-v1`: `xhigh` for full-profile contract/planning/challenge/review/integration; `high` for ordinary planning/review and all source-writing implementation/fixes; `medium` for artifact-only repair, validation-only work, and fallback delivery. Launchers honor the actual level across every backend. Legacy runs without a pinned stage policy retain xhigh, and surviving handles retain their recorded configuration. Unsupported configuration blocks; never silently substitute a model.
 
 Workers never spawn nested agents. A Paseo coordinator creates Paseo subagents, Herdr creates non-focused workspaces, tmux creates detached windows, and direct mode runs non-interactively without a terminal manager. The supervisor archives or closes each settled handle immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis.
+
+### Artifact-only recovery
+
+Workers should use the typed `artifact_guard.py block` command and [blocker schema](schemas/blockers.md). In new runs, a parseable blocked result missing only `blockers[*].kind` receives at most one five-minute, medium-reasoning artifact-only repair. It has a new immutable assignment/output, no project/Git/forge write permission, and pinned original semantics, logs, content, HEAD, branch, and index. It cannot manufacture a pass, rewrite evidence, or start another source writer. Ambiguous/invalid repair and stale evidence block with an actionable explanation. Missing files or process failures remain distinct from eligible schema repair. Resume never resets the allowance; legacy runs retain their existing policy.
 
 ### Work packets and bounded deviations
 
@@ -239,9 +244,11 @@ One fresh worker independently reviews the complete baseline-to-worktree state. 
 
 ### Delivery and completion
 
-Delivery workers may write Git and forge state but not project files. They preserve pre-existing changes, commit only task changes, push, create/update PRs, and monitor required checks. Authentication, permission, and infrastructure failures block rather than churn. Change-related failures get at most one pipeline-fix batch.
+New GitHub.com runs pin a deterministic command executor using [scripts/delivery_tools.py](scripts/delivery_tools.py), not a delivery agent. It audits the explicit task inventory, preserves unrelated work, commits/pushes without force, reconciles the existing PR, and checks CI against the local/pushed/PR head. Command intents are durable and recovered without worker handles; independent repositories can execute delivery concurrently. Other forges and legacy runs retain their pinned worker path.
 
-After delivery, the graph verifies that the committed content still matches passing evidence rather than invalidating it merely because `HEAD` changed. Completion then verifies the policy-selected plan decision, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically.
+Version-2 delivery evidence requires positive required-check policy discovery, the final checked head, and every required identity passing. An empty rollup is not a waiver: verified absence is `not-configured`, never "CI passed." Pending/missing/timed-out, skipped/cancelled, changed-head/policy, or unknown-policy results cannot complete. Authentication, permission, and infrastructure failures block rather than churn. Only compatible change-related failures get one pipeline-fix batch; pending checks do not spend it. Bootstrap can set a repository's `delivery_check_timeout_seconds` from 0 (observe once) to 1800 (default). This is a CI polling limit, not a whole-run deadline.
+
+After delivery, the graph verifies that the committed content still matches passing evidence rather than invalidating it merely because `HEAD` changed. Completion then verifies the policy-selected plan decision, canonical hashes, current validation, required integration/report evidence, delivery artifacts, no unresolved must-fix finding, no unexplained writer lease, no open workflow worker handle, empty actions, and empty blockers. Metrics are generated deterministically, counting command attempts separately from agent launches. Do not infer elapsed-time improvements from mocked worker counts.
 
 ## Final response
 

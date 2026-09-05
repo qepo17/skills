@@ -14,11 +14,15 @@ Profiled stage fields:
 
 Thinking classification:
 
-- `xhigh`: full-profile plan, design challenge, review, and integration;
-- `high`: standard planning/review, implementation, and complex fixes;
-- `medium`: validation, mechanical fixes, delivery, and report tooling.
+- `xhigh`: full-profile contract, plan, design challenge, review, and integration;
+- `high`: ordinary planning/review and every source-writing implementation/fix;
+- `medium`: artifact-only repair, validation-only work, and fallback delivery.
 
-The supervisor launches every classification with runtime `xhigh`; the assignment value remains policy metadata.
+New assignments pin `reasoning_policy: stage-v1`; the runtime honors the classification with `gpt-6-astra`. Legacy assignments/runs use `legacy-xhigh` when no newer policy was pinned. Existing handles are recovered with their recorded runtime configuration. Deterministic delivery/report work does not launch an agent.
+
+`execution_mode: artifact-repair` retains the original result stage and scope but has no project/Git/forge write access, a five-minute timeout, and medium reasoning. Its `repair_of` binds the original assignment, rejected output, referenced evidence, and repository states. Initialize from the original payload and follow the [blocker contract](blockers.md); this is not another implementation attempt.
+
+New GitHub delivery uses `execution_mode: command`, `delivery_evidence_version: 2`, and a pinned `check_timeout_seconds` (0–1800). The graph executes it directly, with durable intent/reconciliation and no worker handle. A `verify_only: true` command assignment refreshes accepted delivery after interruption with `git_access: none` and `forge_access: none`; it cannot commit, push, or create a PR. Other forges retain worker delivery with version-2 final-head evidence.
 
 Only project-file stages receive one repository write scope. Only delivery receives Git/forge write access. Workers never mutate run/agent/event/checkpoint state. The LangGraph control plane constructs assignments; workers must not infer or schedule a subsequent phase. The batch supervisor must reject a project-file writer unless the complete current plan set has an approved policy/user decision and the assignment pins that exact review-bundle path/hash. Validate before launch:
 

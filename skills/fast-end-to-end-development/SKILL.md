@@ -1,13 +1,13 @@
 ---
 name: fast-end-to-end-development
-description: "Run a lightweight, artifact-backed development workflow for an ordinary single-repository change: agent planning, implementation, one independent review, one revision pass, and pull-request creation, with an optional self-contained HTML explainer. Use when the user wants a quicker end-to-end coding flow and does not require durable orchestration, high-risk approval, multi-repository integration, or resumability."
+description: "Run a lightweight single-repository change through planning, implementation, one independent review and revision, and verified PR delivery. Uses stage-specific reasoning, scripted GitHub delivery, final-head CI evidence, and one separate bounded CI fix. Use for quick ordinary changes that do not require durable orchestration, high-risk approval, multi-repository integration, or whole-run resumability."
 ---
 
 # Fast End-to-End Development
 
 Use this skill for a small or medium change that should move from request to pull request in one bounded pass:
 
-`plan → implement → review once → revise once → create PR → [optional HTML explainer]`
+`plan → implement → review once → revise once → PR + required CI → [CI fix once] → [optional HTML explainer]`
 
 The current agent owns the run. Keep the process fast by removing Herdr worker orchestration, multi-profile policy selection, mandatory plan-approval pauses, integration workers, and retry loops. Keep the safety that matters: preserve pre-existing work, inspect repository instructions, record evidence, use a fresh reviewer, cap remediation at one batch, and stop on material ambiguity or high-risk scope.
 
@@ -15,7 +15,9 @@ Resolve `SKILL_DIR` to this skill's directory. Set `RUN_DIR` to the run director
 
 ## Agent runtime
 
-Use `gpt-6-astra` with `xhigh` reasoning for every subagent session in this workflow, including planning, implementation, review, revision, delivery, and delegated artifact rendering. Mechanical Git, forge, and renderer commands do not need a delegated model session. When launching a subagent explicitly, pass `model_reasoning_effort="xhigh"` for Codex or `--model openai-codex/gpt-6-astra --thinking xhigh` for Pi.
+Keep `gpt-6-astra` as the subagent model. Use `high` for independent review and any delegated planning/coding/fixes; use `medium` only for exceptional read-only artifact assistance. The active coordinator retains the user's runtime settings. Normally it owns planning, implementation, fixes, and all mechanical commands, delegating only the one fresh reviewer. Never start an agent just to run Git, wait for checks, write delivery prose, or render HTML.
+
+For Codex pass `model_reasoning_effort="high"`; for Pi use `--model openai-codex/gpt-6-astra --thinking high` (substitute `medium` only for read-only assistance). Unsupported runtime configuration is an explicit environment blocker; do not silently substitute a model or reasoning level.
 
 ## Herdr pane lifecycle
 
@@ -30,7 +32,8 @@ Use the fast path for one repository and ordinary application changes. Before ed
 - Escalate to `end-to-end-development` for multiple repositories or changes involving authorization, security-sensitive code, database migrations or backfills, destructive data operations, concurrency/distributed behavior, background processing, new storage, public contracts, or another high-cost mechanism.
 - Ask the user only when a material product decision or repository identity cannot be established. Do not pause merely for plan approval.
 - Read repository-local instructions (`AGENTS.md`, `CONTRIBUTING.md`, `README`, package/build configuration, and relevant nested instructions) before planning.
-- Verify Git and the repository forge are available when the request includes a PR. Prefer the connected GitHub capability or `gh` for GitHub; use the repository's established forge CLI otherwise.
+- Verify Python 3.11+, Git, and authenticated forge access before implementation. GitHub delivery uses the bundled helper and `gh`; other forges use their established CLI with the same final-head evidence requirements.
+- Never copy `.env` or database credentials into a worktree. Escalate migration-capable validation to the durable workflow and confirm an isolated local/test target before execution.
 
 ## Durable run record
 
@@ -49,7 +52,9 @@ Keep concise evidence there; keep full command output in a `logs/` child directo
 | `implementation.md` | What changed, changed-file inventory, and pre-review checks |
 | `review.md` | Exactly one independent review, findings, severity, and evidence |
 | `revision.md` | Finding dispositions, any fixes, and post-revision checks |
-| `delivery.md` | Commit, branch, PR URL, and forge/check status |
+| `delivery.md` | Final commit, branch, PR URL, checked head, required-check policy, and terminal check state |
+| `delivery-input-N.json` / `delivery-output-N.json` | Immutable inputs and evidence for each scripted GitHub delivery attempt |
+| `ci-revision.md` | When needed: the single CI-fix batch, failure classification, changed files, and revalidation |
 | `pr-explainer.json` | When requested: sanitized structured input for the HTML renderer |
 | `pr-explainer.html` | When requested: self-contained human-readable PR explainer |
 
@@ -58,12 +63,13 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 ## Invariants
 
 - Capture `git status --short` and the baseline commit before editing. Preserve unrelated user changes; never use `reset --hard`, `clean`, broad checkout, or an overwrite to make the tree convenient.
-- Use a task branch unless the user explicitly supplied a task branch. If unrelated uncommitted changes make branch isolation unsafe, use a dedicated worktree or stop and explain the boundary.
+- Always use a clean dedicated task worktree and branch, preferring Worktrunk. A supplied task branch still needs isolated worktree execution. Preserve the original checkout and never bring credentials into the worktree.
 - Keep one project-file writer. Do not let a reviewer or delivery step edit source files.
 - Close every workflow-created Herdr pane immediately after its agent settles and its result is captured; retain only working, blocked, or timed-out panes that still need attention.
 - Treat the plan as the implementation contract. A simpler equivalent change or focused test is allowed; a new high-cost mechanism, public contract, migration, or unrelated refactor requires escalation.
-- Perform at most one review and one revision batch. A no-op revision is valid when the review has no `must-fix` findings. Never start a second review or revision batch.
-- Do not create the PR until the revision gate and required local checks pass. If a post-PR CI failure needs code changes after the one revision is spent, report the blocker and recommend the full workflow.
+- Perform at most one independent review and one review-revision batch. A no-op revision is valid when there are no `must-fix` findings. A separate CI-fix batch is allowed once; neither fix starts another full review.
+- Create the PR only after review/revision and required local checks pass. Completion additionally requires the final-head CI gate. Pending checks are not success; a second change-related CI failure or incompatible correction blocks.
+- For UI changes, inspect the running interface with browser tooling and record interaction/visual evidence. Tests or an implementer's claim alone do not satisfy this gate.
 - Keep the HTML explainer derived from accepted artifacts, not from memory or raw transcripts.
 
 ## Workflow
@@ -84,7 +90,7 @@ Write `plan.md` before implementation. Keep it outcome-oriented rather than a li
 
 Implement the approved-by-the-agent plan in the task branch. Follow existing patterns, keep the diff narrow, and add or update focused tests with the behavior. Do not introduce an undeclared mechanism merely to avoid asking a question.
 
-Run `git diff --check`, focused tests, and the relevant broader checks in one validation pass. Record each command, exit code, and a concise result in `implementation.md`. Stop on a failing environment or dependency check rather than hiding it as a code result.
+Run `git diff --check`, focused tests, and relevant broader checks in one validation pass. Record commands, exit codes, and browser evidence when applicable in `implementation.md`. After passing checks, record the content identity with `python3 "$SKILL_DIR/scripts/delivery_tools.py" fingerprint <worktree>`. Reuse evidence only while that identity is unchanged; rerun affected/broad checks after a fix and pin the new identity. Stop on an environment/dependency failure rather than presenting it as a code result.
 
 ### 3. Review once
 
@@ -105,17 +111,17 @@ Resolve all compatible `must-fix` findings in one bounded batch. Keep advisory f
 
 Run the affected tests plus the relevant broad checks once after the batch. Write `revision.md` mapping every finding ID to `resolved`, `accepted-as-advisory`, or `blocked`, with changed files and command results. If no revision is needed, record a no-op revision and retain the passing checks.
 
-### 5. Create the PR
+### 5. Deliver and verify the PR
 
-Before delivery, verify the diff contains only task changes, no secrets, and no unexplained generated files. Confirm the final checks and branch tip, then:
+Audit the task-only diff for secrets and unexplained generated files. Confirm passing local checks, review dispositions, applicable browser verification, and the validated fingerprint before any push.
 
-1. Commit only the task changes with a focused message.
-2. Push the task branch with its upstream configured.
-3. Create the PR against the recorded base branch.
-4. Use a concise PR body containing the problem, solution, tests, review/revision status, and risks. Add the HTML explainer reference after rendering when the forge supports a comment or attachment.
-5. Record the commit SHA, PR URL/number, base/head, and initial check state in `delivery.md`.
+For GitHub, read [DELIVERY.md](DELIVERY.md), derive a concise commit/PR message from accepted artifacts, and invoke the bundled deterministic helper. It stages only the exact task inventory, reconciles existing commits/PRs, and binds required-check evidence to the local, pushed, and PR head. Do not delegate delivery to an agent.
 
-Use the forge's normal authentication and PR tooling. Do not amend or force-push unrelated history. If the forge rejects delivery for authentication, permission, or infrastructure reasons, preserve the artifacts and report the exact next action.
+Record the helper's output in `delivery.md`. A complete result requires positive discovery of the required-check policy and passing required checks on the final head. An empty rollup is not proof that no checks are required. An explicitly discovered absence is reported as `not-configured`, never as "CI passed". The helper polls for up to 30 minutes; a smaller timeout may be specified. Pending/timed-out, unknown-policy, authentication, permission, or infrastructure outcomes are not completion and do not spend the CI code-fix allowance. Preserve evidence and report the exact resume action.
+
+For other forges, the coordinator uses the established CLI and records equivalent final-head and policy evidence. Unsupported policy discovery blocks; never silently fall back to an unverified PR. Do not amend or force-push unrelated history.
+
+For a change-related required-check failure, allow **one separate compatible CI-fix batch** even if the review revision was already used. Inspect logs to distinguish existing/infrastructure failures from task defects; do not fix unrelated code. Record `ci-revision.md`, rerun affected and relevant broad checks (plus browser checks if affected), and update the validated fingerprint. Reconcile the same PR using a new immutable delivery input/output path. A second failure, unresolved must-fix, or change in product/risk scope blocks and recommends the durable workflow; never start another review or CI-fix batch.
 
 ### 6. Optionally render the PR explainer in HTML
 
@@ -133,7 +139,7 @@ The renderer requires non-empty `title`, `summary`, `repository`, and `pr_url` f
 
 ## Completion handoff
 
-Finish only when the PR exists, any requested `pr-explainer.html` validates as a readable file, and every completed Herdr pane created by the workflow has been closed. Report, briefly:
+Finish only when the PR exists, required local checks and applicable browser verification pass, must-fix findings are resolved, and required CI is verified on the final head (or positively identified as not configured). Any requested `pr-explainer.html` must be readable, and every settled Herdr pane created by the workflow must be closed. "PR created; CI pending" is progress, not completion. Report, briefly:
 
 - status and PR URL;
 - final commit and check state;
@@ -143,5 +149,7 @@ Finish only when the PR exists, any requested `pr-explainer.html` validates as a
 If any gate fails, do not claim completion. Leave the durable artifacts in place and state the exact resume action or escalation to the full `end-to-end-development` skill. Absence of an unrequested HTML explainer is not a failed gate.
 
 ## Bundled resource
+
+[scripts/delivery_tools.py](scripts/delivery_tools.py) provides commit-independent fingerprints and deterministic GitHub delivery. Its standalone JSON/CLI contract is in [DELIVERY.md](DELIVERY.md); only Python's standard library, Git, and `gh` are required.
 
 `[scripts/render_pr_explainer.py](scripts/render_pr_explainer.py)` renders the final explainer without third-party dependencies. It accepts JSON on disk or stdin and HTML-escapes all user/repository-controlled values.

@@ -6,6 +6,8 @@ Initialize the assigned file first:
 python3 <validator_path> init <assignment_path>
 ```
 
+For a stage that cannot finish, follow the [blocker contract](blockers.md) and use the typed `block` command.
+
 Apply the pinned simplicity and codebase-design guidance. The artifact must:
 
 - hash-bind the exact plan;
