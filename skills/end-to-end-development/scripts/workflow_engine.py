@@ -381,6 +381,79 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_artifact_repair(self) -> bool:
+        """Recover only a pre-fix oversized handoff rejection, without replaying work.
+
+        The CLI holds the execution lock. Pin the read-only repair before clearing
+        the blocker so a crash cannot route the original assignment to a writer.
+        """
+        run = self.load_run()
+        if (run["status"] != "blocked" or len(run["blockers"]) != 1
+                or run["next_actions"]
+                or run["retry_limits"].get("artifact_repairs_per_action", 0) != 1
+                or any(repo.get("active_writer") for repo in run["repositories"].values())):
+            return False
+        blocker = run["blockers"][0]
+        match = re.fullmatch(
+            r"Artifact evidence rejected for (.+): \$\.next_action: must be at most 300 characters",
+            blocker["summary"],
+        )
+        if (blocker["kind"] != "decision" or not match
+                or blocker["required_action"] != "Inspect the preserved artifact/evidence and resolve the reported decision; source work was not replayed."):
+            return False
+        action_id = match[1]
+        path = self.run_dir / "assignments" / f"{_slug(action_id)}.json"
+        assignment = _load_json(path)
+        artifact_guard.validate_assignment(assignment)
+        repository = run["repositories"].get(assignment.get("repo_id"))
+        phase = {"validation-fix": "validate", "pipeline-fix": "deliver"}.get(assignment["stage"], assignment["stage"])
+        if (assignment["action_id"] != action_id or assignment["run_id"] != run["run_id"]
+                or assignment["output_kind"] != "result" or phase != run["phase"]
+                or assignment.get("execution_mode") == "artifact-repair" or not repository
+                or action_id in repository["accepted_artifacts"]
+                or Path(assignment["cwd"]).resolve() != Path(repository["worktree"]).resolve()):
+            return False
+        manifest_path = Path(blocker["evidence_path"])
+        if manifest_path.resolve().parent != self.run_dir / "supervisor":
+            return False
+        manifest = _load_json(manifest_path)
+        if not any(worker.get("action_id") == action_id for worker in manifest.get("workers", [])):
+            return False
+        if any(agent.get("cleanup_status", "complete") != "complete" for agent in self.load_agents()["agents"]):
+            return False
+        saved = run.get("artifact_repairs", {}).get(action_id, {})
+        if saved.get("launch_started_at"):
+            return False
+        output = Path(assignment["output_artifact"])
+        if output.stat().st_size > artifact_guard.MAX_BYTES["result"]:
+            return False
+        payload = _load_json(output)
+        if not artifact_guard.oversized_next_action(payload):
+            return False
+        # Do not normalize old results here: that would rebind stale passing
+        # validations to today's content before checking their original evidence.
+        artifact_guard.repairable_result(payload, output)
+        if (payload["tree_fingerprint"] != workflow_tools.worktree_fingerprint(Path(assignment["cwd"]))
+                or payload["git"]["head"] != _git(Path(assignment["cwd"]), "rev-parse", "HEAD")
+                or repository["branch"] != _git(Path(assignment["cwd"]), "branch", "--show-current")
+                or Path(payload["git"]["status_short_path"]).read_text().strip()
+                != _git(Path(assignment["cwd"]), "status", "--short")):
+            return False
+        repair_path = self._artifact_repair_assignment(assignment)
+        artifact_guard.validate_assignment(_load_json(repair_path))
+        with RunLock(self.run_dir):
+            current = self.load_run()
+            if current["status"] != "blocked" or current["blockers"] != run["blockers"]:
+                raise WorkflowError("artifact recovery blocker changed before transition")
+            current["status"] = "working"
+            current["blockers"] = []
+            for repo in current["repositories"].values():
+                if repo["status"] == "blocked":
+                    repo["status"] = "pending"
+            self._save_run(current)
+        self._append_event("resumed", reason="retry-artifact-repair", next_action=run["phase"])
+        return True
+
     def retry_validation_evidence(self) -> bool:
         """Retry only the exact validation-coverage blocker after an engine fix."""
         with RunLock(self.run_dir):
@@ -835,17 +908,17 @@ class WorkflowEngine:
                     existing = _load_json(output_path)
                 except (OSError, ValueError, json.JSONDecodeError):
                     return assignment_path
-                if existing.get("status") not in {"blocked", "failed"}:
-                    return assignment_path
                 if (assignment.get("output_kind") == "result"
                         and run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
                         and assignment["action_id"] not in run.get("artifact_repairs", {})):
                     try:
                         self._validate_worker_output(assignment, output_path)
                     except artifact_guard.ValidationError as error:
-                        if error.code == "missing-field" and re.fullmatch(r"\$\.blockers\[[0-9]+\]\.kind", error.path):
+                        if artifact_guard.repairable_rejection(error.code, error.path):
                             return self._artifact_repair_assignment(assignment)
                         raise WorkflowError(f"Cannot resume invalid result evidence: {error}") from error
+                if existing.get("status") not in {"blocked", "failed"}:
+                    return assignment_path
                 assignment_path = self._replacement(assignment)
 
         if inputs is None:
@@ -1366,6 +1439,8 @@ class WorkflowEngine:
         if _reference(repair_path) != repair["assignment"]:
             raise WorkflowError("immutable artifact repair assignment changed")
         repaired = _load_json(repair_path)
+        if repair_path.resolve() == path.resolve() or repaired.get("execution_mode") != "artifact-repair":
+            raise WorkflowError("artifact repair must reference a distinct read-only assignment")
         accepted = run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
         # Only an explicit external-condition resume after a valid blocked repair
         # can create new source work. A crash never spends a fresh repair budget.
@@ -1383,7 +1458,10 @@ class WorkflowEngine:
         payload = _load_json(output)
         artifact_guard.repairable_result(payload, output)
         repair = dict(assignment)
-        repair["action_id"] = assignment["action_id"] + ":artifact-repair-1"
+        # Put the identity hash before the readable label and stay below _slug's
+        # filename bound; appending a suffix to a long action can alias its writer.
+        identity = hashlib.sha256(assignment["action_id"].encode()).hexdigest()[:16]
+        repair["action_id"] = f"artifact-repair-1:{identity}:{assignment['action_id'][:80]}"
         repair["created_at"] = self.now()
         repair["execution_mode"] = "artifact-repair"
         repair["thinking"] = "medium"
@@ -1403,15 +1481,21 @@ class WorkflowEngine:
         }
         repair["output_artifact"] = str(output.with_name(f"{output.stem}-artifact-repair-1.json"))
         repair["instructions"] = [
-            "Repair only missing blockers[*].kind using the existing blocker text and evidence.",
+            "Repair only missing blockers[*].kind from existing evidence and/or an oversized next_action.",
+            "If next_action exceeds 300 characters, shorten it to at most 300 characters or set it to null; it is advisory, not graph routing.",
             "Initialize the output from this assignment; it copies the original semantic payload.",
-            "Do not change existing fields, run tests, or modify project/Git/forge state.",
+            "Keep every other field unchanged. Do not run tests or modify project/Git/forge state.",
             "If classification is ambiguous, leave the field missing and explain why in the worker log.",
         ]
         path = self.run_dir / "assignments" / f"{_slug(repair['action_id'])}.json"
+        if path == original_path:
+            raise WorkflowError("artifact repair assignment path aliases the original writer")
         if not path.exists():
             workflow_tools.atomic_write_json(path, repair)
-        artifact_guard.validate_assignment(_load_json(path))
+        saved = _load_json(path)
+        if saved.get("execution_mode") != "artifact-repair" or saved.get("action_id") != repair["action_id"]:
+            artifact_guard.fail("$.execution_mode", "artifact repair requires a distinct read-only assignment")
+        artifact_guard.validate_assignment(saved)
         with RunLock(self.run_dir):
             current = self.load_run()
             current.setdefault("artifact_repairs", {})[assignment["action_id"]] = {
@@ -1459,8 +1543,8 @@ class WorkflowEngine:
             replacements: list[Path] = []
             for assignment, worker in result.rejected:
                 is_repair = assignment.get("execution_mode") == "artifact-repair"
-                if repair_enabled and not is_repair and worker.get("error_code") == "missing-field" and re.fullmatch(
-                    r"\$\.blockers\[[0-9]+\]\.kind", worker.get("error_path", "")
+                if repair_enabled and not is_repair and artifact_guard.repairable_rejection(
+                    worker.get("error_code"), worker.get("error_path")
                 ):
                     try:
                         replacements.append(self._artifact_repair_assignment(assignment))

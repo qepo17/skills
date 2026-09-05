@@ -131,6 +131,14 @@ After updating an engine that emitted the exact validation-coverage blocker from
 
 It accepts only that exact validate-phase blocker and creates a new assignment bound to the canonical plan hash and validation IDs. It does not clear other code, dependency, or decision blockers.
 
+For the exact result rejection `$.next_action: must be at most 300 characters` emitted before oversized-handoff repair was supported:
+
+```bash
+"$ORCHESTRATOR" retry-artifact-repair "$RUN_DIR" --worker-runtime auto
+```
+
+This requires a pinned unused repair allowance, no active actions/writers or unsettled worker cleanup, the original rejection manifest/assignment, and still-current content/HEAD/branch/status evidence. It pins the original artifact and evidence into a read-only repair before clearing the blocker. It never normalizes stale validation evidence onto a changed tree, resets attempts, clears unrelated blockers, or bypasses review/delivery. A crash before launch reuses the saved repair; a claimed attempt is never relaunched.
+
 After updating an engine that ran a dependent fix concurrently with an upstream contract fix and emitted the exact hash-pinned bundle-drift blocker, use:
 
 ```bash
@@ -182,7 +190,7 @@ The skill uses the locked project in this directory:
 
 ## Output repair and command delivery
 
-Worker schemas link a concise blocker contract and typed construction command. Rejections carry an error code and field path through both acceptance seams. New runs permit one artifact-only correction of a parseable blocked result missing only blocker kinds. The graph persists a derived read-only assignment/output and binds the original payload, referenced evidence, content, HEAD, branch, and index. A persisted launch claim prevents a failed/missing repair output from starting another attempt after a crash. Repair never changes outcomes, reruns validation, resets retries, or falls back to another source writer. Unsupported/ambiguous repairs and stale evidence remain blocked. Explicit external-condition resume after a valid blocked repair is distinct from crash recovery.
+Worker schemas link a concise blocker contract and typed construction command. Rejections carry an error code and field path through both acceptance seams. Runs with a pinned repair allowance permit one artifact-only correction of a parseable result with only missing blocker kinds and/or `next_action` text longer than 300 characters. The advisory text may be shortened to at most 300 characters or set to null; valid existing text and every semantic result field remain unchanged. The graph persists a derived read-only assignment/output and binds the original payload, referenced evidence, content, HEAD, branch, and index. A persisted launch claim prevents a failed/missing repair output from starting another attempt after a crash. Repair never changes outcomes, reruns validation, resets retries, or falls back to another source writer. Unsupported/ambiguous repairs and stale evidence remain blocked. Explicit external-condition resume after a valid blocked repair is distinct from crash recovery.
 
 GitHub delivery assignments use `execution_mode: command` with normal durable `next_actions`; they never create agent records or backend handles. The graph executes the standard-library helper, records immutable input/output evidence, and reconciles Git/forge state after interruption. Independent command deliveries and remaining forge workers can run concurrently. The graph's cold-entry `recover` node refreshes completed delivery through read-only commands; ordinary phase reconciliation does not repeat those queries endlessly. Hash-pinned refresh obligations survive active peer actions and drain after the existing batch settles, so a pending fix in one repository cannot hide stale delivery in another. Recovery before acceptance re-observes the forge without commit/push/PR writes, retaining earlier snapshots; recovery after acceptance uses a new assignment/output. Recovered CI failures retain the same bounded fix route. Version-2 results require matching local/pushed/checked heads and positive required-check policy evidence. A changing policy/head invalidates the observation. Pending CI is not completion and never spends the code-fix allowance. Other forges retain an explicit worker path with equivalent evidence requirements; unknown policy blocks rather than silently downgrading.
 

@@ -101,6 +101,14 @@ Never edit `run.json`, `agents.json`, `events.jsonl`, assignments, or LangGraph 
 
 This command rejects every other blocker and reruns validation with a new plan-hash-bound assignment; it does not weaken ordinary code-blocker handling.
 
+If an older engine rejected a result solely because `next_action` exceeded 300 characters, update the engine and use:
+
+```bash
+"$ORCHESTRATOR" retry-artifact-repair "$RUN_DIR" --worker-runtime auto
+```
+
+This guarded transition requires the exact handoff-metadata rejection, intact current evidence, settled workers, and an unused pinned repair allowance. It creates a read-only artifact repair, not another implementation or validation attempt. It does not clear unrelated blockers, replenish attempts, or skip independent review and delivery gates. Do not edit the rejected artifact or coordinator state by hand.
+
 If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
 
 ```bash
@@ -230,7 +238,7 @@ Workers never spawn nested agents. A Paseo coordinator creates Paseo subagents, 
 
 ### Artifact-only recovery
 
-Workers should use the typed `artifact_guard.py block` command and [blocker schema](schemas/blockers.md). In new runs, a parseable blocked result missing only `blockers[*].kind` receives at most one five-minute, medium-reasoning artifact-only repair. It has a new immutable assignment/output, no project/Git/forge write permission, and pinned original semantics, logs, content, HEAD, branch, and index. It cannot manufacture a pass, rewrite evidence, or start another source writer. Ambiguous/invalid repair and stale evidence block with an actionable explanation. Missing files or process failures remain distinct from eligible schema repair. Resume never resets the allowance; legacy runs retain their existing policy.
+Workers should use the typed `artifact_guard.py block` command and [blocker schema](schemas/blockers.md). In runs with a pinned repair allowance, a parseable result with only missing `blockers[*].kind` and/or an oversized advisory `next_action` receives at most one five-minute, medium-reasoning artifact-only repair. `next_action` must be null or at most 300 characters; only an originally oversized value may be shortened or cleared. Graph routing never depends on this text. It has a new immutable assignment/output, no project/Git/forge write permission, and pinned original semantics, logs, content, HEAD, branch, and index. It cannot manufacture a pass, rewrite evidence, or start another source writer. Ambiguous/invalid repair and stale evidence block with an actionable explanation. Missing files or process failures remain distinct from eligible schema repair. Resume never resets the allowance; legacy runs retain their existing policy.
 
 ### Work packets and bounded deviations
 

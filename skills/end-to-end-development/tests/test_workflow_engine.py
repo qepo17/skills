@@ -743,16 +743,16 @@ class MissingBlockerKindBatch(FakeSuccessfulBatch):
             artifact = json.loads(original.read_text())
             artifact["assignment_path"] = str(assignment_paths[0])
             artifact["assignment_sha256"] = hashlib.sha256(assignment_paths[0].read_bytes()).hexdigest()
-            artifact["blockers"][0]["kind"] = "environment"
+            self.repair_metadata(artifact)
             if self.repair_change == "status":
-                artifact["status"] = "complete"
+                artifact["status"] = "complete" if artifact["status"] == "blocked" else "failed"
                 artifact["blockers"] = []
             elif self.repair_change == "source":
                 (Path(assignment["cwd"]) / "feature.txt").write_text("unauthorized repair\n")
             elif self.repair_change in {"invalid", "crash-after-invalid"}:
-                del artifact["blockers"][0]["kind"]
+                artifact = json.loads(original.read_text())
             elif self.repair_change == "evidence":
-                Path(artifact["blockers"][0]["evidence_path"]).write_text("changed evidence\n")
+                sorted(workflow_tools.artifact_evidence_paths(artifact))[0].write_text("changed evidence\n")
             elif self.repair_change == "index":
                 self._git(Path(assignment["cwd"]), "add", "feature.txt")
             elif self.repair_change == "head":
@@ -778,23 +778,62 @@ class MissingBlockerKindBatch(FakeSuccessfulBatch):
             self.source_writes += 1
             output = Path(assignment["output_artifact"])
             artifact = json.loads(output.read_text())
-            evidence = Path(assignment["log_dir"]) / "environment.log"
-            evidence.write_text("The isolated test service is unavailable.\n")
-            artifact.update(status="blocked", blockers=[{
-                "id": "BLOCK-001",
-                "summary": "The isolated test service is unavailable.",
-                "evidence_path": str(evidence),
-                "required_action": "Restore the isolated test service, then resume.",
-            }])
-            if self.repair_change == "missing-evidence":
-                evidence.unlink()
-            elif self.repair_change == "contradictory":
-                artifact["status"] = "complete"
+            self.break_metadata(assignment, artifact)
             output.write_text(json.dumps(artifact) + "\n")
             if self.repair_change == "crash-after-writer":
                 self.repair_change = None
                 raise KeyboardInterrupt("writer settled before its rejection was recorded")
         return code, manifest
+
+    def repair_metadata(self, artifact: dict[str, Any]) -> None:
+        artifact["blockers"][0]["kind"] = "environment"
+
+    def break_metadata(self, assignment: dict[str, Any], artifact: dict[str, Any]) -> None:
+        evidence = Path(assignment["log_dir"]) / "environment.log"
+        evidence.write_text("The isolated test service is unavailable.\n")
+        artifact.update(status="blocked", blockers=[{
+            "id": "BLOCK-001",
+            "summary": "The isolated test service is unavailable.",
+            "evidence_path": str(evidence),
+            "required_action": "Restore the isolated test service, then resume.",
+        }])
+        if self.repair_change == "missing-evidence":
+            evidence.unlink()
+        elif self.repair_change == "contradictory":
+            artifact["status"] = "complete"
+
+
+class OversizedNextActionBatch(MissingBlockerKindBatch):
+    def __init__(self, *, repair_change: str | None = None, long_packet_id: bool = False) -> None:
+        super().__init__(repair_change=repair_change)
+        self.long_packet_id = long_packet_id
+
+    def __call__(self, assignment_paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(assignment_paths[0].read_text())
+        if assignment["stage"] == "implement" and assignment.get("execution_mode") != "artifact-repair":
+            if self.source_writes:
+                raise AssertionError("artifact recovery replayed the source writer")
+        result = super().__call__(assignment_paths, **kwargs)
+        if assignment["stage"] == "plan" and self.long_packet_id:
+            output = Path(assignment["output_artifact"])
+            plan = json.loads(output.read_text())
+            plan["work_packets"][0]["id"] = "API-PACKET-" + "LONG-" * 32
+            output.write_text(json.dumps(plan))
+        return result
+
+    def repair_metadata(self, artifact: dict[str, Any]) -> None:
+        artifact["next_action"] = "Proceed to independent review, then delivery."
+        if self.repair_change == "validation":
+            artifact["validations"][0]["summary"] = "Rewritten validation evidence."
+        elif self.repair_change == "null":
+            artifact["next_action"] = None
+
+    def break_metadata(self, assignment: dict[str, Any], artifact: dict[str, Any]) -> None:
+        artifact["next_action"] = "Proceed to independent review, then delivery. " * 8
+        if self.repair_change == "missing-evidence":
+            Path(artifact["validations"][0]["log_path"]).unlink()
+        elif self.repair_change == "contradictory":
+            artifact["status"] = "blocked"
 
 
 class WorkflowEngineTests(unittest.TestCase):
@@ -925,6 +964,178 @@ class WorkflowEngineTests(unittest.TestCase):
         )
         self.assertEqual("complete", engine.load_run()["status"])
         self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+
+    def test_oversized_next_action_repairs_before_review_and_delivery(self) -> None:
+        batch = OversizedNextActionBatch()
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "oversized-handoff"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"], engine.load_run()["blockers"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual(["plan", "implement", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+        repair = next(a for a in batch.assignments if a.get("execution_mode") == "artifact-repair")
+        for key in ("project_file_access", "git_access", "forge_access"):
+            self.assertEqual("none", repair[key])
+        original_path = Path(repair["repair_of"]["artifact"]["path"])
+        original = json.loads(original_path.read_text())
+        repaired = json.loads(Path(repair["output_artifact"]).read_text())
+        self.assertGreater(len(original["next_action"]), 300)
+        self.assertLessEqual(len(repaired["next_action"]), 300)
+        self.assertEqual(original["validations"], repaired["validations"])
+        self.assertEqual(repair["repair_of"]["artifact"]["sha256"], hashlib.sha256(original_path.read_bytes()).hexdigest())
+
+    def assert_long_handoff_uses_a_distinct_repair(self, *, saved_blocker: bool) -> None:
+        batch = OversizedNextActionBatch(long_packet_id=True)
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "long-handoff"}, "recursion_limit": 150}
+        if saved_blocker:
+            with mock.patch.object(artifact_guard, "repairable_rejection", return_value=False):
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+            self.assertTrue(engine.retry_artifact_repair())
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        repair = next(a for a in batch.assignments if a.get("execution_mode") == "artifact-repair")
+        saved = next(iter(engine.load_run()["artifact_repairs"].values()))
+        self.assertNotEqual(saved["assignment"]["path"], repair["repair_of"]["assignment"]["path"])
+        self.assertLessEqual(len(repair["action_id"]), 200)
+
+    def test_long_handoff_action_cannot_alias_the_source_assignment(self) -> None:
+        self.assert_long_handoff_uses_a_distinct_repair(saved_blocker=False)
+
+    def test_saved_long_handoff_action_cannot_alias_the_source_assignment(self) -> None:
+        self.assert_long_handoff_uses_a_distinct_repair(saved_blocker=True)
+
+    def test_retry_oversized_handoff_from_pre_fix_blocker(self) -> None:
+        batch = OversizedNextActionBatch()
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "retry-handoff"}, "recursion_limit": 150}
+        with mock.patch.object(artifact_guard, "repairable_rejection", return_value=False):
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("decision", engine.load_run()["blockers"][0]["kind"])
+        self.assertFalse(engine.resume_external_blockers())
+        original = next(a for a in batch.assignments if a["stage"] == "implement")
+        before = Path(original["output_artifact"]).read_bytes()
+        self.assertTrue(engine.retry_artifact_repair())
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual(before, Path(original["output_artifact"]).read_bytes())
+
+    def assert_handoff_crash_is_bounded(self, change: str) -> None:
+        batch = OversizedNextActionBatch(repair_change=change)
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": change}, "recursion_limit": 150}
+        with self.assertRaises(KeyboardInterrupt):
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        expected = "blocked" if change in {"crash-after-invalid", "crash-without-output"} else "complete"
+        self.assertEqual(expected, engine.load_run()["status"])
+        self.assertFalse(engine.retry_artifact_repair())
+
+    def test_oversized_handoff_recovers_a_settled_writer_after_crash(self) -> None:
+        self.assert_handoff_crash_is_bounded("crash-after-writer")
+
+    def test_oversized_handoff_recovers_a_written_repair_after_crash(self) -> None:
+        self.assert_handoff_crash_is_bounded("crash-after-output")
+
+    def test_oversized_handoff_never_relaunches_an_invalid_repair_after_crash(self) -> None:
+        self.assert_handoff_crash_is_bounded("crash-after-invalid")
+
+    def test_oversized_handoff_never_relaunches_a_missing_repair_after_crash(self) -> None:
+        self.assert_handoff_crash_is_bounded("crash-without-output")
+
+    def test_handoff_repair_rejects_semantic_and_repository_mutations(self) -> None:
+        for change in ("status", "validation", "source", "evidence", "invalid"):
+            with self.subTest(change=change):
+                self.run_dir = self.root / change
+                (self.worktree / "feature.txt").unlink(missing_ok=True)
+                batch = OversizedNextActionBatch(repair_change=change)
+                engine = self.initialize(batch)
+                config = {"configurable": {"thread_id": change}, "recursion_limit": 150}
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+                self.assertEqual("decision", engine.load_run()["blockers"][0]["kind"])
+                self.assertFalse(engine.retry_artifact_repair())
+                self.assertFalse(engine.resume_external_blockers())
+                build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+                self.assertEqual(1, batch.source_writes)
+                self.assertEqual(1, batch.repairs)
+                self.assertNotIn("review-1", [a["stage"] for a in batch.assignments])
+
+    def test_invalid_handoff_evidence_is_not_repairable(self) -> None:
+        for change in ("missing-evidence", "contradictory"):
+            with self.subTest(change=change):
+                self.run_dir = self.root / change
+                (self.worktree / "feature.txt").unlink(missing_ok=True)
+                batch = OversizedNextActionBatch(repair_change=change)
+                engine = self.initialize(batch)
+                build_graph(engine, InMemorySaver()).invoke(
+                    {"run_dir": str(self.run_dir)},
+                    {"configurable": {"thread_id": change}, "recursion_limit": 150},
+                )
+                self.assertEqual("blocked", engine.load_run()["status"])
+                self.assertEqual(1, batch.source_writes)
+                self.assertEqual(0, batch.repairs)
+
+    def test_saved_handoff_retry_rejects_stale_or_unrelated_state(self) -> None:
+        batch = OversizedNextActionBatch()
+        engine = self.initialize(batch)
+        with mock.patch.object(artifact_guard, "repairable_rejection", return_value=False):
+            build_graph(engine, InMemorySaver()).invoke(
+                {"run_dir": str(self.run_dir)},
+                {"configurable": {"thread_id": "unsafe-retry"}, "recursion_limit": 150},
+            )
+        run = engine.load_run()
+        for change in ("kind", "summary", "policy", "source", "index", "live-worker"):
+            with self.subTest(change=change):
+                changed = json.loads(json.dumps(run))
+                if change == "kind":
+                    changed["blockers"][0]["kind"] = "code"
+                elif change == "summary":
+                    changed["blockers"][0]["summary"] = "Another decision is needed."
+                elif change == "policy":
+                    del changed["retry_limits"]["artifact_repairs_per_action"]
+                elif change == "source":
+                    (self.worktree / "feature.txt").write_text("different content\n")
+                elif change == "index":
+                    FakeSuccessfulBatch._git(self.worktree, "add", "feature.txt")
+                elif change == "live-worker":
+                    agents = engine.load_agents()
+                    agents["agents"][-1]["cleanup_status"] = "retained"
+                    engine._save_agents(agents)
+                engine._save_run(changed)
+                before = engine.run_path.read_bytes()
+                self.assertFalse(engine.retry_artifact_repair())
+                self.assertEqual(before, engine.run_path.read_bytes())
+                (self.worktree / "feature.txt").write_text("implemented\n")
+                FakeSuccessfulBatch._git(self.worktree, "reset", "-q", "HEAD", "--", "feature.txt")
+        self.assertEqual(0, batch.repairs)
+        self.assertEqual(1, batch.source_writes)
+
+    def test_cli_retries_handoff_without_skipping_review_or_command_delivery(self) -> None:
+        import orchestrator
+        batch = OversizedNextActionBatch(repair_change="null")
+        engine, forge = self.github_engine(batch)
+        config = {"configurable": {"thread_id": "cli-handoff"}, "recursion_limit": 150}
+        graph = build_graph(engine, InMemorySaver())
+        with mock.patch.object(artifact_guard, "repairable_rejection", return_value=False):
+            graph.invoke({"run_dir": str(self.run_dir)}, config)
+        args = orchestrator.build_parser().parse_args(["retry-artifact-repair", str(self.run_dir)])
+        with mock.patch.object(orchestrator, "_open_graph") as opened:
+            opened.return_value.__enter__.return_value = (engine, graph, config)
+            result = orchestrator._invoke(args, {"run_dir": str(self.run_dir)})
+        self.assertEqual("complete", result["status"])
+        self.assertEqual(1, forge.create_count)
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual(["plan", "implement", "implement", "review-1"], [a["stage"] for a in batch.assignments])
 
     def test_missing_blocker_kind_repairs_output_without_replaying_source(self) -> None:
         batch = MissingBlockerKindBatch()

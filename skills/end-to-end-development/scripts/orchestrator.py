@@ -139,6 +139,11 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
     ) as (engine, graph, config):
         if args.command == "resume":
             engine.resume_external_blockers()
+        elif args.command == "retry-artifact-repair":
+            if not engine.retry_artifact_repair():
+                raise WorkflowError(
+                    "run is not blocked by an eligible oversized next_action rejection with an unused repair allowance"
+                )
         elif args.command == "retry-validation-evidence":
             if not engine.retry_validation_evidence():
                 raise WorkflowError(
@@ -226,6 +231,16 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--report-root", type=Path)
 
+    artifact_retry = subparsers.add_parser(
+        "retry-artifact-repair",
+        help="repair an exact oversized next_action rejection without replaying source work",
+    )
+    artifact_retry.add_argument("run_dir", type=Path)
+    artifact_retry.add_argument(
+        "--worker-runtime", choices=["auto", "codex", "pi"], default="auto"
+    )
+    artifact_retry.add_argument("--report-root", type=Path)
+
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",
         help="retry an exact validation-coverage blocker after fixing the engine",
@@ -302,6 +317,14 @@ def main() -> int:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": "resume"},
+            )
+        elif args.command == "retry-artifact-repair":
+            output = _invoke(
+                args,
+                {
+                    "run_dir": str(args.run_dir.resolve()),
+                    "last_transition": "retry-artifact-repair",
+                },
             )
         elif args.command == "retry-validation-evidence":
             output = _invoke(
