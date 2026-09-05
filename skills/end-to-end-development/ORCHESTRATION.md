@@ -158,6 +158,18 @@ Generic continuation words are rejected. Requested changes return selected repos
 
 Omit `--repository` to revise every repository plan.
 
+## Explicit handoff metadata recovery
+
+A completed implementation can be rejected solely because its advisory `next_action` exceeds 300 characters. After explicit user authorization, use the hash-pinned recovery command instead of editing run state or replaying source work:
+
+```bash
+"$ORCHESTRATOR" repair-handoff-metadata "$RUN_DIR" \
+  --artifact-sha256 "$REJECTED_ARTIFACT_SHA256"
+"$ORCHESTRATOR" resume "$RUN_DIR" --worker-runtime auto
+```
+
+The command accepts only that exact implement-phase decision blocker, a completed result with passing recorded checks, cleaned workers, unchanged worktree/HEAD/branch/status, and intact approved inputs. It archives the original bytes and a recovery receipt, sets only `next_action` to null, validates every other field, and accepts the repaired result under its original assignment. Approval, test results, retry limits and phase routing are unchanged. Interrupted publication is recoverable from the immutable archive; an already accepted result cannot be repaired again. The command does not advance the graph or launch any worker; ordinary `resume` continues validation, independent review and delivery. Other schema errors, source drift and genuine failures remain blocked.
+
 ## Database-target gate
 
 The graph refuses to schedule any migration-capable validation until non-secret evidence identifies an isolated local/test database. Record only a classification and description—never a URL, credential, or secret:
