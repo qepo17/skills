@@ -16,13 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-DEFAULT_WORKER_MODEL = "gpt-5.6-luna"
-DEFAULT_WORKER_THINKING = "max"
+DEFAULT_WORKER_MODEL = "gpt-6-astra"
+DEFAULT_WORKER_THINKING = "xhigh"
 THINKING_BY_CLASSIFICATION = {
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "max",
-    "max": "max",
+    "medium": DEFAULT_WORKER_THINKING,
+    "high": DEFAULT_WORKER_THINKING,
+    "xhigh": DEFAULT_WORKER_THINKING,
+    "max": DEFAULT_WORKER_THINKING,
 }
 WORKER_BACKENDS = {"direct", "herdr", "paseo", "tmux"}
 WORKER_RUNTIMES = {"codex", "pi"}

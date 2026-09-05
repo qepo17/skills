@@ -176,7 +176,7 @@ The skill uses the locked project in this directory:
 - `langgraph==1.2.11`
 - `langgraph-checkpoint-sqlite==3.1.1`
 
-`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. `workflow_tools.py run-batch` delegates lifecycle to the auto-detected worker supervisor while LangGraph retains the immutable assignment and artifact protocol. Launchers map assignment reasoning to runtime effort (`medium`, `high`, or `max` for `xhigh`) instead of using maximum reasoning for every stage.
+`scripts/run-orchestrator` invokes `uv run --project`, uses `uv.lock`, and sets `UV_PROJECT_ENVIRONMENT` to `${XDG_CACHE_HOME:-$HOME/.cache}/pi/end-to-end-development/venv` unless already configured. `workflow_tools.py run-batch` delegates lifecycle to the auto-detected worker supervisor while LangGraph retains the immutable assignment and artifact protocol. Workers use `gpt-6-astra`, and launchers normalize every assignment reasoning classification to runtime `xhigh`.
 
 ## Testing seams
 

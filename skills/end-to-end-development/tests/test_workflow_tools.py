@@ -323,10 +323,11 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertIn("--print", command)
         self.assertIn("--no-session", command)
         self.assertIn("--thinking", command)
-        self.assertIn("medium", command)
+        self.assertIn("xhigh", command)
         self.assertIn("--model", command)
-        self.assertIn("openai-codex/gpt-5.6-luna", command)
+        self.assertIn("openai-codex/gpt-6-astra", command)
         self.assertEqual("pi", manifest["workers"][0]["runtime"])
+        self.assertEqual("xhigh", manifest["workers"][0]["thinking"])
         self.assertIn(str(assignment_path.resolve()), command[-1])
 
     def test_dry_run_uses_codex_for_a_codex_coordinator(self) -> None:
@@ -382,9 +383,10 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertEqual("codex", command[0])
         self.assertIn("exec", command)
         self.assertIn("--model", command)
-        self.assertIn("gpt-5.6-luna", command)
-        self.assertIn('model_reasoning_effort="medium"', command)
+        self.assertIn("gpt-6-astra", command)
+        self.assertIn('model_reasoning_effort="xhigh"', command)
         self.assertEqual("codex", manifest["workers"][0]["runtime"])
+        self.assertEqual("xhigh", manifest["workers"][0]["thinking"])
 
     def test_project_writer_batch_requires_run_state_with_plan_approval(self) -> None:
         plan = self.root / "run" / "repos" / "api" / "plan-v1.json"

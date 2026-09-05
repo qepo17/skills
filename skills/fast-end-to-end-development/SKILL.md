@@ -15,7 +15,7 @@ Resolve `SKILL_DIR` to this skill's directory. Set `RUN_DIR` to the run director
 
 ## Agent runtime
 
-Use `gpt-5.6-luna` with effort proportional to the work: `high` for planning, implementation, review, and revision; `medium` for delivery or artifact rendering. Mechanical Git, forge, and renderer commands do not need a delegated model session. When launching an agent explicitly, pass the corresponding Codex `reasoning_effort` or Pi `--thinking` value.
+Use `gpt-6-astra` with `xhigh` reasoning for every subagent session in this workflow, including planning, implementation, review, revision, delivery, and delegated artifact rendering. Mechanical Git, forge, and renderer commands do not need a delegated model session. When launching a subagent explicitly, pass `model_reasoning_effort="xhigh"` for Codex or `--model openai-codex/gpt-6-astra --thinking xhigh` for Pi.
 
 ## Herdr pane lifecycle
 

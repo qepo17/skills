@@ -90,7 +90,7 @@ class ExecutionContextDetectionTests(unittest.TestCase):
                     0,
                     {
                         "id": "parent-123",
-                        "provider": "codex/gpt-5.6-luna",
+                        "provider": "codex/gpt-6-astra",
                         "status": "running",
                     },
                 )
@@ -195,7 +195,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def request(
-        self, runtime: str = "pi", thinking: str = "max"
+        self, runtime: str = "pi", thinking: str = "xhigh"
     ) -> worker_supervisor.WorkerRequest:
         assignment = self.run_dir / "assignment.json"
         assignment.write_text("{}\n", encoding="utf-8")
@@ -224,18 +224,23 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertIn("--print", preview["command"])
         self.assertIn("--no-session", preview["command"])
 
-    def test_preview_uses_the_assignment_reasoning_level(self) -> None:
+    def test_preview_uses_astra_with_default_xhigh_reasoning(self) -> None:
         supervisor = worker_supervisor.WorkerSupervisor(
             self.run_dir,
             worker_supervisor.ExecutionContext("direct", "pi", "fallback", {}),
             pi_binary="pi-custom",
         )
 
-        preview = supervisor.preview(self.request(thinking="medium"))
+        preview = supervisor.preview(self.request())
 
+        model_index = preview["command"].index("--model") + 1
+        self.assertEqual("openai-codex/gpt-6-astra", preview["command"][model_index])
         thinking_index = preview["command"].index("--thinking") + 1
-        self.assertEqual("medium", preview["command"][thinking_index])
-        self.assertEqual("max", worker_supervisor.runtime_thinking("xhigh"))
+        self.assertEqual("xhigh", preview["command"][thinking_index])
+        for classification in ("medium", "high", "xhigh", "max"):
+            self.assertEqual(
+                "xhigh", worker_supervisor.runtime_thinking(classification)
+            )
 
     def test_tmux_preview_creates_a_detached_window_without_focus(self) -> None:
         supervisor = worker_supervisor.WorkerSupervisor(
