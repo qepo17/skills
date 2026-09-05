@@ -63,7 +63,9 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 ## Invariants
 
 - Capture `git status --short` and the baseline commit before editing. Preserve unrelated user changes; never use `reset --hard`, `clean`, broad checkout, or an overwrite to make the tree convenient.
-- Always use a clean dedicated task worktree and branch, preferring Worktrunk. A supplied task branch still needs isolated worktree execution. Preserve the original checkout and never bring credentials into the worktree.
+- **Start from an up-to-date base.** Before creating a new task worktree or planning changes, identify the repository's remote and default branch; do not assume `origin/main`. Run `git fetch <remote>` and create the task branch from the latest remote default branch (or an explicitly user-selected base). If fetching or resolving the base fails, stop and report it rather than silently using a stale local base.
+- Always use a clean dedicated task worktree and branch, preferring Worktrunk. For a new task branch, pass the fetched base explicitly: `wt switch --create <branch> --base <remote>/<default-branch> --format json --no-cd`. Preserve the original checkout and never bring credentials into the worktree.
+- The fresh-base rule applies only to new task branches. For a supplied existing task branch or continued run, inspect status and divergence first and use that branch in an isolated worktree rather than recreating it from the default branch. Preserve existing commits, local changes, and recorded baselines; never automatically pull, reset, discard, or rebase existing work.
 - Keep one project-file writer. Do not let a reviewer or delivery step edit source files.
 - Close every workflow-created Herdr pane immediately after its agent settles and its result is captured; retain only working, blocked, or timed-out panes that still need attention.
 - Treat the plan as the implementation contract. A simpler equivalent change or focused test is allowed; a new high-cost mechanism, public contract, migration, or unrelated refactor requires escalation.

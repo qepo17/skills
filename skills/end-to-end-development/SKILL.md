@@ -53,13 +53,14 @@ Treat skill arguments plus relevant user conversation as the complete request.
 
 1. Discover every affected repository and every material risk before creating run state.
 2. Ask the user only when repository identity or a material product choice cannot be established from the request and repository evidence. A later plan-review interrupt is mandatory only if policy selects full.
-3. Create one dedicated worktree per repository, preferring Worktrunk:
+3. **Start from an up-to-date base.** Before creating a new task worktree or planning changes, identify each repository's remote and default branch; do not assume `origin/main`. Fetch the remote and create the task branch from the latest remote default branch (or an explicitly user-selected base). If fetching or resolving the base fails, stop and report it rather than silently using a stale local base. Create one dedicated worktree per repository, preferring Worktrunk and passing the base explicitly:
 
    ```bash
-   wt switch --create <branch> --format json --no-cd
+   git fetch <remote> && \
+     wt switch --create <branch> --base <remote>/<default-branch> --format json --no-cd
    ```
 
-   The dedicated worktree must be clean. Never copy `.env` or other database credentials into it.
+   The dedicated worktree must be clean. Never copy `.env` or other database credentials into it. For a supplied existing task branch, inspect status and divergence first and use that branch in an isolated worktree rather than recreating it from the default branch. Preserve existing commits and local changes; never automatically pull, reset, discard, or rebase existing work.
 4. Write a bootstrap specification using the exact shape in [ORCHESTRATION.md](ORCHESTRATION.md). Preserve material user wording in requirement source text and acceptance criteria.
 5. Choose durable run state under:
 
@@ -78,6 +79,8 @@ Treat skill arguments plus relevant user conversation as the complete request.
 The command runs until completion, a validated blocker, or a full-profile plan-review LangGraph interrupt.
 
 ### Resume
+
+The fresh-base rule applies only to new task branches. Preserve the run's existing worktrees, commits, local changes, and recorded baselines; do not recreate branches or automatically pull, reset, discard, or rebase them to catch up with the remote.
 
 For an explicit run directory:
 
