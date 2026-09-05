@@ -1,5 +1,7 @@
 # Review artifact (`review`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Initialize the assigned file first:
 
 ```bash
@@ -20,7 +22,7 @@ Each finding contains stable ID, category (`standards` or `spec`), severity, act
 - A review that finished examining the assigned tree uses `status: complete`, including when it reports `must-fix` findings. Use `status: blocked` and `blockers` only when the review itself could not finish.
 - `reviewed_status_path` contains only the exact final `git status --short` output for the assigned worktree; keep commentary and conclusions in the review artifact or separate logs.
 
-Validate before returning:
+Follow the shared semantic preflight before returning. When mechanical metadata is ready, validate; otherwise report normalization pending and leave mandatory normalization/final validation to the graph:
 
 ```bash
 python3 <validator_path> review <output_artifact>

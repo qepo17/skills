@@ -1,6 +1,6 @@
 # End-to-End Development Coordinator Artifact Contract
 
-This file is normative for the LangGraph control plane. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read the stage-specific file under [`schemas/`](schemas/) and its linked [blocker contract](schemas/blockers.md), initialized from their immutable assignment with:
+This file describes LangGraph control-plane projections and examples. [SKILL.md — Validation rules](SKILL.md#validation-rules) is the shared upfront validation contract for every coordinator and worker. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read that contract before any work, then their stage-specific reminder under [`schemas/`](schemas/) and its linked [blocker contract](schemas/blockers.md). Initialize only a missing assigned output with:
 
 ```bash
 python3 "$SKILL_DIR/scripts/artifact_guard.py" init <assignment-path>

@@ -1,5 +1,7 @@
 # Immutable worker assignment (`assignment`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Assignments are coordinator-owned. Required common fields are schema/artifact/run/action identity, timestamp, stage, attempt, optional profile, repository scope, baseline/pre-existing status, access permissions, hash-pinned inputs, requirement IDs, instructions, validation commands, output kind/path, log directory, stage-specific `artifact_schema_path`, and validator path. Repository-scoped read-only assignments also pin `input_tree_fingerprint`; acceptance fails if their content changes. In every new run, a project-file writer also has a `plan_review` hashed-file reference identical to the approved bundle in `run.json`; that same Markdown file appears in `input_artifacts`.
 
 Profiled stage fields:
