@@ -1,6 +1,6 @@
 # End-to-End Development Coordinator Artifact Contract
 
-This file is normative for the LangGraph control plane. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read the stage-specific file under [`schemas/`](schemas/) and its linked [blocker contract](schemas/blockers.md), initialized from their immutable assignment with:
+This file describes LangGraph control-plane projections and examples. [SKILL.md — Validation rules](SKILL.md#validation-rules) is the shared upfront validation contract for every coordinator and worker. The graph is the only executable state machine and the only writer of coordinator state after initialization. Workers read that contract before any work, then their stage-specific reminder under [`schemas/`](schemas/) and its linked [blocker contract](schemas/blockers.md). Initialize only a missing assigned output with:
 
 ```bash
 python3 "$SKILL_DIR/scripts/artifact_guard.py" init <assignment-path>
@@ -328,6 +328,16 @@ Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_sta
 An `execution_mode: artifact-repair` assignment keeps the original result stage, IDs, commands, and canonical inputs but grants no project/Git/forge write access. It has a new action/output path, medium reasoning, and a 300-second timeout. `repair_of` contains hashed `assignment`, `artifact`, and `evidence` references plus `repository_states` keyed by repository ID (`fingerprint`, `head`, `branch`, `index_sha256`). The index hash represents staged entries, not volatile stat-cache bytes.
 
 `run.json.artifact_repairs` maps the original action ID to a hashed repair assignment and its `resume_generation`, persisted before launch. Its `launch_started_at` claim is saved before entering the supervisor: after a crash, adopt/wait for surviving work and accept a valid output, but never relaunch a claimed repair with missing/invalid output. An indeterminate launch blocks conservatively. `external_resume_generation` advances only on supported explicit external-condition resume; crash recovery never replenishes the one-repair allowance. Accepted repairs remain immutable. Only previously missing blocker kinds, an originally oversized advisory `next_action` (shortened to at most 300 characters or null), and coordinator-owned metadata can differ from the original payload. Eligibility validates the complete remaining result before scheduling repair; complete results retain their existing passing evidence and still proceed through independent review. `retry-artifact-repair` is the guarded CLI transition for a saved pre-fix oversized-handoff rejection and requires an unused pinned allowance and still-current evidence. Genuine blocked outcomes remain blocked; arbitrary field edits, changed input/evidence/Git state, or invalid/ambiguous classification do not become replacement source work.
+
+### Coordinator validation command evidence
+
+A `validate` assignment may use `execution_mode: command` only with `coordinator_validation.executor: git-diff-check-v1`. Its context hash-pins a complete accepted `source` result, referenced `evidence`, and `repository_state` (`fingerprint`, `head`, `branch`, `index_sha256`). The source must cover every assigned ID/command on the same tree, with all records passing except pending exact `git diff --check`. All write permissions remain `none` and execution uses fixed argv, never a plan-supplied shell string.
+
+`coordinator_validation_assignments` maps action IDs to the immutable assignment path/hash, recorded before execution. Execution, action installation, output acceptance, and crash reconciliation verify that digest. The assignment must include exactly every evidence path derived from the source result, not a worker-selected subset.
+
+The command result binds the assignment path/hash, pinned repository state, exact argv, capture timestamp, exit code, and hashed log. The new result's `command_evidence` references that immutable command result. Previous passing records remain identical except for `cache_status: reused` and their hash-pinned source; only the whitespace record receives the captured outcome. The complete result shape is deterministic, including requirement/task IDs, decisions, resolutions, summary, and advisory next action. Only the coordinator-owned Git snapshot may be normalized; arbitrary semantic additions or changes are rejected. `not-run` is not a code failure, while a captured nonzero exit retains the normal exhausted/fix gate. No worker handle is created. A saved command result may reconstruct an output after a crash; invalid outputs are never overwritten into passes.
+
+`coordinator_validation_recoveries` maps repository IDs to the hashed command assignment and preserved original exhaustion blocker for an explicit legacy recovery. It does not change `plan_review`, `retry_limits`, or worker/delivery policies.
 
 ### Command delivery evidence
 

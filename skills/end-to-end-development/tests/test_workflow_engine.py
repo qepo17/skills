@@ -836,6 +836,57 @@ class OversizedNextActionBatch(MissingBlockerKindBatch):
             artifact["status"] = "blocked"
 
 
+class CoordinatorCheckBatch(FakeSuccessfulBatch):
+    """A planned coordinator-only whitespace check must not launch a source fix."""
+
+    def __init__(self, *, legacy_fix: bool = False, command: str = "git diff --check", whitespace_error: bool = False) -> None:
+        super().__init__()
+        self.legacy_fix = legacy_fix
+        self.command = command
+        self.whitespace_error = whitespace_error
+
+    def __call__(self, assignment_paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(assignment_paths[0].read_text())
+        if assignment["stage"] == "validation-fix":
+            if not self.legacy_fix:
+                raise AssertionError("not-run coordinator check was routed to a source-fix writer")
+            self.assignments.append(assignment)
+            output = Path(assignment["output_artifact"])
+            artifact = artifact_guard.artifact_skeleton(assignment_paths[0], assignment)
+            log = Path(assignment["log_dir"]) / "coordinator-permission.log"
+            log.write_text("git diff --check is reserved to the coordinator; no source defect was identified.\n")
+            artifact.update(status="blocked", summary="Coordinator-only check remains pending.",
+                            tree_fingerprint=workflow_tools.worktree_fingerprint(Path(assignment["cwd"])),
+                            git={"head": assignment["baseline"], "status_short_path": assignment["preexisting_status_path"]},
+                            blockers=[{"id": "BLOCK-COORDINATOR", "kind": "permission",
+                                       "summary": "The coordinator owns git diff --check.", "evidence_path": str(log),
+                                       "required_action": "Have the coordinator record the whitespace check outcome."}],
+                            validations=[{"id": "API-VAL-002", "command": "git diff --check", "cwd": assignment["cwd"],
+                                          "result": "not-run", "exit_code": None, "summary": "Coordinator only.", "log_path": str(log)}])
+            output.write_text(json.dumps(artifact))
+            return 0, {"workers": [{"action_id": assignment["action_id"], "agent_name": "legacy-permission-fix",
+                                    "status": "accepted", "cleanup_status": "complete"}]}
+        code, manifest = super().__call__(assignment_paths, **kwargs)
+        output = Path(assignment["output_artifact"])
+        artifact = json.loads(output.read_text())
+        if assignment["stage"] == "plan":
+            artifact["validations"].append({
+                "id": "API-VAL-002", "command": self.command, "cwd": assignment["cwd"],
+                "scope": "broad", "migration_capable": False,
+            })
+            artifact["tasks"][0]["validation_ids"].append("API-VAL-002")
+            artifact["tasks"][0]["steps"].append("The coordinator owns git diff --check; workers must leave it pending.")
+        elif assignment["stage"] in {"implement", "validate"}:
+            for record in artifact["validations"]:
+                if record["command"] == self.command:
+                    record.update(result="not-run", exit_code=None, summary="Reserved to the coordinator.")
+            if assignment["stage"] == "implement" and self.whitespace_error:
+                (Path(assignment["cwd"]) / "README.md").write_text("implementation with whitespace   \n")
+                artifact["changed_files"] = ["README.md", "feature.txt"]
+        output.write_text(json.dumps(artifact))
+        return code, manifest
+
+
 class WorkflowEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1999,6 +2050,294 @@ class WorkflowEngineTests(unittest.TestCase):
             "Write reviewed_status_path as the exact final git status --short output with no commentary.",
             assignment["instructions"],
         )
+
+    def exhausted_coordinator_gate(self, *, whitespace_error: bool = False) -> tuple[WorkflowEngine, CoordinatorCheckBatch]:
+        batch = CoordinatorCheckBatch(legacy_fix=True, whitespace_error=whitespace_error)
+        engine = self.initialize(batch, profile="full")
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "exhausted-coordinator"}, "recursion_limit": 150}
+        interrupted = graph.invoke({"run_dir": str(self.run_dir)}, config)
+        graph.invoke(Command(resume={
+            "decision": "approve", "review_sha256": interrupted["__interrupt__"][0].value["review_sha256"],
+            "text": "I approve all plans in this exact complete review bundle.",
+        }), config, interrupt_after=["implement"])
+        source = engine._current_validation("api", require_pass=False)
+        self.assertIsNotNone(source)
+        engine._set_phase("validate")
+        fix = engine.build_assignment(
+            stage="validation-fix", repo_id="api", scope="cycle-1", instructions=["Resolve the pending check."],
+            validation_ids=["API-VAL-002"], validation_commands=["git diff --check"],
+        )
+        engine._run_with_replacements([fix])
+        # Saved projection from the old engine after permission resume: not-run
+        # was counted as a code failure despite the fix having changed no source.
+        engine._block(summary="Validation fix cycles exhausted for api: API-VAL-002.", evidence_path=source[0],
+                      required_action="Make a concrete recovery decision; automatic validation fixes are exhausted.", repo_id="api")
+        batch.legacy_fix = False
+        return engine, batch
+
+    def test_retry_exhausted_coordinator_gate_preserves_approval_and_limits(self) -> None:
+        engine, batch = self.exhausted_coordinator_gate()
+        before = engine.load_run()
+        # The reported Core run predates the artifact-repair policy. A bounded
+        # coordinator command must not retrofit that policy or replenish budgets.
+        del before["retry_limits"]["artifact_repairs_per_action"]
+        engine._save_run(before)
+        evidence = {ref["path"]: Path(ref["path"]).read_bytes()
+                    for ref in before["repositories"]["api"]["accepted_artifacts"].values()}
+        self.assertFalse(engine.resume_external_blockers())
+        self.assertFalse(engine.retry_validation_evidence())
+        self.assertTrue(engine.retry_coordinator_validation())
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "recovered-coordinator"}, "recursion_limit": 150},
+        )
+        after = engine.load_run()
+        self.assertEqual("complete", after["status"])
+        self.assertEqual(before["plan_review"], after["plan_review"])
+        self.assertEqual(before["retry_limits"], after["retry_limits"])
+        self.assertEqual(["plan", "implement", "validation-fix", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+        self.assertEqual(evidence, {path: Path(path).read_bytes() for path in evidence})
+
+    def test_coordinator_check_preserves_passing_evidence_without_a_source_fix(self) -> None:
+        batch = CoordinatorCheckBatch()
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "coordinator-check"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+        self.assertEqual([], engine._artifacts(repo_id="api", stage="validation-fix", kind="result"))
+        validation = engine._current_validation("api", require_pass=True)
+        self.assertIsNotNone(validation)
+        records = validation[1]["validations"]
+        self.assertEqual("reused", records[0]["cache_status"])
+        self.assertEqual("git diff --check", records[1]["command"])
+        self.assertEqual(0, records[1]["exit_code"])
+
+    def test_coordinator_check_uses_command_delivery_without_extra_workers(self) -> None:
+        batch = CoordinatorCheckBatch()
+        engine, forge = self.github_engine(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "coordinator-github"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1"], [a["stage"] for a in batch.assignments])
+        self.assertEqual(1, forge.create_count)
+        self.assertEqual(3, len(engine.load_agents()["agents"]))
+        self.assertEqual(2, json.loads((self.run_dir / "metrics.json").read_text())["command_attempts"])
+
+    def test_coordinator_check_failure_does_not_reset_the_exhausted_gate(self) -> None:
+        engine, batch = self.exhausted_coordinator_gate(whitespace_error=True)
+        before = engine.load_run()
+        self.assertTrue(engine.retry_coordinator_validation())
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "coordinator-failure"}, "recursion_limit": 150},
+        )
+        after = engine.load_run()
+        self.assertEqual("blocked", after["status"])
+        self.assertIn("Validation fix cycles exhausted", after["blockers"][0]["summary"])
+        self.assertEqual(before["retry_limits"], after["retry_limits"])
+        self.assertEqual(before["plan_review"], after["plan_review"])
+        self.assertFalse(engine.retry_coordinator_validation())
+        self.assertNotIn("review-1", [a["stage"] for a in batch.assignments])
+        validation = engine._current_validation("api", require_pass=False)[1]
+        self.assertEqual("fail", validation["validations"][1]["result"])
+        self.assertNotEqual(0, validation["validations"][1]["exit_code"])
+        self.assertIsNone(engine._current_validation("api", require_pass=True))
+
+    def test_unrecognized_not_run_check_never_spends_a_source_fix(self) -> None:
+        batch = CoordinatorCheckBatch(command="git diff --check; touch unsafe-command")
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "unrecognized-pending"}, "recursion_limit": 150},
+        )
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertIn("were not run", engine.load_run()["blockers"][0]["summary"])
+        self.assertEqual(["plan", "implement"], [a["stage"] for a in batch.assignments])
+        self.assertFalse((self.worktree / "unsafe-command").exists())
+        self.assertFalse(engine.retry_coordinator_validation())
+        self.assertEqual([], engine._artifacts(repo_id="api", stage="validation-fix", kind="result"))
+
+    def test_coordinator_retry_rejects_stale_and_unrelated_state(self) -> None:
+        engine, _ = self.exhausted_coordinator_gate()
+        original = engine.load_run()
+        for change in ("summary", "kind", "source", "index", "live-worker"):
+            with self.subTest(change=change):
+                current = json.loads(json.dumps(original))
+                if change == "summary":
+                    current["blockers"][0]["summary"] = "Validation fix cycles exhausted for api: API-VAL-001."
+                elif change == "kind":
+                    current["blockers"][0]["kind"] = "permission"
+                elif change == "source":
+                    (self.worktree / "feature.txt").write_text("source changed after tests\n")
+                elif change == "index":
+                    FakeSuccessfulBatch._git(self.worktree, "add", "feature.txt")
+                else:
+                    agents = engine.load_agents()
+                    agents["agents"][-1]["cleanup_status"] = "retained"
+                    engine._save_agents(agents)
+                engine._save_run(current)
+                before = engine.run_path.read_bytes()
+                self.assertFalse(engine.retry_coordinator_validation())
+                self.assertEqual(before, engine.run_path.read_bytes())
+                (self.worktree / "feature.txt").write_text("implemented\n")
+                FakeSuccessfulBatch._git(self.worktree, "reset", "-q", "HEAD", "--", "feature.txt")
+
+    def assert_coordinator_command_crash_recovers(self, *, keep_output: bool) -> None:
+        import coordinator_validation
+        batch = CoordinatorCheckBatch()
+        engine = self.initialize(batch)
+        execute = engine._execute_command
+        config = {"configurable": {"thread_id": "coordinator-crash"}, "recursion_limit": 150}
+        captured = []
+        def crash(path: Path) -> dict[str, Any]:
+            result = execute(path)
+            assignment = json.loads(path.read_text())
+            captured.append(assignment)
+            if not keep_output:
+                Path(assignment["output_artifact"]).unlink()
+            raise KeyboardInterrupt("coordinator command captured before artifact acceptance")
+        with mock.patch.object(coordinator_validation.subprocess, "run", wraps=subprocess.run) as commands:
+            with mock.patch.object(engine, "_execute_command", side_effect=crash):
+                with self.assertRaises(KeyboardInterrupt):
+                    build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+            build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        diff_checks = [call for call in commands.call_args_list if call.args[0] == ["git", "diff", "--check"]]
+        self.assertEqual(1, len(diff_checks))
+        self.assertEqual(1, len(captured))
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+
+    def test_coordinator_check_recovers_a_captured_output_without_reexecution(self) -> None:
+        self.assert_coordinator_command_crash_recovers(keep_output=True)
+
+    def test_coordinator_check_recovers_command_evidence_before_output(self) -> None:
+        self.assert_coordinator_command_crash_recovers(keep_output=False)
+
+    def test_coordinator_check_rejects_forged_outcomes_and_reused_evidence(self) -> None:
+        import coordinator_validation
+        engine, batch = self.exhausted_coordinator_gate()
+        path = engine._coordinator_validation_assignment("api")
+        assignment = json.loads(path.read_text())
+        coordinator_validation.execute(path)
+        output = Path(assignment["output_artifact"])
+        data = json.loads(output.read_text())
+        engine._validate_worker_output(assignment, output)
+        for change in ("outcome", "reused", "summary", "next_action", "requirement_ids", "task_ids", "decisions", "log", "source-log", "state"):
+            with self.subTest(change=change):
+                modified = json.loads(json.dumps(data))
+                restore = None
+                if change == "outcome":
+                    modified["validations"][1].update(result="fail", exit_code=1)
+                elif change == "reused":
+                    modified["validations"][0]["summary"] = "Fabricated prior evidence."
+                elif change in {"summary", "next_action"}:
+                    modified[change] = "Unrelated semantic change."
+                elif change == "requirement_ids":
+                    modified[change] = []
+                elif change == "task_ids":
+                    modified[change] = ["API-TASK-001"]
+                elif change == "decisions":
+                    modified[change] = [{"id": "DEC-FORGED", "kind": "implementation", "summary": "Source work done.", "evidence": "Fabricated."}]
+                elif change in {"log", "source-log"}:
+                    log = Path(modified["validations"][1 if change == "log" else 0]["log_path"])
+                    restore = (log, log.read_bytes())
+                    log.write_text("tampered evidence\n")
+                else:
+                    (self.worktree / "feature.txt").write_text("changed after check\n")
+                output.write_text(json.dumps(modified))
+                with self.assertRaises(artifact_guard.ValidationError):
+                    engine._validate_worker_output(assignment, output)
+                if restore:
+                    restore[0].write_bytes(restore[1])
+                (self.worktree / "feature.txt").write_text("implemented\n")
+        self.assertEqual(1, len([a for a in batch.assignments if a["stage"] == "implement"]))
+
+    def assert_coordinator_assignment_is_immutable(self, *, remove_reference: bool) -> None:
+        import coordinator_validation
+        engine, _ = self.exhausted_coordinator_gate()
+        path = engine._coordinator_validation_assignment("api")
+        engine._install_actions([path])
+        assignment = json.loads(path.read_text())
+        source = json.loads(Path(assignment["coordinator_validation"]["source"]["path"]).read_text())
+        log = Path(source["validations"][0]["log_path"])
+        log.write_text("altered passing evidence after command intent\n")
+        references = assignment["coordinator_validation"]["evidence"]
+        if remove_reference:
+            assignment["coordinator_validation"]["evidence"] = [ref for ref in references if ref["path"] != str(log)]
+        else:
+            for ref in references:
+                if ref["path"] == str(log):
+                    ref["sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
+        path.write_text(json.dumps(assignment))
+        with self.assertRaises(artifact_guard.ValidationError):
+            coordinator_validation.execute(path)
+        with self.assertRaises(artifact_guard.ValidationError):
+            engine.reconcile()
+        self.assertFalse(Path(assignment["output_artifact"]).exists())
+
+    def test_coordinator_assignment_cannot_drop_passing_evidence_pins(self) -> None:
+        self.assert_coordinator_assignment_is_immutable(remove_reference=True)
+
+    def test_coordinator_assignment_cannot_rebind_changed_evidence_after_crash(self) -> None:
+        self.assert_coordinator_assignment_is_immutable(remove_reference=False)
+
+    def test_coordinator_command_assignment_cannot_grant_source_writes(self) -> None:
+        engine, _ = self.exhausted_coordinator_gate()
+        path = engine._coordinator_validation_assignment("api")
+        assignment = json.loads(path.read_text())
+        for change in ("executor", "command", "source", "access"):
+            with self.subTest(change=change):
+                modified = json.loads(json.dumps(assignment))
+                if change == "executor":
+                    modified["coordinator_validation"]["executor"] = "shell"
+                elif change == "command":
+                    modified["validation_commands"][1] += "; touch unsafe-command"
+                elif change == "source":
+                    modified["coordinator_validation"]["source"]["sha256"] = "0" * 64
+                else:
+                    modified["project_file_access"] = "write"
+                    modified["repositories"][0]["access"] = "write"
+                with self.assertRaises(artifact_guard.ValidationError):
+                    artifact_guard.validate_assignment(modified)
+
+    def test_cli_coordinator_recovery_advances_without_another_approval(self) -> None:
+        import orchestrator
+        engine, _ = self.exhausted_coordinator_gate()
+        args = orchestrator.build_parser().parse_args(["retry-coordinator-validation", str(self.run_dir)])
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "cli-coordinator"}, "recursion_limit": 150}
+        with mock.patch.object(orchestrator, "_open_graph") as opened:
+            opened.return_value.__enter__.return_value = (engine, graph, config)
+            result = orchestrator._invoke(args, {"run_dir": str(self.run_dir)})
+        self.assertEqual("complete", result["status"])
+        self.assertEqual("approved", result["plan_review"]["status"])
+        self.assertNotIn("interrupts", result)
+
+    def test_ui_handoff_recovery_preserves_exact_user_approval(self) -> None:
+        batch = OversizedNextActionBatch()
+        engine = self.initialize(batch, profile="full")
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "approved-ui"}, "recursion_limit": 150}
+        interrupted = graph.invoke({"run_dir": str(self.run_dir)}, config)
+        with mock.patch.object(artifact_guard, "repairable_rejection", return_value=False):
+            graph.invoke(Command(resume={
+                "decision": "approve", "review_sha256": interrupted["__interrupt__"][0].value["review_sha256"],
+                "text": "I approve all plans in this exact complete review bundle.",
+            }), config)
+        before = engine.load_run()["plan_review"]
+        self.assertTrue(engine.retry_artifact_repair())
+        output = build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertNotIn("__interrupt__", output)
+        self.assertEqual(before, engine.load_run()["plan_review"])
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
 
     def test_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
         fake = FakeSuccessfulBatch(fail_first_validation=True)

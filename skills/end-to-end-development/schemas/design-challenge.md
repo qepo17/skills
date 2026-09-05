@@ -1,5 +1,7 @@
 # Design challenge artifact (`design-challenge`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Initialize the assigned file first:
 
 ```bash

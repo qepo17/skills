@@ -199,20 +199,8 @@ def repository_state(worktree: Path) -> dict[str, str]:
 
 
 def artifact_evidence_paths(value: Any) -> set[Path]:
-    """Collect on-disk evidence, not narrative strings or arbitrary source paths."""
-    paths: set[Path] = set()
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in {"evidence_path", "log_path", "status_short_path"} and isinstance(child, str):
-                paths.add(Path(child).resolve())
-            elif key == "source_artifact" and isinstance(child, dict):
-                paths.add(Path(child["path"]).resolve())
-            else:
-                paths.update(artifact_evidence_paths(child))
-    elif isinstance(value, list):
-        for child in value:
-            paths.update(artifact_evidence_paths(child))
-    return paths
+    """Preserve the evidence-collection seam shared with the standard-library guard."""
+    return artifact_guard.artifact_evidence_paths(value)
 
 
 def normalize_worker_artifact(
@@ -227,6 +215,9 @@ def normalize_worker_artifact(
     and status snapshots so a correct result is not retried because a model
     copied stale mechanical metadata into its JSON artifact.
     """
+    if assignment.get("coordinator_validation"):
+        if repository_state(Path(assignment["cwd"])) != assignment["coordinator_validation"]["repository_state"]:
+            raise artifact_guard.ValidationError("coordinator check changed pinned repository/Git state")
     if assignment.get("execution_mode") == "artifact-repair":
         for repository in assignment["repositories"]:
             expected = assignment["repair_of"]["repository_states"][repository["repo_id"]]
@@ -381,14 +372,26 @@ def _legacy_agent_name(assignment: dict[str, Any]) -> str:
 
 
 def _worker_prompt(assignment_path: Path) -> str:
+    assignment = load_json(assignment_path)
+    skill_path = Path(assignment["validator_path"]).resolve().parent.parent / "SKILL.md"
     return (
         f"Execute the immutable assignment at {assignment_path}. Treat its hash-pinned inputs "
-        "as authoritative. If the output does not exist, initialize its stage-specific skeleton "
-        "with the assignment's validator init command. Read artifact_schema_path and its linked blocker "
-        "contract, not the full coordinator contract. Write only the assigned output, allowed project files, and "
+        f"as authoritative. Read {skill_path} (especially its Validation rules section), "
+        "artifact_schema_path, and its linked blocker contract before planning, project edits, "
+        "validation commands, or artifact construction. If these rules are unavailable, stop and "
+        "report the blocker. The coordinator-only run commands and approval/retry instructions "
+        "in SKILL.md do not grant workers orchestration authority. If the output does not exist, "
+        "initialize its stage-specific skeleton with the assignment's validator init command. "
+        "Write only the assigned output, allowed project files, and "
         "log directory. Complete semantic fields and command outcomes; do not spend time "
         "recomputing assignment, Git-status, content-fingerprint, or command hashes because the "
-        "coordinator normalizes and validates those after settlement. Do not spawn nested agents. "
+        "coordinator normalizes and validates those after settlement. Before returning, check "
+        "all semantic fields against the SKILL.md checklist. Run the assigned validator when "
+        "mechanical metadata is valid; for normalization-dependent result/review skeletons, "
+        "report normalization pending instead of validating known placeholders. Correct "
+        "semantic/schema errors without replaying source work or passing tests, and report "
+        "any attempted validation's remaining diagnostics; never claim a rejected handoff "
+        "passed. Do not spawn nested agents. "
         "Final response: at most eight lines containing status, output path, and blocker IDs."
     )
 

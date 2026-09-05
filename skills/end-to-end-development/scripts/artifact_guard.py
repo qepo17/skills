@@ -1171,10 +1171,10 @@ def validate_assignment(data: dict[str, Any]) -> None:
     timestamp(field(data, "created_at", "$"), "$.created_at")
     stage = enum(field(data, "stage", "$"), ASSIGNMENT_STAGES, "$.stage")
     execution_mode = enum(data.get("execution_mode", "worker"), {"worker", "artifact-repair", "command"}, "$.execution_mode")
-    if execution_mode == "command" and stage != "deliver":
-        fail("$.execution_mode", "only delivery uses command assignments")
+    if execution_mode == "command" and stage not in {"deliver", "validate"}:
+        fail("$.execution_mode", "only delivery and bounded coordinator validation use command assignments")
     verify_only = boolean(data.get("verify_only", False), "$.verify_only")
-    if verify_only and execution_mode != "command":
+    if verify_only and (execution_mode != "command" or stage != "deliver"):
         fail("$.verify_only", "read-only delivery verification requires a command assignment")
     if data.get("delivery_evidence_version", 1) not in {1, 2}:
         fail("$.delivery_evidence_version", "unsupported delivery evidence version")
@@ -1517,6 +1517,8 @@ def validate_assignment(data: dict[str, Any]) -> None:
         must_exist=True,
         file_only=True,
     )
+    if execution_mode == "command" and stage == "validate":
+        validate_coordinator_check_assignment(data)
 
 
 def validate_contract(data: dict[str, Any]) -> None:
@@ -2641,6 +2643,8 @@ def validate_result(data: dict[str, Any]) -> None:
         string(next_action, "$.next_action", max_length=300)
     if assignment.get("execution_mode") == "artifact-repair":
         validate_repaired_payload(assignment, data)
+    if assignment.get("execution_mode") == "command" and assignment["stage"] == "validate":
+        validate_coordinator_check_result(assignment, data)
 
 
 def validate_review(data: dict[str, Any]) -> None:
@@ -3226,6 +3230,104 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
     else:  # pragma: no cover - guarded by assignment validation
         fail("$.output_kind", f"cannot initialize unsupported kind {kind}")
     return common
+
+
+def artifact_evidence_paths(value: Any) -> set[Path]:
+    """Collect referenced evidence files, not narrative or source-code paths."""
+    paths: set[Path] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"evidence_path", "log_path", "status_short_path"} and isinstance(child, str):
+                paths.add(Path(child).resolve())
+            elif key == "source_artifact" and isinstance(child, dict):
+                paths.add(Path(child["path"]).resolve())
+            else:
+                paths.update(artifact_evidence_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.update(artifact_evidence_paths(child))
+    return paths
+
+
+def validate_coordinator_check_assignment(data: dict[str, Any]) -> None:
+    """A command validation may execute only a pending, approved whitespace check."""
+    context = obj(field(data, "coordinator_validation", "$"), "$.coordinator_validation")
+    enum(field(context, "executor", "$.coordinator_validation"), {"git-diff-check-v1"}, "$.coordinator_validation.executor")
+    if any(data[key] != "none" for key in ("project_file_access", "git_access", "forge_access")):
+        fail("$.coordinator_validation", "coordinator checks may not write project/Git/forge state")
+    if len(data["repositories"]) != 1 or data["repositories"][0]["worktree"] != data["cwd"]:
+        fail("$.repositories", "coordinator check must have exactly its assigned worktree")
+    source_path = hashed_file_reference(field(context, "source", "$.coordinator_validation"), "$.coordinator_validation.source")
+    if context["source"] not in data["input_artifacts"]:
+        fail("$.input_artifacts", "must pin coordinator validation source")
+    source = load_json_object(source_path, "$.coordinator_validation.source")
+    if (source.get("artifact_kind") != "result" or source.get("status") != "complete"
+            or source.get("run_id") != data["run_id"] or source.get("repo_id") != data["repo_id"]
+            or source.get("tree_fingerprint") != data.get("input_tree_fingerprint")):
+        fail("$.coordinator_validation.source", "must be complete same-run/repository/tree evidence")
+    records = array(field(source, "validations", "$"), "$.validations")
+    validate_validation_records(records, "$.validations", tree_fingerprint=data["input_tree_fingerprint"], require_cache_metadata=True)
+    if sorted((r["id"], r["command"]) for r in records) != sorted(zip(data["validation_ids"], data["validation_commands"], strict=True)):
+        fail("$.coordinator_validation.source", "must cover every exact assigned validation ID/command")
+    pending = [r for r in records if r["result"] != "pass"]
+    if not pending or any(r["command"] != "git diff --check" or r["result"] != "not-run" for r in pending):
+        fail("$.coordinator_validation.source", "only pending git diff --check may be completed; actual failures need their normal gate")
+    if any(r["cwd"] != data["cwd"] for r in records):
+        fail("$.coordinator_validation.source", "validation cwd must match the assigned worktree")
+    references = array(field(context, "evidence", "$.coordinator_validation"), "$.coordinator_validation.evidence")
+    evidence_paths = [Path(hashed_file_reference(ref, f"$.coordinator_validation.evidence[{index}]")).resolve()
+                      for index, ref in enumerate(references)]
+    if evidence_paths != sorted(artifact_evidence_paths(source)):
+        fail("$.coordinator_validation.evidence", "must pin exactly every source evidence file")
+    state = obj(field(context, "repository_state", "$.coordinator_validation"), "$.coordinator_validation.repository_state")
+    for key in ("fingerprint", "index_sha256"):
+        sha256(field(state, key, "$.coordinator_validation.repository_state"), f"$.coordinator_validation.repository_state.{key}")
+    sha(field(state, "head", "$.coordinator_validation.repository_state"), "$.coordinator_validation.repository_state.head")
+    string(field(state, "branch", "$.coordinator_validation.repository_state"), "$.coordinator_validation.repository_state.branch")
+    if state["fingerprint"] != data["input_tree_fingerprint"]:
+        fail("$.coordinator_validation.repository_state", "must pin the source tree")
+
+
+def coordinator_check_artifact(assignment_path: Path, assignment: dict[str, Any], evidence_ref: dict[str, str]) -> dict[str, Any]:
+    """Construct the entire deterministic result from pinned inputs and command capture."""
+    validate_coordinator_check_assignment(assignment)
+    data = artifact_skeleton(assignment_path, assignment)
+    context = assignment["coordinator_validation"]
+    evidence_path = hashed_file_reference(evidence_ref, "$.command_evidence")
+    evidence = load_json_object(evidence_path, "$.command_evidence")
+    if (evidence.get("assignment") != {"path": data["assignment_path"], "sha256": data["assignment_sha256"]}
+            or evidence.get("repository_state") != context["repository_state"]
+            or evidence.get("argv") != ["git", "diff", "--check"]):
+        fail("$.command_evidence", "command evidence must match the assignment and pinned repository state")
+    log_path = hashed_file_reference(field(evidence, "log", "$.command_evidence"), "$.command_evidence.log")
+    exit_code = integer(field(evidence, "exit_code", "$.command_evidence"), "$.command_evidence.exit_code", minimum=0)
+    source = load_json_object(context["source"]["path"], "$.coordinator_validation.source")
+    expected = copy.deepcopy(source["validations"])
+    for record in expected:
+        if record["result"] == "pass":
+            record.update(cache_status="reused", source_artifact=context["source"])
+        else:
+            record.update(result="pass" if exit_code == 0 else "fail", exit_code=exit_code,
+                          cache_status="fresh", source_artifact=None, log_path=log_path,
+                          summary="Coordinator git diff --check passed." if exit_code == 0 else "Coordinator git diff --check failed.")
+    data.update(
+        created_at=timestamp(field(evidence, "completed_at", "$.command_evidence"), "$.command_evidence.completed_at"),
+        summary="Recorded the pending coordinator whitespace check; retained matching passing evidence.",
+        tree_fingerprint=context["repository_state"]["fingerprint"], validations=expected,
+        git=source["git"], command_evidence=evidence_ref, next_action="review-1",
+    )
+    return data
+
+
+def validate_coordinator_check_result(assignment: dict[str, Any], data: dict[str, Any]) -> None:
+    expected = coordinator_check_artifact(Path(data["assignment_path"]), assignment, field(data, "command_evidence", "$"))
+    candidate = copy.deepcopy(data)
+    # Only the Git snapshot is normalized at acceptance; every other field is
+    # mechanically derived, not a place to inject new worker semantic claims.
+    candidate.pop("git", None)
+    expected.pop("git", None)
+    if candidate != expected:
+        fail("$", "coordinator validation changed its deterministic result or captured command outcome")
 
 
 def oversized_next_action(data: dict[str, Any]) -> bool:

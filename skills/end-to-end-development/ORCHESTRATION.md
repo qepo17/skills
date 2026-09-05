@@ -139,6 +139,14 @@ For the exact result rejection `$.next_action: must be at most 300 characters` e
 
 This requires a pinned unused repair allowance, no active actions/writers or unsettled worker cleanup, the original rejection manifest/assignment, and still-current content/HEAD/branch/status evidence. It pins the original artifact and evidence into a read-only repair before clearing the blocker. It never normalizes stale validation evidence onto a changed tree, resets attempts, clears unrelated blockers, or bypasses review/delivery. A crash before launch reuses the saved repair; a claimed attempt is never relaunched.
 
+For a saved exhausted validation gate whose sole pending check is the coordinator-owned whitespace check:
+
+```bash
+"$ORCHESTRATOR" retry-coordinator-validation "$RUN_DIR" --worker-runtime auto
+```
+
+The transition requires approved plans, the exact exhaustion blocker and accepted source evidence, unchanged content/HEAD/branch/status, settled workers, and a consumed no-change permission-blocked fix containing only pending `git diff --check` evidence. It records a hash-pinned command assignment in `coordinator_validation_recoveries` before advancing. It neither resets the code-fix limit nor reopens approval, and it rejects genuinely failed checks and unrelated blockers. Plain logs cannot establish acceptance; the graph captures its own bounded read-only execution. UI handoff rejection uses the separate `retry-artifact-repair` transition.
+
 After updating an engine that ran a dependent fix concurrently with an upstream contract fix and emitted the exact hash-pinned bundle-drift blocker, use:
 
 ```bash
@@ -194,7 +202,13 @@ Worker schemas link a concise blocker contract and typed construction command. R
 
 GitHub delivery assignments use `execution_mode: command` with normal durable `next_actions`; they never create agent records or backend handles. The graph executes the standard-library helper, records immutable input/output evidence, and reconciles Git/forge state after interruption. Independent command deliveries and remaining forge workers can run concurrently. The graph's cold-entry `recover` node refreshes completed delivery through read-only commands; ordinary phase reconciliation does not repeat those queries endlessly. Hash-pinned refresh obligations survive active peer actions and drain after the existing batch settles, so a pending fix in one repository cannot hide stale delivery in another. Recovery before acceptance re-observes the forge without commit/push/PR writes, retaining earlier snapshots; recovery after acceptance uses a new assignment/output. Recovered CI failures retain the same bounded fix route. Version-2 results require matching local/pushed/checked heads and positive required-check policy evidence. A changing policy/head invalidates the observation. Pending CI is not completion and never spends the code-fix allowance. Other forges retain an explicit worker path with equivalent evidence requirements; unknown policy blocks rather than silently downgrading.
 
-All new behavior is version-pinned at initialization. Existing runs without extension fields keep their historical execution/retry paths. Do not retrofit active runs by editing state.
+Delivery and worker policies are version-pinned at initialization. Existing runs without those extension fields keep their historical delivery/retry policies. The narrowly allowlisted coordinator validation executor is pinned in each new immutable command assignment, including explicit recovery of a legacy exhausted gate; it does not retrofit limits or worker policy. Do not retrofit active runs by editing state.
+
+### Coordinator-owned validation
+
+A `not-run` record never justifies a source fix. When a complete current result covers every planned ID/command and all non-whitespace checks pass, the graph can fill a pending exact `git diff --check` through [scripts/coordinator_validation.py](scripts/coordinator_validation.py). This command assignment runs without an agent, Git/forge write access, shell interpretation, or migration execution. It captures exit status, a hashed log, and content/HEAD/branch/index state; a new deterministic result reuses the prior passing records unchanged except for their reuse provenance. A durable assignment digest is verified before execution/reconciliation, and the assignment must pin every source evidence file; neither the assignment nor unrelated semantic result fields may be rewritten during recovery. Actual failures retain the ordinary bounded code-fix gate, including exhaustion. Other pending checks block without consuming that allowance.
+
+Command evidence surviving a crash is reused before reconstructing the output; a valid output is reconciled without re-execution or delivery-specific forge refresh. A crash before command capture can repeat only this read-only check. Invalid, changed, or missing evidence never becomes a pass or a replacement source writer.
 
 ## Testing seams
 

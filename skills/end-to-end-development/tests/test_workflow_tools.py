@@ -622,6 +622,8 @@ class WorkerNameRecoveryTests(unittest.TestCase):
                 "cwd": directory,
                 "timeout_seconds": 30,
             }
+            assignment["validator_path"] = str(SCRIPTS_DIR / "artifact_guard.py")
+            (run_dir / "assignment.json").write_text(json.dumps(assignment))
             old_name = "20260905T053000Z-global-contract-8daf9d03-a2"
             record_path = run_dir / "supervisor" / workflow_tools.worker_supervisor.WorkerSupervisor.record_name(assignment["action_id"])
             record_path.parent.mkdir()
@@ -653,6 +655,8 @@ class WorkerNameRecoveryTests(unittest.TestCase):
                 "cwd": directory,
                 "timeout_seconds": 30,
             }
+            assignment["validator_path"] = str(SCRIPTS_DIR / "artifact_guard.py")
+            (run_dir / "assignment.json").write_text(json.dumps(assignment))
             with mock.patch.object(workflow_tools.worker_supervisor, "WorkerSupervisor") as factory:
                 factory.record_name.return_value = "worker-unused.json"
                 factory.return_value.recover.return_value = None

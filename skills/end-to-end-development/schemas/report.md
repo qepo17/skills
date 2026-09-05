@@ -1,5 +1,7 @@
 # Report artifact (`report`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Reports are generated deterministically from accepted artifacts, not composed by a model:
 
 ```bash

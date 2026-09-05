@@ -1,5 +1,7 @@
 # Worker result artifact (`result`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Initialize the assigned file first:
 
 ```bash
@@ -18,8 +20,9 @@ Required rules:
 - The worker may leave assignment hash, `tree_fingerprint`, `git`, validation command hashes/fingerprints, and fresh-cache metadata at their skeleton values. The coordinator computes these mechanical fields at acceptance time.
 - Every validation records ID, exact command/cwd, exit code, result, summary, and log path. Implementation, review-fix, pipeline-fix, and `validate` results cover every exact ID/command pair in their assignment. The final repository writer receives the complete planned suite, allowing the graph to skip a duplicate validation worker.
 - `cache_status: reused` requires a hash-pinned `source_artifact`; use it only when command hash and tree fingerprint match passing evidence.
+- A check reserved to the coordinator remains `result: not-run` with `exit_code: null`; never claim a pass or invent a code defect. The graph can capture the exact pending `git diff --check` when all other records pass on the current tree. It creates a command-bound result and preserves the prior passing records; workers must not manufacture coordinator evidence. Other pending checks block without spending a source-fix allowance.
 - Decisions have an ID, `kind`, summary, and evidence. Use `bounded-plan-deviation` only for a change that preserves requirements/contract, adds no mechanism, follows repository precedent, and stays within the packet concern.
 - `next_action` is required and must be null or a nonempty string of at most 300 characters. It is advisory, never a phase-routing command. Keep detailed handoff notes in logs, not this field.
 - Full output stays in log files. The coordinator adds an authoritative acceptance-time Git snapshot and runs final schema validation after the worker settles.
 
-Return after the semantic payload and logs are complete; do not spend a separate worker pass repairing coordinator-owned mechanical fields.
+Before returning, follow the shared stage-aware preflight in SKILL.md. Check every semantic field; for normalization-dependent skeletons, report normalization pending rather than running raw validation against known placeholders. The graph must normalize and validate before acceptance. Do not spend a separate worker pass repairing coordinator-owned mechanical fields.
