@@ -139,6 +139,22 @@ For the exact result rejection `$.next_action: must be at most 300 characters` e
 
 This requires a pinned unused repair allowance, no active actions/writers or unsettled worker cleanup, the original rejection manifest/assignment, and still-current content/HEAD/branch/status evidence. It pins the original artifact and evidence into a read-only repair before clearing the blocker. It never normalizes stale validation evidence onto a changed tree, resets attempts, clears unrelated blockers, or bypasses review/delivery. A crash before launch reuses the saved repair; a claimed attempt is never relaunched.
 
+A narrowly scoped runtime-bootstrap recovery is available when that repair worker settled and returned the exact missing-output execution rejection:
+
+```bash
+"$ORCHESTRATOR" complete-handoff-metadata "$RUN_DIR" --worker-runtime auto
+```
+
+Only a complete original result with oversized advisory `next_action` and no blockers qualifies. The original repair's assignment/artifact/evidence and every accessible repository's content, HEAD, branch and index must still match. With no active work and a settled, non-timed-out worker, the graph records `metadata_completion` intent under the existing repair claim, creates its missing output with only `next_action` cleared, validates semantic equivalence, and accepts it. No worker is relaunched and no allowance is reset. A crash resumes that command only from its recorded intent; a pre-existing output without intent, invalid result, ambiguous blocker, or changed evidence is rejected. New derived repairs use the running skill's validator/schema paths, not the older source assignment's paths.
+
+For an exhausted validation-fix gate whose only outstanding record is the exact planned `git diff --check`, `not-run` with null exit code:
+
+```bash
+"$ORCHESTRATOR" retry-coordinator-validation "$RUN_DIR" --worker-runtime auto
+```
+
+Recovery requires the matching exhausted-check blocker, canonical current evidence, matching content/HEAD/branch/status, no active action/writer, and settled workers. It clears only that blocker, never limits or approvals. Normal validation then schedules a deterministic `validate` command assignment: fixed Git argv with external diff/textconv/fsmonitor disabled, no shell, 60-second timeout, current source evidence and semantic Git index pinned. These checks run serially because the validator owns process-global artifact context; delivery remains independently parallel. Other passing records are reused by hash in a new result. Output is reconciled after a crash without rerunning a completed command or rebinding it to changed content. A real nonzero result remains a failed gate; execution/timeout failures block as infrastructure. The allowlist does not include tests, migrations, shell pipelines, or forge commands.
+
 After updating an engine that ran a dependent fix concurrently with an upstream contract fix and emitted the exact hash-pinned bundle-drift blocker, use:
 
 ```bash

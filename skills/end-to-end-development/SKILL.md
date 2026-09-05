@@ -109,6 +109,22 @@ If an older engine rejected a result solely because `next_action` exceeded 300 c
 
 This guarded transition requires the exact handoff-metadata rejection, intact current evidence, settled workers, and an unused pinned repair allowance. It creates a read-only artifact repair, not another implementation or validation attempt. It does not clear unrelated blockers, replenish attempts, or skip independent review and delivery gates. Do not edit the rejected artifact or coordinator state by hand.
 
+If an advisory-text repair worker settled but its validator failed before creating any output, the coordinator can finish that purely mechanical operation with:
+
+```bash
+"$ORCHESTRATOR" complete-handoff-metadata "$RUN_DIR" --worker-runtime auto
+```
+
+This is not another worker attempt: it accepts only the exact missing-output rejection for a launched, settled repair whose original result is complete and has only oversized advisory text. It verifies the original assignment, artifact, evidence and repository/index state; records resumable command intent; creates the missing repaired result with `next_action: null`; and passes normal semantic validation before acceptance. No source writer is replayed, existing outputs are never overwritten, blocker classifications are never inferred, and repair claims/limits/approval remain unchanged. Other missing, invalid or ambiguous repairs remain blocked. New repair assignments point to the currently executing skill's validator/schema, not a stale source assignment's runtime.
+
+If an older run exhausted its validation fixes solely because the planned `git diff --check` was handed off unexecuted to the coordinator, use:
+
+```bash
+"$ORCHESTRATOR" retry-coordinator-validation "$RUN_DIR" --worker-runtime auto
+```
+
+This command accepts only the exact exhausted-check blocker with unchanged, hash-pinned source/plan evidence, no active work, and all other planned checks passing. Command intent additionally pins the semantic Git index and verifies it before/after execution and crash acceptance. The graph executes only the fixed read-only whitespace check (no shell), emits a new validation artifact, and reuses the other passing records by hash. It preserves approval, source artifacts and retry limits. A real whitespace failure remains a failed gate; arbitrary commands, stale evidence and unrelated blockers are rejected. Ordinary validation now handles this exact never-run check before scheduling a source fix. No worker gains Git access.
+
 If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
 
 ```bash
