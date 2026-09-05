@@ -223,11 +223,7 @@ The graph constructs immutable assignments and invokes the supervisor internally
 
 `--worker-runtime auto` inherits a Paseo parent's Pi/Codex provider when present, otherwise follows the coordinator: Codex when `CODEX_THREAD_ID` is present and Pi by default. `E2E_COORDINATOR_RUNTIME` remains an internal diagnostic override, not required user setup.
 
-Every worker uses `gpt-5.6-luna` with assignment-proportional runtime reasoning:
-
-- `xhigh` (runtime `max`): full planning, design challenge, review, and integration;
-- `high`: standard planning/review, implementation, and complex fixes;
-- `medium`: validation, mechanical fixes, and delivery.
+Every worker uses `gpt-6-astra` with runtime `xhigh` reasoning. Assignment `thinking` remains a durable policy classification (`xhigh` for full planning, design challenge, review, and integration; `high` for standard planning/review, implementation, and complex fixes; `medium` for validation, mechanical fixes, and delivery), but the launcher normalizes every classification to `xhigh`.
 
 Workers never spawn nested agents. A Paseo coordinator creates Paseo subagents, Herdr creates non-focused workspaces, tmux creates detached windows, and direct mode runs non-interactively without a terminal manager. The supervisor archives or closes each settled handle immediately after capturing its artifact result, including rejected artifacts; working, blocked, and timed-out workers are retained for diagnosis.
 

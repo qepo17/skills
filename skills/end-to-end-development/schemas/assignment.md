@@ -12,11 +12,13 @@ Profiled stage fields:
 - validation fixes: compatible sorted `validation_ids`;
 - legacy round-two review: the sorted finding IDs it verifies; new runs do not schedule this stage.
 
-Thinking routing:
+Thinking classification:
 
-- `xhigh` (launched as runtime `max`): full-profile plan, design challenge, review, and integration;
+- `xhigh`: full-profile plan, design challenge, review, and integration;
 - `high`: standard planning/review, implementation, and complex fixes;
 - `medium`: validation, mechanical fixes, delivery, and report tooling.
+
+The supervisor launches every classification with runtime `xhigh`; the assignment value remains policy metadata.
 
 Only project-file stages receive one repository write scope. Only delivery receives Git/forge write access. Workers never mutate run/agent/event/checkpoint state. The LangGraph control plane constructs assignments; workers must not infer or schedule a subsequent phase. The batch supervisor must reject a project-file writer unless the complete current plan set has an approved policy/user decision and the assignment pins that exact review-bundle path/hash. Validate before launch:
 
