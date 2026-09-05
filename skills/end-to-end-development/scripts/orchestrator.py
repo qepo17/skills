@@ -144,6 +144,9 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                 raise WorkflowError(
                     "run is not blocked by the exact validation-coverage evidence condition"
                 )
+        elif args.command == "retry-result-handoff":
+            if not engine.retry_result_handoff():
+                raise WorkflowError("run is not eligible for the exact overlong result handoff repair")
         elif args.command == "retry-dependent-fixes":
             if not engine.retry_dependent_fixes():
                 raise WorkflowError(
@@ -236,6 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validation_retry.add_argument("--report-root", type=Path)
 
+    handoff_retry = subparsers.add_parser(
+        "retry-result-handoff", help="repair only an overlong result next_action without replaying source work",
+    )
+    handoff_retry.add_argument("run_dir", type=Path)
+    handoff_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    handoff_retry.add_argument("--report-root", type=Path)
+
     dependent_fix_retry = subparsers.add_parser(
         "retry-dependent-fixes",
         help="retry fixes after an accepted upstream contract fix",
@@ -310,6 +320,11 @@ def main() -> int:
                     "run_dir": str(args.run_dir.resolve()),
                     "last_transition": "retry-validation-evidence",
                 },
+            )
+        elif args.command == "retry-result-handoff":
+            output = _invoke(
+                args,
+                {"run_dir": str(args.run_dir.resolve()), "last_transition": "retry-result-handoff"},
             )
         elif args.command == "retry-dependent-fixes":
             output = _invoke(

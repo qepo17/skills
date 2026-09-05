@@ -109,6 +109,16 @@ If a dependent fix was started concurrently with an upstream contract fix and st
 
 The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
 
+### Overlong result handoff recovery
+
+If a settled result was rejected with exactly `$.next_action: must be at most 300 characters`, use:
+
+```bash
+"$ORCHESTRATOR" retry-result-handoff "$RUN_DIR" --worker-runtime auto
+```
+
+This explicit transition reuses the existing one-repair allowance; it does not change pinned policies or retry limits. It verifies the exact rejection, otherwise-valid result, current content/HEAD/branch/index status, and absence of active workers/writers. A read-only repair initializes a new artifact whose `next_action` points to the hash-pinned original handoff. All other semantic evidence, including failed checks and blockers, stays unchanged. Source work is not replayed. Other malformed evidence, stale state, and exhausted repairs remain blocked; ordinary `resume` still does not clear decision blockers.
+
 ## Full-profile plan-review interrupt
 
 Fast and standard runs still emit a complete hash-pinned review bundle, but policy accepts it atomically without a user pause. When a full-profile graph returns `status: awaiting-user` and `phase: plan-review`:

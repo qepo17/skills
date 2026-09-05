@@ -139,6 +139,14 @@ After updating an engine that ran a dependent fix concurrently with an upstream 
 
 This guarded transition accepts only that fix-phase blocker. Remaining fixes follow the shared contract's dependency order, receive accepted upstream fix artifacts as hash-pinned inputs, and get read-only access to upstream worktrees.
 
+For the exact settled-result rejection `$.next_action: must be at most 300 characters`, explicitly opt into the existing bounded read-only repair path:
+
+```bash
+"$ORCHESTRATOR" retry-result-handoff "$RUN_DIR" --worker-runtime auto
+```
+
+The command verifies the rejection manifest, otherwise-valid artifact and current repository/Git evidence before pinning a new repair assignment. It replaces only the routing hint with a reference to the preserved original text, never edits the original artifact or authoritative semantic evidence, never converts a failed check into a pass, and never replays a source writer. Other decision blockers are refused. The existing one-repair budget and crash recovery apply; no active-run policy or allowance is reset.
+
 A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 
 ```bash

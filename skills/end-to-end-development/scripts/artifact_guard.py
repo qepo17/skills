@@ -3017,6 +3017,8 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
     if assignment.get("execution_mode") == "artifact-repair":
         source = load_json_object(assignment["repair_of"]["artifact"]["path"], "$.repair_of.artifact")
         source.update(common)
+        if assignment["repair_of"].get("kind") == "next-action-length":
+            source["next_action"] = REPAIRED_NEXT_ACTION
         return source
     created_at = _utc_now()
     repo = assignment.get("repo_id")
@@ -3228,23 +3230,32 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
     return common
 
 
-def repairable_result(data: dict[str, Any], output_path: Path) -> list[int]:
-    """Validate an otherwise intact blocked result without guessing its missing kinds.
+REPAIRED_NEXT_ACTION = "See the full next_action in the hash-pinned repair_of.artifact."
 
-    The temporary enum values are used only for schema checking and never written
-    or accepted. The repair worker must supply an evidence-backed classification.
-    """
-    if data.get("artifact_kind") != "result" or data.get("status") != "blocked":
-        fail("$.status", "only intact blocked results are eligible for artifact repair")
-    missing = [
-        index for index, blocker in enumerate(array(field(data, "blockers", "$"), "$.blockers"))
-        if isinstance(blocker, dict) and "kind" not in blocker
-    ]
-    if not missing:
-        fail("$.blockers", "no missing blocker classification to repair")
+
+def repairable_result(
+    data: dict[str, Any], output_path: Path, *, kind: str = "blocker-kind",
+) -> list[int]:
+    """Check one narrow repair without changing the preserved source evidence."""
+    enum(kind, {"blocker-kind", "next-action-length"}, "$.repair_of.kind")
     candidate = copy.deepcopy(data)
-    for index in missing:
-        candidate["blockers"][index]["kind"] = "decision"
+    missing: list[int] = []
+    if kind == "next-action-length":
+        hint = data.get("next_action")
+        if not isinstance(hint, str) or len(hint) <= 300:
+            fail("$.next_action", "only an overlong result handoff is eligible")
+        candidate["next_action"] = REPAIRED_NEXT_ACTION
+    else:
+        if data.get("artifact_kind") != "result" or data.get("status") != "blocked":
+            fail("$.status", "only intact blocked results are eligible for artifact repair")
+        missing = [
+            index for index, blocker in enumerate(array(field(data, "blockers", "$"), "$.blockers"))
+            if isinstance(blocker, dict) and "kind" not in blocker
+        ]
+        if not missing:
+            fail("$.blockers", "no missing blocker classification to repair")
+        for index in missing:
+            candidate["blockers"][index]["kind"] = "decision"
     global CURRENT_ARTIFACT_PATH
     previous = CURRENT_ARTIFACT_PATH
     CURRENT_ARTIFACT_PATH = output_path
@@ -3292,18 +3303,23 @@ def validate_repair_assignment(data: dict[str, Any]) -> None:
     if data.get("input_tree_fingerprint") != states[data["repo_id"]]["fingerprint"]:
         fail("$.input_tree_fingerprint", "must match the pinned post-writer state")
     original_artifact = load_json_object(artifact_path, "$.repair_of.artifact")
-    repairable_result(original_artifact, Path(artifact_path))
+    repairable_result(original_artifact, Path(artifact_path), kind=repair.get("kind", "blocker-kind"))
 
 
 def validate_repaired_payload(assignment: dict[str, Any], data: dict[str, Any]) -> None:
-    """A classification repair cannot rewrite prior facts or manufacture a pass."""
+    """A repair cannot rewrite prior facts or manufacture a passing check."""
     original = load_json_object(assignment["repair_of"]["artifact"]["path"], "$.repair_of.artifact")
     candidate = copy.deepcopy(data)
-    if len(candidate.get("blockers", [])) != len(original["blockers"]):
-        fail("$.repair_of", "artifact-only repair changed existing semantic evidence")
-    for index, blocker in enumerate(original["blockers"]):
-        if "kind" not in blocker:
-            candidate["blockers"][index].pop("kind", None)
+    if assignment["repair_of"].get("kind") == "next-action-length":
+        if candidate.get("next_action") != REPAIRED_NEXT_ACTION:
+            fail("$.next_action", "handoff repair must point to the preserved original text")
+        candidate["next_action"] = original["next_action"]
+    else:
+        if len(candidate.get("blockers", [])) != len(original["blockers"]):
+            fail("$.repair_of", "artifact-only repair changed existing semantic evidence")
+        for index, blocker in enumerate(original["blockers"]):
+            if "kind" not in blocker:
+                candidate["blockers"][index].pop("kind", None)
     # These fields are owned by the coordinator, not the semantic worker.
     for payload in (original, candidate):
         for key in ("assignment_path", "assignment_sha256", "git", "tree_fingerprint"):

@@ -414,6 +414,78 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_result_handoff(self) -> bool:
+        """Opt in to one read-only repair of the exact overlong next_action rejection."""
+        run = self.load_run()
+        reason = "$.next_action: must be at most 300 characters"
+        if (run["status"] != "blocked" or len(run["blockers"]) != 1 or run["next_actions"]
+                or run["retry_limits"].get("artifact_repairs_per_action", 0) != 1):
+            return False
+        blocker = run["blockers"][0]
+        if (blocker["kind"] != "decision"
+                or not blocker["summary"].startswith("Artifact evidence rejected for ")
+                or not blocker["summary"].endswith(": " + reason)):
+            return False
+        manifest_path = Path(blocker["evidence_path"]).resolve()
+        if manifest_path.parent != (self.run_dir / "supervisor").resolve():
+            return False
+        matches = [worker for worker in _load_json(manifest_path).get("workers", [])
+                   if worker.get("error_code") == "invalid-evidence"
+                   and worker.get("error_path") == "$.next_action"
+                   and worker.get("reason") == reason
+                   and blocker["summary"] == f"Artifact evidence rejected for {worker['action_id']}: {reason}"]
+        if len(matches) != 1:
+            return False
+        worker = matches[0]
+        path = Path(worker["assignment_path"]).resolve()
+        if path != self.run_dir / "assignments" / f"{_slug(worker['action_id'])}.json":
+            return False
+        assignment = _load_json(path)
+        artifact_guard.validate_assignment(assignment)
+        if (assignment["run_id"] != run["run_id"] or assignment["stage"] != run["phase"]
+                or assignment["action_id"] != worker["action_id"]
+                or assignment.get("execution_mode") == "artifact-repair"
+                or assignment["output_kind"] != "result"):
+            return False
+        repo = run["repositories"].get(assignment.get("repo_id"))
+        if not repo or assignment["cwd"] != repo["worktree"]:
+            return False
+        if any(item.get("active_writer") for item in run["repositories"].values()):
+            return False
+        if any(agent["status"] in {"starting", "working"}
+               or agent.get("cleanup_status") in {"pending", "retained", "failed"}
+               for agent in self.load_agents()["agents"]):
+            return False
+        repair_record = run.get("artifact_repairs", {}).get(assignment["action_id"], {})
+        if repair_record.get("launch_started_at"):
+            return False
+        output = Path(assignment["output_artifact"])
+        if not output.resolve().is_relative_to(self.run_dir) or output.stat().st_size > artifact_guard.MAX_BYTES["result"]:
+            raise WorkflowError("rejected result path or size is invalid")
+        if any(ref["path"] == str(output) for ref in repo["accepted_artifacts"].values()):
+            return False
+        payload = _load_json(output)
+        artifact_guard.repairable_result(payload, output, kind="next-action-length")
+        # Never normalize stale source evidence into a fresh pass during recovery.
+        state = workflow_tools.repository_state(Path(repo["worktree"]))
+        if (payload["tree_fingerprint"] != state["fingerprint"]
+                or payload["git"]["head"] != state["head"] or repo["branch"] != state["branch"]
+                or Path(payload["git"]["status_short_path"]).read_text().strip()
+                != _git(Path(repo["worktree"]), "status", "--short").strip()):
+            raise WorkflowError("rejected result has stale repository/Git evidence")
+        repair_path = self._artifact_repair_assignment(assignment, kind="next-action-length")
+        with RunLock(self.run_dir):
+            current = self.load_run()
+            if current["blockers"] != run["blockers"]:
+                raise WorkflowError("blockers changed while preparing the handoff repair")
+            current["status"] = "working"
+            current["blockers"] = []
+            current["repositories"][assignment["repo_id"]]["status"] = "pending"
+            self._save_run(current)
+        self._append_event("resumed", reason="retry-result-handoff", artifact=str(repair_path),
+                           next_action=run["phase"])
+        return True
+
     def retry_dependent_fixes(self) -> bool:
         """Retry only a fix blocked by a concurrently changed upstream contract."""
         with RunLock(self.run_dir):
@@ -1374,14 +1446,16 @@ class WorkflowEngine:
             return path
         return repair_path
 
-    def _artifact_repair_assignment(self, assignment: dict[str, Any]) -> Path:
+    def _artifact_repair_assignment(
+        self, assignment: dict[str, Any], *, kind: str = "blocker-kind",
+    ) -> Path:
         original_path = self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json"
         redirected = self._repair_redirect(original_path)
         if redirected != original_path:
             return redirected
         output = Path(assignment["output_artifact"])
         payload = _load_json(output)
-        artifact_guard.repairable_result(payload, output)
+        artifact_guard.repairable_result(payload, output, kind=kind)
         repair = dict(assignment)
         repair["action_id"] = assignment["action_id"] + ":artifact-repair-1"
         repair["created_at"] = self.now()
@@ -1408,6 +1482,15 @@ class WorkflowEngine:
             "Do not change existing fields, run tests, or modify project/Git/forge state.",
             "If classification is ambiguous, leave the field missing and explain why in the worker log.",
         ]
+        if kind == "next-action-length":
+            repair["repair_of"]["kind"] = kind
+            repair["artifact_schema_path"] = str(self.skill_dir / "schemas/result.md")
+            repair["validator_path"] = str(self.skill_dir / "scripts/artifact_guard.py")
+            repair["instructions"] = [
+                "Initialize the output; the skeleton replaces only the overlong next_action with a reference to its preserved original text.",
+                "Validate the new artifact and return. Keep every other semantic field exactly unchanged, including failed checks and blockers.",
+                "Do not run tests or write project/Git/forge state. The original artifact must remain byte-for-byte unchanged.",
+            ]
         path = self.run_dir / "assignments" / f"{_slug(repair['action_id'])}.json"
         if not path.exists():
             workflow_tools.atomic_write_json(path, repair)
