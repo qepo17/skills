@@ -1,5 +1,7 @@
 # Delivery artifact (`delivery`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 The graph executes new GitHub `execution_mode: command` assignments through `scripts/delivery_tools.py`; no delivery worker is launched. Worker assignments remain supported for other forges and legacy runs.
 
 For a worker assignment, initialize the assigned file first:

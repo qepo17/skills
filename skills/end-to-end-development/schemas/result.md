@@ -1,5 +1,7 @@
 # Worker result artifact (`result`)
 
+Before any work, read [SKILL.md — Validation rules](../SKILL.md#validation-rules). It contains the shared limits, required fields, evidence rules, and role boundaries; this file is a stage-specific reminder.
+
 Initialize the assigned file first:
 
 ```bash
@@ -23,4 +25,4 @@ Required rules:
 - `next_action` is required and must be null or a nonempty string of at most 300 characters. It is advisory, never a phase-routing command. Keep detailed handoff notes in logs, not this field.
 - Full output stays in log files. The coordinator adds an authoritative acceptance-time Git snapshot and runs final schema validation after the worker settles.
 
-Return after the semantic payload and logs are complete; do not spend a separate worker pass repairing coordinator-owned mechanical fields.
+Before returning, follow the shared stage-aware preflight in SKILL.md. Check every semantic field; for normalization-dependent skeletons, report normalization pending rather than running raw validation against known placeholders. The graph must normalize and validate before acceptance. Do not spend a separate worker pass repairing coordinator-owned mechanical fields.
