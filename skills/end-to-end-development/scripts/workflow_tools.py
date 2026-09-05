@@ -13,6 +13,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -355,6 +356,24 @@ def run_metrics(run_dir: Path) -> dict[str, Any]:
 
 
 def _agent_name(assignment: dict[str, Any]) -> str:
+    """Build a deterministic Herdr-safe name without truncating its identity hash."""
+    identity = json.dumps(
+        [assignment["run_id"], assignment["action_id"], assignment["attempt"]],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
+    suffix = f"-{digest}-a{assignment['attempt']}"
+    # Attempts have no schema upper bound; the hash still identifies huge ones.
+    if len(suffix) > 28:
+        return f"e2e-{digest}"
+    repo = assignment.get("repo_id") or "global"
+    label = re.sub(r"[^a-z0-9_-]+", "-", f"{repo}-{assignment['stage']}".lower())
+    prefix = f"e2e-{label}"[: 32 - len(suffix)].rstrip("-_")
+    return prefix + suffix
+
+
+def _legacy_agent_name(assignment: dict[str, Any]) -> str:
+    """Only for adopting workers launched before bounded names were introduced."""
     action_hash = hashlib.sha256(assignment["action_id"].encode()).hexdigest()[:8]
     repo = assignment.get("repo_id") or "global"
     prefix = assignment["run_id"].split("-")[0]
@@ -497,9 +516,16 @@ def recover_assignment_worker(
         tmux_binary=os.environ.get("E2E_TMUX_BINARY", "tmux"),
         paseo_binary=os.environ.get("E2E_PASEO_BINARY", "paseo"),
     )
+    # Recovery must use the launch-time identity, including when a crash left
+    # only a starting record and the backend handle still needs adoption.
+    agent_name = (
+        record["agent_name"]
+        if record and isinstance(record.get("agent_name"), str) and record["agent_name"]
+        else _legacy_agent_name(assignment)
+    )
     request = worker_supervisor.WorkerRequest(
         action_id=assignment["action_id"],
-        agent_name=_agent_name(assignment),
+        agent_name=agent_name,
         assignment_path=assignment_path.resolve(),
         cwd=Path(assignment["cwd"]),
         timeout_seconds=assignment["timeout_seconds"],

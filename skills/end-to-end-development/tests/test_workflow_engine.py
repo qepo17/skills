@@ -17,6 +17,7 @@ from langgraph.types import Command
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 import artifact_guard  # noqa: E402
+import workflow_tools  # noqa: E402
 from workflow_engine import WorkflowEngine, WorkflowError, build_graph  # noqa: E402
 
 
@@ -1550,6 +1551,7 @@ class WorkflowEngineTests(unittest.TestCase):
             allow_existing=False,
         )
 
+        old_name = workflow_tools._legacy_agent_name(json.loads(assignment_path.read_text()))
         command_log = self.root / "crash-recovery-herdr.jsonl"
         fake_herdr = self.root / "fake-crash-recovery-herdr.py"
         fake_herdr.write_text(
@@ -1559,6 +1561,7 @@ class WorkflowEngineTests(unittest.TestCase):
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:3] in (['agent', 'get'], ['agent', 'wait']):\n"
+            f"    if sys.argv[3] != {old_name!r}: sys.exit(1)\n"
             "    print(json.dumps({'result': {'agent': {\n"
             "        'terminal_id': 'term-recovered', 'pane_id': 'pane-recovered'\n"
             "    }}}))\n"
@@ -1580,6 +1583,7 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertIn(["pane", "close", "pane-recovered"], commands)
         self.assertNotIn(["pane", "close", "term-recovered"], commands)
         recovered_agent = engine.load_agents()["agents"][0]
+        self.assertEqual(old_name, recovered_agent["name"])
         self.assertEqual("herdr", recovered_agent["backend"])
         self.assertEqual("complete", recovered_agent["cleanup_status"])
         self.assertNotIn("pane_id", recovered_agent)

@@ -239,7 +239,7 @@ Records every session, including failed/replacement workers:
   "updated_at": "2026-08-17T08:40:00Z",
   "agents": [
     {
-      "name": "20260817-api-implement-ab12cd34-a1",
+      "name": "e2e-api-implement-ab12cd34-a1",
       "stage": "implement",
       "repo_id": "api",
       "attempt": 1,
@@ -257,6 +257,8 @@ Records every session, including failed/replacement workers:
 ```
 
 Statuses are `starting`, `working`, `blocked`, `idle`, `failed`, and `closed`. `backend` is `direct`, `paseo`, `herdr`, `tmux`, or a test/legacy adapter name. `handle_id` is opaque to the graph. Cleanup status is `pending`, `retained`, `complete`, or `failed`; completion requires every settled worker to be `complete`. Older schema-v1 Herdr records with `pane_id` and optional `pane_closed` remain valid on resume.
+
+New worker names match `^[a-z][a-z0-9_-]{0,31}$` for Herdr compatibility. They use an `e2e-` prefix, a sanitized/truncated repository-stage label, and a hash of the full run ID, action ID, and attempt. Truncation preserves the identity hash; the readable attempt is omitted only if it cannot fit. Resume preserves recorded launch-time names (or the legacy name for pre-supervisor Herdr runs) rather than renaming existing workers. Run IDs and immutable assignments are unchanged.
 
 ## Immutable assignment (`assignment`)
 
