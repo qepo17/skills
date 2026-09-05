@@ -109,6 +109,14 @@ If an older engine rejected a result solely because `next_action` exceeded 300 c
 
 This guarded transition requires the exact handoff-metadata rejection, intact current evidence, settled workers, and an unused pinned repair allowance. It creates a read-only artifact repair, not another implementation or validation attempt. It does not clear unrelated blockers, replenish attempts, or skip independent review and delivery gates. Do not edit the rejected artifact or coordinator state by hand.
 
+If an older run exhausted validation fixes solely because a permission-blocked `git diff --check` was recorded as `not-run`, update the engine and use:
+
+```bash
+"$ORCHESTRATOR" retry-coordinator-validation "$RUN_DIR" --worker-runtime auto
+```
+
+This requires the exact exhausted gate, unchanged current evidence, a no-change permission-blocked fix, and an already-approved plan bundle. The graph executes only the allowlisted whitespace check and records a new hash-bound result, reusing the other passing checks. A loose coordinator log is not accepted as proof; the safe command is observed again under durable assignment intent. Limits and approval are never reset. Real check failures, stale evidence, and unrelated blockers are refused. For an accompanying oversized UI handoff, use `retry-artifact-repair` on that run separately; neither recovery requests another plan approval or bypasses independent review/PR checks.
+
 If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
 
 ```bash
@@ -247,6 +255,8 @@ The plan defines the packet, not individual task, as the implementation unit. A 
 ### Validation and review
 
 The graph computes a content fingerprint independent of commit identity. The final implementation/fix writer runs the complete planned suite, and the graph reuses that evidence only when validation ID, exact command hash, and content fingerprint match. A delivery-only commit therefore causes no duplicate validation; any source change invalidates the evidence. Compatible failures are fixed in one batch and checked once afterward.
+
+`not-run` is pending evidence, not a failed test, and never spends a source-fix allowance. When every other planned check has current passing evidence and only the exact `git diff --check` remains pending, the graph records it through a bounded read-only command assignment. All other pending commands block for execution/ownership resolution. No arbitrary shell command, migration, source edit, or unbound coordinator assertion is authorized by this path.
 
 One fresh worker independently reviews the complete baseline-to-worktree state. Critical/high actionable findings always block; medium correctness/spec findings normally block; low findings remain advisory. Compatible must-fix findings are resolved in one repository batch, affected checks run once, and the workflow proceeds without a second review. An incompatible or still-failing correction blocks instead of opening another remediation loop.
 

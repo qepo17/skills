@@ -24,6 +24,10 @@ New assignments pin `reasoning_policy: stage-v1`; the runtime honors the classif
 
 New GitHub delivery uses `execution_mode: command`, `delivery_evidence_version: 2`, and a pinned `check_timeout_seconds` (0–1800). The graph executes it directly, with durable intent/reconciliation and no worker handle. A `verify_only: true` command assignment refreshes accepted delivery after interruption with `git_access: none` and `forge_access: none`; it cannot commit, push, or create a PR. Other forges retain worker delivery with version-2 final-head evidence.
 
+A `validate` assignment may use `execution_mode: command` only for the graph's allowlisted `coordinator_validation.executor: git-diff-check-v1`. It pins the accepted source result, evidence, and repository/Git state, executes only pending exact `git diff --check`, and reuses all other already-passing records. It grants no write permissions and creates no worker. A free-form coordinator log is not an accepted result.
+
+Access flags are write grants: `project_file_access: none` and `git_access: none` do not prohibit read-only inspection within a repository's `access: read` scope. Explicit command ownership in the approved plan still applies; workers leave a coordinator-reserved check pending rather than treating validation commands as permission to change its owner.
+
 Only project-file stages receive one repository write scope. Only delivery receives Git/forge write access. Workers never mutate run/agent/event/checkpoint state. The LangGraph control plane constructs assignments; workers must not infer or schedule a subsequent phase. The batch supervisor must reject a project-file writer unless the complete current plan set has an approved policy/user decision and the assignment pins that exact review-bundle path/hash. Validate before launch:
 
 ```bash

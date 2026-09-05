@@ -29,6 +29,7 @@ from langgraph.types import interrupt
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
+import coordinator_validation  # noqa: E402
 import delivery_tools  # noqa: E402
 import worker_supervisor  # noqa: E402
 import workflow_tools  # noqa: E402
@@ -454,6 +455,67 @@ class WorkflowEngine:
         self._append_event("resumed", reason="retry-artifact-repair", next_action=run["phase"])
         return True
 
+    def retry_coordinator_validation(self) -> bool:
+        """Recover only an exhausted not-run whitespace gate, never failed tests.
+
+        Called under the CLI execution lock. The prior code-fix budget and exact
+        approved bundle remain untouched; only an allowlisted read-only command
+        gets new evidence, with all other checks reused from a current artifact.
+        """
+        run = self.load_run()
+        if (run["status"] != "blocked" or run["phase"] != "validate" or len(run["blockers"]) != 1
+                or run["next_actions"] or (run.get("plan_review") or {}).get("status") != "approved"
+                or any(repo.get("active_writer") for repo in run["repositories"].values())
+                or any(agent.get("cleanup_status", "complete") != "complete" for agent in self.load_agents()["agents"])):
+            return False
+        blocker = run["blockers"][0]
+        if (blocker["kind"] != "code" or blocker["required_action"]
+                != "Make a concrete recovery decision; automatic validation fixes are exhausted."):
+            return False
+        for repo_id in sorted(run["repositories"]):
+            source = self._coordinator_check_source(repo_id)
+            if source is None:
+                continue
+            pending = [record for record in source[1]["validations"] if record["result"] == "not-run"]
+            ids = sorted(record["id"] for record in pending)
+            if (blocker["summary"] != f"Validation fix cycles exhausted for {repo_id}: {', '.join(ids)}."
+                    or Path(blocker["evidence_path"]).resolve() != source[0].resolve()):
+                continue
+            fixes = self._artifacts(repo_id=repo_id, stage="validation-fix", kind="result")
+            if not fixes or len(fixes) < run["retry_limits"]["validation_fix_cycles"]:
+                return False
+            fix = fixes[-1][1]
+            if (fix["status"] != "blocked" or fix["changed_files"] or not fix["blockers"]
+                    or any(b["kind"] != "permission" for b in fix["blockers"])
+                    or fix.get("tree_fingerprint") != source[1]["tree_fingerprint"]
+                    or sorted(record["id"] for record in fix["validations"]) != ids
+                    or any(record["result"] != "not-run" or record["command"] != "git diff --check"
+                           or record["exit_code"] is not None for record in fix["validations"])):
+                return False
+            path = self._coordinator_validation_assignment(repo_id)
+            if path is None:
+                return False
+            reference = _reference(path)
+            saved = run.get("coordinator_validation_recoveries", {}).get(repo_id)
+            if saved and saved["assignment"] != reference:
+                return False
+            with RunLock(self.run_dir):
+                current = self.load_run()
+                if current["status"] != "blocked" or current["blockers"] != run["blockers"]:
+                    raise WorkflowError("coordinator validation blocker changed before recovery")
+                current.setdefault("coordinator_validation_recoveries", {})[repo_id] = {
+                    "assignment": reference, "blocker": blocker,
+                }
+                current["status"] = "working"
+                current["blockers"] = []
+                for repository in current["repositories"].values():
+                    if repository["status"] == "blocked":
+                        repository["status"] = "pending"
+                self._save_run(current)
+            self._append_event("resumed", reason="retry-coordinator-validation", next_action="validate")
+            return True
+        return False
+
     def retry_validation_evidence(self) -> bool:
         """Retry only the exact validation-coverage blocker after an engine fix."""
         with RunLock(self.run_dir):
@@ -536,6 +598,7 @@ class WorkflowEngine:
             if action.get("status") != "working" or not assignment_path:
                 continue
             resolved_assignment_path = Path(assignment_path)
+            coordinator_validation.verify_assignment_pin(resolved_assignment_path)
             assignment = _load_json(resolved_assignment_path)
             if assignment.get("execution_mode") == "command":
                 output = Path(assignment["output_artifact"])
@@ -544,7 +607,7 @@ class WorkflowEngine:
                         previous = _load_json(output)
                     except (OSError, ValueError):
                         previous = {}
-                    if previous.get("status") == "complete":
+                    if previous.get("status") == "complete" and assignment["stage"] == "deliver":
                         # A file surviving a crash is not fresh forge evidence.
                         # Re-observe without commit/push/PR writes before acceptance.
                         self._execute_delivery_command(resolved_assignment_path, verify_only=True)
@@ -589,6 +652,7 @@ class WorkflowEngine:
                     remaining_actions.append(action)
                     continue
                 assignment_path = Path(assignment_path_value)
+                coordinator_validation.verify_assignment_pin(assignment_path)
                 assignment = _load_json(assignment_path)
                 artifact_guard.validate_assignment(assignment)
                 output_path = Path(assignment["output_artifact"])
@@ -896,6 +960,7 @@ class WorkflowEngine:
         assignment_path = self.run_dir / "assignments" / f"{_slug(action_id)}.json"
         if assignment_path.exists():
             while True:
+                coordinator_validation.verify_assignment_pin(assignment_path)
                 assignment = _load_json(assignment_path)
                 artifact_guard.validate_assignment(assignment)
                 redirected = self._repair_redirect(assignment_path)
@@ -1021,6 +1086,8 @@ class WorkflowEngine:
         return assignment_path
 
     def _install_actions(self, assignment_paths: list[Path]) -> None:
+        for path in assignment_paths:
+            coordinator_validation.verify_assignment_pin(path)
         assignments = [(path, _load_json(path)) for path in assignment_paths]
         actions = []
         for order, (path, assignment) in enumerate(
@@ -1069,6 +1136,7 @@ class WorkflowEngine:
     def _validate_worker_output(
         self, assignment: dict[str, Any], output_path: Path
     ) -> dict[str, Any]:
+        coordinator_validation.verify_assignment_pin(self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json")
         raw = output_path.read_bytes()
         if len(raw) > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
             raise artifact_guard.ValidationError("artifact exceeds its size limit")
@@ -1165,7 +1233,7 @@ class WorkflowEngine:
         target[assignment["action_id"]] = _reference(output_path)
         pending = run.get("pending_delivery_refresh", {})
         repo_id = assignment.get("repo_id")
-        if (assignment.get("execution_mode") == "command" and repo_id in pending
+        if (assignment.get("execution_mode") == "command" and assignment["stage"] == "deliver" and repo_id in pending
                 and self._assignment_pins(assignment, Path(pending[repo_id]["path"]), pending[repo_id]["sha256"])):
             del pending[repo_id]
 
@@ -1246,6 +1314,25 @@ class WorkflowEngine:
                 "cleanup_status": "complete", "started_at": started, "ended_at": self.now(),
                 "elapsed_seconds": result["elapsed_seconds"], "output_artifact": assignment["output_artifact"]}
 
+    def _execute_command(self, path: Path) -> dict[str, Any]:
+        coordinator_validation.verify_assignment_pin(path)
+        assignment = _load_json(path)
+        if assignment["stage"] == "deliver":
+            return self._execute_delivery_command(path)
+        if assignment["stage"] != "validate":
+            raise WorkflowError("unsupported command assignment")
+        started = self.now()
+        self._append_event("command-started", action_id=assignment["action_id"], artifact=str(path))
+        try:
+            coordinator_validation.execute(path)
+        except (OSError, ValueError, subprocess.TimeoutExpired, artifact_guard.ValidationError) as error:
+            return {"action_id": assignment["action_id"], "executor": "command", "status": "rejected",
+                    "reason": str(error), "error_code": "invalid-evidence", "cleanup_status": "complete",
+                    "started_at": started, "ended_at": self.now()}
+        return {"action_id": assignment["action_id"], "executor": "command", "status": "accepted",
+                "cleanup_status": "complete", "started_at": started, "ended_at": self.now(),
+                "output_artifact": assignment["output_artifact"]}
+
     def _execute_assignments(self, paths: list[Path]) -> BatchResult:
         self._install_actions(paths)
         with RunLock(self.run_dir):
@@ -1291,7 +1378,7 @@ class WorkflowEngine:
         worker_paths = [path for path in paths if path not in command_paths]
         if command_paths:
             with ThreadPoolExecutor(max_workers=len(command_paths) + bool(worker_paths)) as pool:
-                commands = [pool.submit(self._execute_delivery_command, path) for path in command_paths]
+                commands = [pool.submit(self._execute_command, path) for path in command_paths]
                 workers = pool.submit(self.batch_runner, worker_paths, run_dir=self.run_dir,
                                       worker_runtime=self.worker_runtime, allow_existing=allow_existing) if worker_paths else None
                 code, manifest = workers.result() if workers else (0, {"workers": []})
@@ -1551,7 +1638,7 @@ class WorkflowEngine:
                         continue
                     except (OSError, ValueError, artifact_guard.ValidationError) as error:
                         worker = {**worker, "reason": str(error), "error_code": "invalid-evidence"}
-                if is_repair or (repair_enabled and worker.get("error_code") in {"invalid-evidence", "missing-field"}):
+                if is_repair or assignment.get("coordinator_validation") or (repair_enabled and worker.get("error_code") in {"invalid-evidence", "missing-field"}):
                     self._block(
                         summary=f"Artifact evidence rejected for {assignment['action_id']}: {worker.get('reason')}",
                         evidence_path=result.manifest_path,
@@ -2679,12 +2766,57 @@ class WorkflowEngine:
             validation_ids=self._plan_validation_ids(repo_id),
         )
 
-    def _failed_validation_ids(self, artifact: dict[str, Any]) -> list[str]:
-        return sorted(
-            record["id"]
-            for record in artifact.get("validations", [])
-            if record.get("result") not in {"pass"}
+    def _coordinator_check_source(self, repo_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
+        source = self._current_validation(repo_id, require_pass=False)
+        if source is None:
+            return None
+        records = source[1]["validations"]
+        pending = [record for record in records if record["result"] != "pass"]
+        expected = list(zip(self._plan_validation_ids(repo_id), self._plan_commands(repo_id), strict=True))
+        repository = self.load_run()["repositories"][repo_id]
+        worktree = repository["worktree"]
+        if (not pending or any(record["result"] != "not-run" or record["command"] != "git diff --check" for record in pending)
+                or sorted((record["id"], record["command"]) for record in records) != sorted(expected)
+                or any(record["cwd"] != worktree for record in records)
+                or source[1]["git"]["head"] != _git(Path(worktree), "rev-parse", "HEAD")
+                or repository["branch"] != _git(Path(worktree), "branch", "--show-current")
+                or Path(source[1]["git"]["status_short_path"]).read_text().strip()
+                != _git(Path(worktree), "status", "--short")):
+            return None
+        return source
+
+    def _coordinator_validation_assignment(self, repo_id: str) -> Path | None:
+        source = self._coordinator_check_source(repo_id)
+        if source is None:
+            return None
+        run = self.load_run()
+        state = workflow_tools.repository_state(Path(run["repositories"][repo_id]["worktree"]))
+        context = {
+            "executor": "git-diff-check-v1", "source": _reference(source[0]),
+            "evidence": [_reference(path) for path in sorted(workflow_tools.artifact_evidence_paths(source[1]))],
+            "repository_state": state,
+        }
+        identity = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
+        path = self.build_assignment(
+            stage="validate", repo_id=repo_id, scope=f"coordinator-check-{identity}",
+            inputs=self._canonical_inputs(run, repo_id),
+            instructions=["Execute only the pending git diff --check and reuse the other pinned passing records."],
+            validation_ids=self._plan_validation_ids(repo_id), validation_commands=self._plan_commands(repo_id),
+            extras={"execution_mode": "command", "timeout_seconds": 60, "coordinator_validation": context},
         )
+        assignment = _load_json(path)
+        if (assignment.get("coordinator_validation") != context or assignment.get("execution_mode") != "command"
+                or assignment["stage"] != "validate"):
+            raise artifact_guard.ValidationError("coordinator validation assignment differs from its canonical intent")
+        with RunLock(self.run_dir):
+            current = self.load_run()
+            coordinator_validation.verify_assignment_pin(path)
+            current.setdefault("coordinator_validation_assignments", {})[assignment["action_id"]] = _reference(path)
+            self._save_run(current)
+        return path
+
+    def _failed_validation_ids(self, artifact: dict[str, Any]) -> list[str]:
+        return sorted(record["id"] for record in artifact.get("validations", []) if record.get("result") == "fail")
 
     def _run_validation_wave(
         self, repo_ids: Iterable[str], scope: str
@@ -2705,6 +2837,13 @@ class WorkflowEngine:
                     self._block_from_artifact(artifact)
                     return "blocked"
 
+        coordinator_checks = [path for repo_id in ordered_repo_ids
+                              if (path := self._coordinator_validation_assignment(repo_id)) is not None]
+        if coordinator_checks:
+            self._run_with_replacements(coordinator_checks)
+            if self.load_run()["status"] == "blocked":
+                return "blocked"
+
         fix_assignments: list[Path] = []
         for repo_id in ordered_repo_ids:
             current_any = self._current_validation(repo_id, require_pass=False)
@@ -2720,6 +2859,14 @@ class WorkflowEngine:
                 )
                 return "blocked"
             _, validation, _ = current_any
+            pending_ids = sorted(record["id"] for record in validation["validations"] if record["result"] == "not-run")
+            if pending_ids:
+                self._block(
+                    summary=f"Validation checks were not run for {repo_id}: {', '.join(pending_ids)}.",
+                    evidence_path=current_any[0], kind="decision", repo_id=repo_id,
+                    required_action="Resolve command ownership or execution prerequisites and record validation evidence; no source-fix allowance was spent.",
+                )
+                return "blocked"
             failed_ids = self._failed_validation_ids(validation)
             if not failed_ids:
                 continue

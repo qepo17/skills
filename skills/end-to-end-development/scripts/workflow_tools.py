@@ -199,20 +199,8 @@ def repository_state(worktree: Path) -> dict[str, str]:
 
 
 def artifact_evidence_paths(value: Any) -> set[Path]:
-    """Collect on-disk evidence, not narrative strings or arbitrary source paths."""
-    paths: set[Path] = set()
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if key in {"evidence_path", "log_path", "status_short_path"} and isinstance(child, str):
-                paths.add(Path(child).resolve())
-            elif key == "source_artifact" and isinstance(child, dict):
-                paths.add(Path(child["path"]).resolve())
-            else:
-                paths.update(artifact_evidence_paths(child))
-    elif isinstance(value, list):
-        for child in value:
-            paths.update(artifact_evidence_paths(child))
-    return paths
+    """Preserve the evidence-collection seam shared with the standard-library guard."""
+    return artifact_guard.artifact_evidence_paths(value)
 
 
 def normalize_worker_artifact(
@@ -227,6 +215,9 @@ def normalize_worker_artifact(
     and status snapshots so a correct result is not retried because a model
     copied stale mechanical metadata into its JSON artifact.
     """
+    if assignment.get("coordinator_validation"):
+        if repository_state(Path(assignment["cwd"])) != assignment["coordinator_validation"]["repository_state"]:
+            raise artifact_guard.ValidationError("coordinator check changed pinned repository/Git state")
     if assignment.get("execution_mode") == "artifact-repair":
         for repository in assignment["repositories"]:
             expected = assignment["repair_of"]["repository_states"][repository["repo_id"]]

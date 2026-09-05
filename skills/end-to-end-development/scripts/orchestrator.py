@@ -144,6 +144,11 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                 raise WorkflowError(
                     "run is not blocked by an eligible oversized next_action rejection with an unused repair allowance"
                 )
+        elif args.command == "retry-coordinator-validation":
+            if not engine.retry_coordinator_validation():
+                raise WorkflowError(
+                    "run is not blocked by an exhausted, permission-denied coordinator whitespace check on current approved evidence"
+                )
         elif args.command == "retry-validation-evidence":
             if not engine.retry_validation_evidence():
                 raise WorkflowError(
@@ -241,6 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact_retry.add_argument("--report-root", type=Path)
 
+    coordinator_retry = subparsers.add_parser(
+        "retry-coordinator-validation",
+        help="record a pending coordinator whitespace check without resetting code-fix limits or approval",
+    )
+    coordinator_retry.add_argument("run_dir", type=Path)
+    coordinator_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    coordinator_retry.add_argument("--report-root", type=Path)
+
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",
         help="retry an exact validation-coverage blocker after fixing the engine",
@@ -325,6 +338,11 @@ def main() -> int:
                     "run_dir": str(args.run_dir.resolve()),
                     "last_transition": "retry-artifact-repair",
                 },
+            )
+        elif args.command == "retry-coordinator-validation":
+            output = _invoke(
+                args,
+                {"run_dir": str(args.run_dir.resolve()), "last_transition": "retry-coordinator-validation"},
             )
         elif args.command == "retry-validation-evidence":
             output = _invoke(
