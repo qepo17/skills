@@ -109,6 +109,10 @@ If a dependent fix was started concurrently with an upstream contract fix and st
 
 The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
 
+### Explicit oversized handoff recovery
+
+If the only rejection is `$.next_action: must be at most 300 characters` on completed implementation, explicit user authorization permits `repair-handoff-metadata <run-dir> --artifact-sha256 <rejected-artifact-hash>`. See [ORCHESTRATION.md](ORCHESTRATION.md#explicit-handoff-metadata-recovery). This guarded command preserves the original handoff, clears only the advisory field, verifies unchanged approved inputs and code, and retains every test result and retry limit. It launches no worker; resume the graph afterward. Never hand-edit run state or broaden this recovery to another blocker.
+
 ## Full-profile plan-review interrupt
 
 Fast and standard runs still emit a complete hash-pinned review bundle, but policy accepts it atomically without a user pause. When a full-profile graph returns `status: awaiting-user` and `phase: plan-review`:

@@ -926,6 +926,118 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual("complete", engine.load_run()["status"])
         self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
 
+    def blocked_long_handoff(self):
+        batch = FakeSuccessfulBatch()
+        def long_handoff(paths, **kwargs):
+            code, manifest = batch(paths, **kwargs)
+            for path in paths:
+                assignment = json.loads(path.read_text())
+                if assignment["stage"] == "implement":
+                    output = Path(assignment["output_artifact"])
+                    artifact = json.loads(output.read_text())
+                    artifact["next_action"] = "Proceed to independent review. " * 15
+                    output.write_text(json.dumps(artifact, indent=2) + "\n")
+                    worker = next(w for w in manifest["workers"] if w["action_id"] == assignment["action_id"])
+                    worker.update(status="rejected", cleanup_status="complete", error_code="invalid-evidence",
+                                  error_path="$.next_action", reason="$.next_action: must be at most 300 characters")
+            return code, manifest
+        engine = self.initialize(long_handoff)
+        graph = build_graph(engine, InMemorySaver())
+        config = {"configurable": {"thread_id": "long-handoff"}, "recursion_limit": 150}
+        graph.invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertIn("$.next_action", engine.load_run()["blockers"][0]["summary"])
+        assignment = next(a for a in batch.assignments if a["stage"] == "implement")
+        output = Path(assignment["output_artifact"])
+        return engine, batch, graph, config, output
+
+    def test_handoff_metadata_recovery_preserves_evidence_and_does_not_replay_source(self):
+        engine, batch, graph, config, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        fingerprint = workflow_tools.worktree_fingerprint(self.worktree)
+        before = engine.load_run()
+        receipt = engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        recovered = json.loads(output.read_text())
+        expected = json.loads(original)
+        expected["next_action"] = None
+        self.assertEqual(expected, recovered)
+        self.assertEqual(original, Path(receipt["original"]["path"]).read_bytes())
+        self.assertEqual(before["plan_review"], engine.load_run()["plan_review"])
+        self.assertEqual(before["retry_limits"], engine.load_run()["retry_limits"])
+        self.assertEqual(fingerprint, workflow_tools.worktree_fingerprint(self.worktree))
+        self.assertEqual("working", engine.load_run()["status"])
+        with self.assertRaises(WorkflowError):
+            engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        graph.invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+
+    def test_handoff_metadata_recovery_rejects_changed_content(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        (self.worktree / "feature.txt").write_text("unvalidated change\n")
+        with self.assertRaisesRegex(WorkflowError, "content|worktree"):
+            engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        self.assertEqual(original, output.read_bytes())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_handoff_metadata_recovery_rejects_unpinned_or_other_invalid_evidence(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        with self.assertRaises(WorkflowError):
+            engine.repair_handoff_metadata("0" * 64)
+        artifact = json.loads(original)
+        artifact["summary"] = ""
+        output.write_text(json.dumps(artifact))
+        with self.assertRaises((WorkflowError, artifact_guard.ValidationError)):
+            engine.repair_handoff_metadata(hashlib.sha256(output.read_bytes()).hexdigest())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_handoff_metadata_recovery_finishes_after_publication_crash(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        digest = hashlib.sha256(original).hexdigest()
+        with mock.patch.object(engine, "_save_run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                engine.repair_handoff_metadata(digest)
+        self.assertIsNone(json.loads(output.read_text())["next_action"])
+        self.assertEqual("blocked", engine.load_run()["status"])
+        receipt = engine.repair_handoff_metadata(digest)
+        self.assertEqual(original, Path(receipt["original"]["path"]).read_bytes())
+        self.assertEqual("working", engine.load_run()["status"])
+
+    def test_handoff_metadata_recovery_refuses_uncleaned_workers(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        agents = engine.load_agents()
+        agents["agents"][-1]["cleanup_status"] = "retained"
+        engine._save_agents(agents)
+        with self.assertRaisesRegex(WorkflowError, "settled and cleaned"):
+            engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        self.assertEqual(original, output.read_bytes())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_handoff_metadata_recovery_cannot_clear_a_failed_check(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        artifact = json.loads(output.read_text())
+        artifact["validations"][0].update(result="fail", exit_code=1)
+        output.write_text(json.dumps(artifact))
+        original = output.read_bytes()
+        with self.assertRaises((WorkflowError, artifact_guard.ValidationError)):
+            engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        self.assertEqual(original, output.read_bytes())
+        self.assertEqual("blocked", engine.load_run()["status"])
+
+    def test_handoff_metadata_recovery_rejects_changed_approval(self):
+        engine, _, _, _, output = self.blocked_long_handoff()
+        original = output.read_bytes()
+        review = Path(engine.load_run()["plan_review"]["review_path"])
+        review.write_text(review.read_text() + "changed\n")
+        with self.assertRaises((WorkflowError, artifact_guard.ValidationError)):
+            engine.repair_handoff_metadata(hashlib.sha256(original).hexdigest())
+        self.assertEqual(original, output.read_bytes())
+        self.assertEqual("blocked", engine.load_run(validate=False)["status"])
+
     def test_missing_blocker_kind_repairs_output_without_replaying_source(self) -> None:
         batch = MissingBlockerKindBatch()
         engine = self.initialize(batch)

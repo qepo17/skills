@@ -226,6 +226,13 @@ def build_parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--report-root", type=Path)
 
+    handoff_repair = subparsers.add_parser(
+        "repair-handoff-metadata",
+        help="repair only a hash-pinned oversized next_action on completed implementation",
+    )
+    handoff_repair.add_argument("run_dir", type=Path)
+    handoff_repair.add_argument("--artifact-sha256", required=True)
+
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",
         help="retry an exact validation-coverage blocker after fixing the engine",
@@ -303,6 +310,11 @@ def main() -> int:
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": "resume"},
             )
+        elif args.command == "repair-handoff-metadata":
+            with _execution_lock(args.run_dir.resolve()):
+                engine = WorkflowEngine(args.run_dir.resolve())
+                receipt = engine.repair_handoff_metadata(args.artifact_sha256)
+                output = {**_result(engine), "handoff_recovery": receipt}
         elif args.command == "retry-validation-evidence":
             output = _invoke(
                 args,

@@ -381,6 +381,109 @@ class WorkflowEngine:
         )
         return True
 
+    def repair_handoff_metadata(self, artifact_sha256: str) -> dict[str, Any]:
+        """Recover only an oversized advisory next_action on a finished implementation.
+
+        This explicit, hash-pinned recovery never launches a writer or normalizes
+        stale test evidence. Preserve the rejected bytes before correcting them;
+        a crash after publication can finish using that same immutable backup.
+        """
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            if (run["status"] != "blocked" or run["phase"] != "implement"
+                    or run["next_actions"] or len(run["blockers"]) != 1
+                    or not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)):
+                raise WorkflowError("not an eligible handoff metadata blocker")
+            blocker = run["blockers"][0]
+            match = re.fullmatch(
+                r"Artifact evidence rejected for (implement:[^ ]+): "
+                r"\$\.next_action: must be at most 300 characters", blocker["summary"])
+            if blocker["kind"] != "decision" or not match:
+                raise WorkflowError("not the exact next_action length blocker")
+            action_id = match.group(1)
+            manifest = _load_json(Path(blocker["evidence_path"]))
+            workers = [w for w in manifest["workers"] if w["action_id"] == action_id]
+            if (len(workers) != 1 or workers[0]["status"] != "rejected"
+                    or workers[0].get("error_path") != "$.next_action"
+                    or workers[0].get("cleanup_status") != "complete"
+                    or any(a.get("cleanup_status") != "complete" for a in self.load_agents()["agents"])
+                    or any(r.get("active_writer") for r in run["repositories"].values())):
+                raise WorkflowError("handoff worker evidence is not settled and cleaned")
+            assignment_path = self.run_dir / "assignments" / f"{_slug(action_id)}.json"
+            assignment = _load_json(assignment_path)
+            artifact_guard.validate_assignment(assignment)
+            repo_id = assignment["repo_id"]
+            repository = run["repositories"][repo_id]
+            output = Path(assignment["output_artifact"])
+            if (assignment["action_id"] != action_id or assignment["run_id"] != run["run_id"]
+                    or assignment["stage"] != "implement" or assignment["output_kind"] != "result"
+                    or action_id in repository["accepted_artifacts"]
+                    or output.resolve() != Path(workers[0]["output_artifact"]).resolve()
+                    or not output.resolve().is_relative_to(self.run_dir)):
+                raise WorkflowError("handoff assignment identity does not match the rejected action")
+            archive = self.run_dir / "recoveries" / f"handoff-{artifact_sha256}.original.json"
+            original_bytes = archive.read_bytes() if archive.exists() else output.read_bytes()
+            if hashlib.sha256(original_bytes).hexdigest() != artifact_sha256:
+                raise WorkflowError("handoff artifact hash does not match")
+            original = json.loads(original_bytes)
+            if (original.get("status") != "complete" or original.get("blockers")
+                    or not isinstance(original.get("next_action"), str)
+                    or len(original["next_action"]) <= 300):
+                raise WorkflowError("only a completed oversized next_action may be repaired")
+            repaired = {**original, "next_action": None}
+            if _load_json(output) not in (original, repaired):
+                raise WorkflowError("handoff content changed beyond next_action")
+            approved = run.get("plan_review") or {}
+            if (approved.get("status") != "approved"
+                    or assignment.get("plan_review") != {
+                        "path": approved.get("review_path"), "sha256": approved.get("review_sha256")}
+                    or _sha256(Path(approved["review_path"])) != approved["review_sha256"]
+                    or not self._assignment_pins(assignment, Path(repository["plan_path"]), repository["plan_sha256"])):
+                raise WorkflowError("handoff approval or canonical plan changed")
+            for ref in assignment["input_artifacts"]:
+                if _sha256(Path(ref["path"])) != ref["sha256"]:
+                    raise WorkflowError("handoff input evidence changed")
+            worktree = Path(repository["worktree"])
+            if (Path(assignment["cwd"]).resolve() != worktree.resolve()
+                    or original.get("tree_fingerprint") != workflow_tools.worktree_fingerprint(worktree)
+                    or original.get("git", {}).get("head") != _git(worktree, "rev-parse", "HEAD")
+                    or repository["branch"] != _git(worktree, "branch", "--show-current")
+                    or Path(original["git"]["status_short_path"]).read_text().strip()
+                       != _git(worktree, "status", "--short").strip()):
+                raise WorkflowError("handoff worktree content or Git evidence changed")
+            previous_path = artifact_guard.CURRENT_ARTIFACT_PATH
+            try:
+                artifact_guard.CURRENT_ARTIFACT_PATH = output
+                artifact_guard.validate_result(repaired)
+            finally:
+                artifact_guard.CURRENT_ARTIFACT_PATH = previous_path
+            if any(v["result"] != "pass" or v["exit_code"] != 0 for v in repaired["validations"]):
+                raise WorkflowError("handoff validation failures cannot be cleared by metadata recovery")
+            # All guards pass before any artifact/state change. Keep the original
+            # assignment, validation results, approval and retry limits untouched.
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            if not archive.exists():
+                with archive.open("xb") as handle:
+                    handle.write(original_bytes)
+            workflow_tools.atomic_write_json(output, repaired)
+            receipt = {"original": _reference(archive), "repaired": _reference(output),
+                       "assignment": _reference(assignment_path), "field": "next_action"}
+            receipt_path = archive.with_name(f"handoff-{artifact_sha256}.receipt.json")
+            if receipt_path.exists():
+                if _load_json(receipt_path) != receipt:
+                    raise WorkflowError("handoff recovery receipt differs")
+            else:
+                workflow_tools.atomic_write_json(receipt_path, receipt)
+            self._record_accepted_reference(run, assignment, output)
+            run.setdefault("handoff_metadata_recoveries", {})[action_id] = _reference(receipt_path)
+            run["status"] = "working"
+            run["blockers"] = []
+            repository["status"] = "pending"
+            self._save_run(run)
+        self._append_event("artifact-accepted", action_id=action_id, artifact=str(output), recovery=True)
+        self._append_event("resumed", reason="repair-handoff-metadata", evidence=str(receipt_path), next_action="implement")
+        return receipt
+
     def retry_validation_evidence(self) -> bool:
         """Retry only the exact validation-coverage blocker after an engine fix."""
         with RunLock(self.run_dir):
