@@ -797,6 +797,79 @@ class MissingBlockerKindBatch(FakeSuccessfulBatch):
         return code, manifest
 
 
+class LongHandoffBatch(FakeSuccessfulBatch):
+    """A valid source result rejected only for an overlong routing hint."""
+
+    def __init__(self, *, failed_check: bool = False, tamper: bool = False) -> None:
+        super().__init__()
+        self.failed_check = failed_check
+        self.tamper = tamper
+        self.source_writes = 0
+        self.repairs = 0
+
+    def __call__(self, paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(paths[0].read_text())
+        if assignment.get("execution_mode") == "artifact-repair":
+            self.assignments.append(assignment)
+            self.repairs += 1
+            artifact = artifact_guard.artifact_skeleton(paths[0], assignment)
+            if self.tamper:
+                artifact["validations"][0].update(exit_code=0, result="pass")
+            Path(assignment["output_artifact"]).write_text(json.dumps(artifact) + "\n")
+            return 0, {"workers": [{
+                "action_id": assignment["action_id"], "agent_name": "handoff-repair",
+                "status": "accepted", "cleanup_status": "complete",
+                "started_at": "2026-08-22T10:00:00Z", "ended_at": "2026-08-22T10:01:00Z",
+            }]}
+        code, manifest = super().__call__(paths, **kwargs)
+        if assignment["stage"] == "implement":
+            self.source_writes += 1
+            output = Path(assignment["output_artifact"])
+            artifact = json.loads(output.read_text())
+            artifact["next_action"] = "Preserve this detailed handoff. " * 20
+            if self.failed_check:
+                artifact["validations"][0].update(exit_code=1, result="fail")
+            output.write_text(json.dumps(artifact) + "\n")
+            manifest["workers"][0].update(
+                status="rejected", cleanup_status="complete", error_code="invalid-evidence",
+                error_path="$.next_action", reason="$.next_action: must be at most 300 characters",
+            )
+            code = 1
+        return code, manifest
+
+
+class DisappearingSchemaBatch(FakeSuccessfulBatch):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_writes = 0
+        self.schema: Path | None = None
+        self.schema_content = ""
+
+    def __call__(self, paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(paths[0].read_text())
+        if assignment["stage"] == "implement":
+            if self.schema is not None:
+                # Recover the surviving artifact as the real supervisor does, without relaunch.
+                return 0, {"workers": [{"action_id": assignment["action_id"], "status": "accepted",
+                                      "agent_name": "recovered-schema", "cleanup_status": "complete",
+                                      "started_at": "2026-08-22T10:00:00Z", "ended_at": "2026-08-22T10:01:00Z"}]}
+            self.schema_content = Path(assignment["artifact_schema_path"]).read_text()
+            self.schema = Path(assignment["log_dir"]) / "temporary-result-schema.md"
+            self.schema.write_text(self.schema_content)
+            assignment["artifact_schema_path"] = str(self.schema)
+            paths[0].write_text(json.dumps(assignment))
+        code, manifest = super().__call__(paths, **kwargs)
+        if assignment["stage"] == "implement":
+            self.source_writes += 1
+            assert self.schema is not None
+            self.schema.unlink()
+            manifest["workers"][0].update(status="rejected", cleanup_status="complete",
+                error_code="invalid-evidence", error_path="$.artifact_schema_path",
+                reason=f"$.artifact_schema_path: does not exist: {self.schema}")
+            code = 1
+        return code, manifest
+
+
 class WorkflowEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -907,6 +980,167 @@ class WorkflowEngineTests(unittest.TestCase):
             report_root=self.root / "reports",
             now=self.now,
         )
+
+    def block_on_long_handoff(self, batch: LongHandoffBatch) -> WorkflowEngine:
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "long-handoff"}, "recursion_limit": 150},
+        )
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertIn("$.next_action: must be at most 300 characters",
+                      engine.load_run()["blockers"][0]["summary"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertFalse(engine.resume_external_blockers())
+        return engine
+
+    def test_handoff_recovery_preserves_original_and_never_replays_source(self) -> None:
+        batch = LongHandoffBatch()
+        engine = self.block_on_long_handoff(batch)
+        original_assignment = next(a for a in batch.assignments if a["stage"] == "implement")
+        output = Path(original_assignment["output_artifact"])
+        before = output.read_bytes()
+        pinned_limits = engine.load_run()["retry_limits"]
+        self.assertTrue(engine.retry_result_handoff())
+        self.assertFalse(engine.retry_result_handoff())
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "recovered-handoff"}, "recursion_limit": 150},
+        )
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual(before, output.read_bytes())
+        self.assertEqual(pinned_limits, engine.load_run()["retry_limits"])
+        repair = next(a for a in batch.assignments if a.get("execution_mode") == "artifact-repair")
+        self.assertEqual("next-action-length", repair["repair_of"]["kind"])
+        self.assertEqual("none", repair["project_file_access"])
+        self.assertEqual("none", repair["git_access"])
+        self.assertEqual("none", repair["forge_access"])
+        self.assertEqual(hashlib.sha256(before).hexdigest(), repair["repair_of"]["artifact"]["sha256"])
+
+    def test_handoff_recovery_keeps_failed_validation_evidence(self) -> None:
+        batch = LongHandoffBatch(failed_check=True)
+        engine = self.block_on_long_handoff(batch)
+        self.assertTrue(engine.retry_result_handoff())
+        engine.phase_implement()
+        repaired = engine._artifacts(repo_id="api", stage="implement", kind="result")[0][1]
+        self.assertEqual(1, repaired["validations"][0]["exit_code"])
+        self.assertEqual("fail", repaired["validations"][0]["result"])
+        self.assertIsNone(engine._current_validation("api", require_pass=True))
+        self.assertEqual(1, batch.source_writes)
+
+    def test_handoff_repair_cannot_turn_a_failed_check_into_a_pass(self) -> None:
+        batch = LongHandoffBatch(failed_check=True, tamper=True)
+        engine = self.block_on_long_handoff(batch)
+        self.assertTrue(engine.retry_result_handoff())
+        engine.phase_implement()
+        self.assertEqual("blocked", engine.load_run()["status"])
+        self.assertIn("changed existing semantic evidence", engine.load_run()["blockers"][0]["summary"])
+        self.assertFalse(engine.retry_result_handoff())
+        self.assertEqual(1, batch.source_writes)
+        self.assertEqual(1, batch.repairs)
+
+    def test_handoff_recovery_rejects_stale_tree_and_unrelated_blockers(self) -> None:
+        batch = LongHandoffBatch()
+        engine = self.block_on_long_handoff(batch)
+        before = engine.run_path.read_bytes()
+        (self.worktree / "feature.txt").write_text("changed after rejection\n")
+        with self.assertRaisesRegex((WorkflowError, artifact_guard.ValidationError), "stale"):
+            engine.retry_result_handoff()
+        self.assertEqual(before, engine.run_path.read_bytes())
+        (self.worktree / "feature.txt").write_text("implemented\n")
+        run = engine.load_run()
+        run["blockers"][0]["summary"] = "A real product decision is needed."
+        engine._save_run(run)
+        self.assertFalse(engine.retry_result_handoff())
+        self.assertEqual(0, batch.repairs)
+
+    def test_handoff_recovery_rejects_additional_invalid_evidence(self) -> None:
+        batch = LongHandoffBatch()
+        engine = self.block_on_long_handoff(batch)
+        original = next(a for a in batch.assignments if a["stage"] == "implement")
+        output = Path(original["output_artifact"])
+        payload = json.loads(output.read_text())
+        payload["task_ids"] = []
+        output.write_text(json.dumps(payload))
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(artifact_guard.ValidationError):
+            engine.retry_result_handoff()
+        self.assertEqual(before, engine.run_path.read_bytes())
+        self.assertEqual(0, batch.repairs)
+
+    def test_handoff_recovery_rejects_changed_head_branch_and_index(self) -> None:
+        batch = LongHandoffBatch()
+        engine = self.block_on_long_handoff(batch)
+        for mutation, restore in [
+            (["branch", "-m", "unexpected-branch"], ["branch", "-m", "feat/langgraph-test"]),
+            (["add", "feature.txt"], ["reset", "--", "feature.txt"]),
+            (["commit", "--allow-empty", "-qm", "unexpected"], ["reset", "--soft", "HEAD~1"]),
+        ]:
+            with self.subTest(mutation=mutation):
+                batch._git(self.worktree, *mutation)
+                before = engine.run_path.read_bytes()
+                with self.assertRaisesRegex(WorkflowError, "stale"):
+                    engine.retry_result_handoff()
+                self.assertEqual(before, engine.run_path.read_bytes())
+                batch._git(self.worktree, *restore)
+        self.assertTrue(engine.retry_result_handoff())
+
+    def test_handoff_recovery_prepared_before_crash_reuses_one_assignment(self) -> None:
+        batch = LongHandoffBatch()
+        engine = self.block_on_long_handoff(batch)
+        original = next(a for a in batch.assignments if a["stage"] == "implement")
+        # Simulate a stop after the immutable repair intent but before clearing the blocker.
+        intent = engine._artifact_repair_assignment(original, kind="next-action-length")
+        before = intent.read_bytes()
+        self.assertTrue(engine.retry_result_handoff())
+        self.assertEqual(before, intent.read_bytes())
+        engine.phase_implement()
+        self.assertEqual(1, batch.repairs)
+        self.assertEqual(1, batch.source_writes)
+
+    def test_handoff_recovery_cli_dispatches_supported_transition(self) -> None:
+        import orchestrator
+        args = orchestrator.build_parser().parse_args(["retry-result-handoff", str(self.run_dir)])
+        self.assertEqual("auto", args.worker_runtime)
+        with mock.patch.object(sys, "argv", ["orchestrator", "retry-result-handoff", str(self.run_dir)]), \
+                mock.patch.object(orchestrator, "_invoke", return_value={"status": "working"}) as invoke, \
+                mock.patch("builtins.print"):
+            self.assertEqual(0, orchestrator.main())
+        self.assertEqual("retry-result-handoff", invoke.call_args.args[1]["last_transition"])
+
+    def test_restored_schema_recovers_valid_result_without_a_source_replay(self) -> None:
+        batch = DisappearingSchemaBatch()
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "schema-recovery"}, "recursion_limit": 150}
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertIn("$.artifact_schema_path: does not exist", engine.load_run()["blockers"][0]["summary"])
+        self.assertFalse(engine.resume_external_blockers())
+        with self.assertRaises(artifact_guard.ValidationError):
+            engine.retry_restored_schema()
+        assert batch.schema is not None
+        batch.schema.write_text(batch.schema_content)
+        self.assertFalse(engine.retry_result_handoff())
+        self.assertTrue(engine.retry_restored_schema())
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertNotIn("artifact_repairs", engine.load_run())
+
+    def test_restored_schema_does_not_accept_stale_source_evidence(self) -> None:
+        batch = DisappearingSchemaBatch()
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "schema-stale"}, "recursion_limit": 150})
+        assert batch.schema is not None
+        batch.schema.write_text(batch.schema_content)
+        (self.worktree / "feature.txt").write_text("stale source\n")
+        before = engine.run_path.read_bytes()
+        with self.assertRaisesRegex(WorkflowError, "stale"):
+            engine.retry_restored_schema()
+        self.assertEqual(before, engine.run_path.read_bytes())
+        self.assertEqual(1, batch.source_writes)
 
     def test_engine_normalizes_assignment_metadata_from_its_own_intent(self) -> None:
         batch = FakeSuccessfulBatch()
