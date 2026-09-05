@@ -10,6 +10,8 @@ python3 <workflow_tools_path> render-report \
   --output <output-artifact>
 ```
 
+Blockers use the [common blocker shape](blockers.md); do not rewrite an accepted report to repair it.
+
 The generated artifact binds the assignment and records the HTML path, byte size, SHA-256, complete requirement IDs, high-impact topics, and blockers. Independently validate it with:
 
 ```bash

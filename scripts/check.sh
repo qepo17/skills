@@ -9,7 +9,23 @@ cd "$ROOT"
 
 python3 scripts/validate_repository.py
 
-UV_PROJECT_ENVIRONMENT="$TMP_DIR/e2e-venv" \
+# Both npx skills installations must remain self-contained and ship the same helper.
+cmp skills/end-to-end-development/scripts/delivery_tools.py \
+  skills/fast-end-to-end-development/scripts/delivery_tools.py
+cp -R skills/fast-end-to-end-development "$TMP_DIR/fast-only"
+git init -q "$TMP_DIR/standalone-repo"
+printf 'standalone fingerprint fixture\n' >"$TMP_DIR/standalone-repo/example.txt"
+git -C "$TMP_DIR/standalone-repo" status --porcelain >"$TMP_DIR/before-status.txt"
+(
+  cd "$TMP_DIR"
+  PYTHONDONTWRITEBYTECODE=1 python3 fast-only/scripts/delivery_tools.py --help >helper-help.txt
+  PYTHONDONTWRITEBYTECODE=1 python3 fast-only/scripts/delivery_tools.py fingerprint "$TMP_DIR/standalone-repo" >fingerprint.txt
+)
+grep -Eq '^[0-9a-f]{64}$' "$TMP_DIR/fingerprint.txt"
+git -C "$TMP_DIR/standalone-repo" status --porcelain >"$TMP_DIR/after-status.txt"
+cmp "$TMP_DIR/before-status.txt" "$TMP_DIR/after-status.txt"
+
+PYTHONDONTWRITEBYTECODE=1 UV_PROJECT_ENVIRONMENT="$TMP_DIR/e2e-venv" \
   uv run --project skills/end-to-end-development --locked \
   python -m unittest discover -s skills/end-to-end-development/tests -v
 

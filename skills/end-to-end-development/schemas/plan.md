@@ -6,6 +6,8 @@ Initialize the assigned file first:
 python3 <validator_path> init <assignment_path>
 ```
 
+For a stage that cannot finish, follow the [blocker contract](blockers.md) and use the typed `block` command.
+
 A complete profiled plan contains:
 
 - `baseline`, nullable `contract_sha256`, and `requirements_sha256`;

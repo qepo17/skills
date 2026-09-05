@@ -17,9 +17,11 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -27,6 +29,7 @@ from langgraph.types import interrupt
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
+import delivery_tools  # noqa: E402
 import worker_supervisor  # noqa: E402
 import workflow_tools  # noqa: E402
 
@@ -208,6 +211,7 @@ class WorkflowEngine:
         worker_runtime: str = "auto",
         report_root: Path | None = None,
         now: Callable[[], str] = workflow_tools.utc_now,
+        delivery_runner: Callable[..., subprocess.CompletedProcess[str]] = delivery_tools.run_process,
     ) -> None:
         self.run_dir = run_dir.resolve()
         self.skill_dir = (skill_dir or Path(__file__).resolve().parents[1]).resolve()
@@ -215,6 +219,7 @@ class WorkflowEngine:
             codebase_design_dir.resolve() if codebase_design_dir else None
         )
         self.batch_runner = batch_runner
+        self.delivery_runner = delivery_runner
         self.worker_runtime = worker_runtime
         self.report_root = (report_root or Path.home() / "src" / "artifacts").resolve()
         self.now = now
@@ -366,6 +371,7 @@ class WorkflowEngine:
                 return False
             run["status"] = "working"
             run["blockers"] = []
+            run["external_resume_generation"] = run.get("external_resume_generation", 0) + 1
             for repository in run["repositories"].values():
                 if repository["status"] == "blocked":
                     repository["status"] = "pending"
@@ -437,10 +443,20 @@ class WorkflowEngine:
         )
         return True
 
-    def reconcile(self) -> str:
+    def reconcile(self, *, refresh_completed: bool = True) -> str:
         """Validate durable facts and recover completed outputs after a crash."""
         cleanup_outcomes = workflow_tools.retry_worker_cleanups(run_dir=self.run_dir)
         preflight = self.load_run()
+        if refresh_completed and preflight["status"] == "working" and preflight["phase"] in {"deliver", "report", "complete"}:
+            # Preserve refresh obligations even while a peer still owns an action.
+            # The ordinary graph drains them once that existing batch settles.
+            refresh = {repo_id: _reference(latest[0]) for repo_id in preflight["repositories"]
+                       if (latest := self._latest_delivery(repo_id)) and latest[2].get("execution_mode") == "command"}
+            if refresh:
+                with RunLock(self.run_dir):
+                    current = self.load_run()
+                    current.setdefault("pending_delivery_refresh", {}).update(refresh)
+                    self._save_run(current)
         recovered_workers: dict[str, dict[str, Any]] = {}
         for action in preflight["next_actions"]:
             assignment_path = action.get("assignment_path")
@@ -448,6 +464,18 @@ class WorkflowEngine:
                 continue
             resolved_assignment_path = Path(assignment_path)
             assignment = _load_json(resolved_assignment_path)
+            if assignment.get("execution_mode") == "command":
+                output = Path(assignment["output_artifact"])
+                if output.exists():
+                    try:
+                        previous = _load_json(output)
+                    except (OSError, ValueError):
+                        previous = {}
+                    if previous.get("status") == "complete":
+                        # A file surviving a crash is not fresh forge evidence.
+                        # Re-observe without commit/push/PR writes before acceptance.
+                        self._execute_delivery_command(resolved_assignment_path, verify_only=True)
+                continue
             worker = self._wait_for_crash_survivor(
                 resolved_assignment_path, assignment
             )
@@ -513,7 +541,7 @@ class WorkflowEngine:
                 self._apply_recovered_projection(run, assignment, artifact, output_path)
                 recovered.append((assignment, artifact))
                 agent_name = workflow_tools._agent_name(assignment)
-                if not any(item["name"] == agent_name for item in agents["agents"]):
+                if assignment.get("execution_mode") != "command" and not any(item["name"] == agent_name for item in agents["agents"]):
                     recovered_at = self.now()
                     worker = recovered_workers.get(assignment["action_id"], {})
                     cleanup_status = worker.get("cleanup_status", "complete")
@@ -562,8 +590,25 @@ class WorkflowEngine:
                 next_action=None,
             )
             if artifact.get("status") in {"blocked", "failed"}:
+                if assignment["stage"] == "deliver" and any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+                    continue  # The delivery phase still owns its permitted CI-fix route.
                 self._block_from_artifact(artifact)
                 break
+        current = self.load_run()
+        if current["status"] == "working" and not current["next_actions"] and current.get("pending_delivery_refresh"):
+            refresh_paths = []
+            for repo_id in sorted(current["pending_delivery_refresh"]):
+                cycle = len(self._artifacts(repo_id=repo_id, stage="deliver", kind="delivery")) + 1
+                refresh_paths.append(self.build_assignment(
+                    stage="deliver", repo_id=repo_id, scope=f"cycle-{cycle}",
+                    instructions=["Refresh final-head policy/check evidence without Git/forge writes."],
+                    extras={"verify_only": True, "git_access": "none", "forge_access": "none"},
+                ))
+            self._set_phase("deliver")
+            for artifact in self._run_with_replacements(refresh_paths):
+                if artifact.get("status") != "complete" and not any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+                    self._block_from_artifact(artifact)
+                    break
         return self.load_run()["phase"]
 
     def _apply_recovered_projection(
@@ -702,6 +747,8 @@ class WorkflowEngine:
             "plan",
             "design-challenge",
             "implement",
+            "validation-fix",
+            "pipeline-fix",
             "review-1",
             "review-2",
             "fix-1",
@@ -774,6 +821,9 @@ class WorkflowEngine:
             while True:
                 assignment = _load_json(assignment_path)
                 artifact_guard.validate_assignment(assignment)
+                redirected = self._repair_redirect(assignment_path)
+                if redirected != assignment_path:
+                    return redirected
                 output_path = Path(assignment["output_artifact"])
                 if not output_path.exists():
                     return assignment_path
@@ -783,6 +833,15 @@ class WorkflowEngine:
                     return assignment_path
                 if existing.get("status") not in {"blocked", "failed"}:
                     return assignment_path
+                if (assignment.get("output_kind") == "result"
+                        and run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
+                        and assignment["action_id"] not in run.get("artifact_repairs", {})):
+                    try:
+                        self._validate_worker_output(assignment, output_path)
+                    except artifact_guard.ValidationError as error:
+                        if error.code == "missing-field" and re.fullmatch(r"\$\.blockers\[[0-9]+\]\.kind", error.path):
+                            return self._artifact_repair_assignment(assignment)
+                        raise WorkflowError(f"Cannot resume invalid result evidence: {error}") from error
                 assignment_path = self._replacement(assignment)
 
         if inputs is None:
@@ -810,6 +869,7 @@ class WorkflowEngine:
             "repo_id": repo_id,
             "cwd": repository["worktree"] if repository else str(self.run_dir),
             "thinking": self._thinking(profile, stage),
+            "reasoning_policy": run.get("worker_reasoning_policy", "legacy-xhigh"),
             "timeout_seconds": 3600 if stage not in {"deliver", "report"} else 1800,
             "project_file_access": "write" if write else "none",
             "git_access": "write" if stage == "deliver" else "none",
@@ -848,6 +908,10 @@ class WorkflowEngine:
             assignment["task_ids"] = []
         if stage not in {"fix-1", "fix-2", "review-2"}:
             assignment["finding_ids"] = []
+        if stage == "deliver" and repository:
+            assignment["delivery_evidence_version"] = repository.get("delivery_evidence_version", 1)
+            assignment["execution_mode"] = "command" if repository.get("delivery_executor") == "github-command" else "worker"
+            assignment["check_timeout_seconds"] = repository.get("delivery_check_timeout_seconds", 1800)
         if stage not in {
             "implement",
             "validate",
@@ -907,11 +971,17 @@ class WorkflowEngine:
                     action.get("assignment_path") for action in run["next_actions"]
                 ]
                 expected = [str(path.resolve()) for path in assignment_paths]
-                if sorted(existing) != sorted(expected):
+                if sorted(existing) == sorted(expected):
+                    return
+                redirected = [str(self._repair_redirect(Path(path))) for path in existing]
+                if sorted(redirected) != sorted(expected) or any(
+                    action["status"] != "pending"
+                    for action, before, after in zip(run["next_actions"], existing, redirected, strict=True)
+                    if before != after
+                ):
                     raise WorkflowError(
                         "refusing to replace a different pending action batch"
                     )
-                return
             run["next_actions"] = actions
             for assignment in (value for _, value in assignments):
                 repo_id = assignment.get("repo_id")
@@ -927,7 +997,7 @@ class WorkflowEngine:
             raise artifact_guard.ValidationError("artifact exceeds its size limit")
         artifact = json.loads(raw)
         artifact = workflow_tools.normalize_worker_artifact(
-            Path(artifact["assignment_path"]),
+            self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json",
             assignment,
             output_path,
             artifact,
@@ -981,6 +1051,11 @@ class WorkflowEngine:
             if artifact.get("status") == "complete":
                 actual_head = _git(worktree, "rev-parse", "HEAD")
                 actual_branch = _git(worktree, "branch", "--show-current")
+                if assignment.get("delivery_evidence_version", 1) == 2:
+                    if artifact.get("head_sha") != actual_head:
+                        raise artifact_guard.ValidationError("checked delivery head is not the current worktree HEAD")
+                    if artifact.get("base_branch") != self.load_run()["repositories"][repo_id]["base_branch"]:
+                        raise artifact_guard.ValidationError("delivery base does not match the assigned repository base")
                 if actual_head not in artifact.get("commits", []):
                     raise artifact_guard.ValidationError(
                         "delivery commits do not contain the current worktree HEAD"
@@ -1011,6 +1086,11 @@ class WorkflowEngine:
             else run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
         )
         target[assignment["action_id"]] = _reference(output_path)
+        pending = run.get("pending_delivery_refresh", {})
+        repo_id = assignment.get("repo_id")
+        if (assignment.get("execution_mode") == "command" and repo_id in pending
+                and self._assignment_pins(assignment, Path(pending[repo_id]["path"]), pending[repo_id]["sha256"])):
+            del pending[repo_id]
 
     def _replacement(self, assignment: dict[str, Any]) -> Path:
         replacement = dict(assignment)
@@ -1033,6 +1113,62 @@ class WorkflowEngine:
         artifact_guard.validate_assignment(_load_json(path))
         return path
 
+    def _execute_delivery_command(self, path: Path, *, verify_only: bool = False) -> dict[str, Any]:
+        assignment = _load_json(path)
+        run = self.load_run()
+        repo_id = assignment["repo_id"]
+        repository = run["repositories"][repo_id]
+        if assignment["action_id"] in repository["accepted_artifacts"]:
+            raise WorkflowError("refusing to overwrite accepted delivery evidence")
+        if self._current_validation(repo_id, require_pass=True) is None:
+            raise WorkflowError("command delivery requires current passing local validation")
+        files = sorted({name for _path, result, writer in self._artifacts(repo_id=repo_id, kind="result")
+                        if writer.get("stage") in PROJECT_WRITE_STAGES for name in result.get("changed_files", [])})
+        request = Path(run["request_path"]).read_text().strip()
+        title = request.splitlines()[0][:100]
+        validations = self._plan_commands(repo_id)
+        body = "## Problem\n" + request[:2000] + "\n\n## Solution\n" + "\n".join(f"- `{name}`" for name in files)
+        body += "\n\n## Validation\n" + "\n".join(f"- `{command}`" for command in validations)
+        body += "\n\nOne independent review completed; compatible must-fix findings resolved. Required CI is monitored on the final head.\n"
+        log_dir = Path(assignment["log_dir"]) / _slug(assignment["action_id"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        spec = {"repository": repository["delivery_repository"], "worktree": repository["worktree"],
+                "baseline": repository["baseline"], "branch": repository["branch"], "base_branch": repository["base_branch"],
+                "task_files": files, "expected_fingerprint": assignment["input_tree_fingerprint"],
+                "commit_message": f"feat: {title[:72]}", "pr_title": title, "pr_body": body,
+                "log_dir": str(log_dir), "check_timeout_seconds": assignment.get("check_timeout_seconds", assignment["timeout_seconds"])}
+        input_path = log_dir / "input.json"
+        if input_path.exists() and _load_json(input_path) != spec:
+            raise WorkflowError("immutable command delivery input changed")
+        if not input_path.exists():
+            workflow_tools.atomic_write_json(input_path, spec)
+        started = self.now()
+        self._append_event("command-started", action_id=assignment["action_id"], artifact=str(input_path))
+        result = delivery_tools.Delivery(spec, run_process=self.delivery_runner).run(verify_only=verify_only or assignment.get("verify_only", False))
+        evidence_path = log_dir / f"result-{uuid4().hex}.json"
+        workflow_tools.atomic_write_json(evidence_path, result)
+        artifact = artifact_guard.artifact_skeleton(path, assignment)
+        artifact.update({key: result[key] for key in ("branch", "base_branch", "commits", "pr_url", "checks",
+                                                     "head_sha", "pushed_head_sha", "checked_head_sha", "check_policy")})
+        artifact["command_evidence"] = _reference(evidence_path)
+        artifact["delivery_outcome"] = result["status"]
+        artifact["status"] = "complete" if result["status"] == "complete" else "blocked"
+        artifact["blockers"] = [] if artifact["status"] == "complete" else [{
+            "id": "BLOCK-DELIVERY", "kind": result["kind"] or "infrastructure", "summary": result["summary"],
+            "evidence_path": str(evidence_path),
+            "required_action": "Wait for required CI, then resume delivery." if result["status"] == "pending" else
+                "Inspect the delivery evidence; restore external access or resolve the compatible change-related failure, then resume.",
+        }]
+        output = Path(assignment["output_artifact"])
+        if output.exists():
+            snapshot = log_dir / f"artifact-{_sha256(output)}.json"
+            if not snapshot.exists():
+                shutil.copyfile(output, snapshot)
+        workflow_tools.atomic_write_json(output, artifact)
+        return {"action_id": assignment["action_id"], "executor": "command", "status": "accepted",
+                "cleanup_status": "complete", "started_at": started, "ended_at": self.now(),
+                "elapsed_seconds": result["elapsed_seconds"], "output_artifact": assignment["output_artifact"]}
+
     def _execute_assignments(self, paths: list[Path]) -> BatchResult:
         self._install_actions(paths)
         with RunLock(self.run_dir):
@@ -1040,6 +1176,12 @@ class WorkflowEngine:
             for action in run["next_actions"]:
                 action["status"] = "working"
                 assignment = _load_json(Path(action["assignment_path"]))
+                if assignment.get("execution_mode") == "artifact-repair":
+                    repair = next(item for item in run["artifact_repairs"].values()
+                                  if item["assignment"]["path"] == action["assignment_path"])
+                    if repair.get("launch_started_at"):
+                        raise WorkflowError("artifact repair launch was already claimed; refusing to relaunch")
+                    repair["launch_started_at"] = self.now()
                 repo_id = assignment.get("repo_id")
                 if assignment["project_file_access"] == "write" and repo_id:
                     if run["repositories"][repo_id].get("active_writer") not in {
@@ -1068,12 +1210,19 @@ class WorkflowEngine:
         allow_existing = any(
             Path(_load_json(path)["output_artifact"]).exists() for path in paths
         )
-        code, manifest = self.batch_runner(
-            paths,
-            run_dir=self.run_dir,
-            worker_runtime=self.worker_runtime,
-            allow_existing=allow_existing,
-        )
+        command_paths = [path for path in paths if _load_json(path).get("execution_mode") == "command"]
+        worker_paths = [path for path in paths if path not in command_paths]
+        if command_paths:
+            with ThreadPoolExecutor(max_workers=len(command_paths) + bool(worker_paths)) as pool:
+                commands = [pool.submit(self._execute_delivery_command, path) for path in command_paths]
+                workers = pool.submit(self.batch_runner, worker_paths, run_dir=self.run_dir,
+                                      worker_runtime=self.worker_runtime, allow_existing=allow_existing) if worker_paths else None
+                code, manifest = workers.result() if workers else (0, {"workers": []})
+                manifest["commands"] = [future.result() for future in commands]
+        else:
+            code, manifest = self.batch_runner(
+                worker_paths, run_dir=self.run_dir, worker_runtime=self.worker_runtime, allow_existing=allow_existing,
+            )
         manifest_dir = self.run_dir / "supervisor"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         manifest_hash = hashlib.sha256(
@@ -1084,7 +1233,7 @@ class WorkflowEngine:
             workflow_tools.atomic_write_json(manifest_path, manifest)
 
         by_action = {
-            worker["action_id"]: worker for worker in manifest.get("workers", [])
+            worker["action_id"]: worker for worker in [*manifest.get("workers", []), *manifest.get("commands", [])]
         }
         accepted: list[tuple[dict[str, Any], dict[str, Any]]] = []
         rejected: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1142,10 +1291,11 @@ class WorkflowEngine:
                     "ended_at": worker.get("ended_at") or self.now(),
                     "output_artifact": assignment["output_artifact"],
                 }
-                if existing_agent is None:
-                    agents["agents"].append(agent_record)
-                else:
-                    existing_agent.update(agent_record)
+                if assignment.get("execution_mode") != "command":
+                    if existing_agent is None:
+                        agents["agents"].append(agent_record)
+                    else:
+                        existing_agent.update(agent_record)
                 repo_id = assignment.get("repo_id")
                 if repo_id:
                     repository = run["repositories"][repo_id]
@@ -1161,6 +1311,7 @@ class WorkflowEngine:
                         worker = dict(worker)
                         worker["status"] = "rejected"
                         worker["reason"] = str(error)
+                        worker.update(artifact_guard.rejection_details(error))
                     else:
                         self._record_accepted_reference(run, assignment, output_path)
                         accepted.append((assignment, artifact))
@@ -1190,6 +1341,8 @@ class WorkflowEngine:
                 action_id=assignment["action_id"],
                 artifact=assignment["output_artifact"],
                 reason=worker.get("reason"),
+                error_code=worker.get("error_code"),
+                error_path=worker.get("error_path"),
                 next_action=None,
             )
 
@@ -1199,12 +1352,100 @@ class WorkflowEngine:
             )
         return BatchResult(tuple(accepted), tuple(rejected), manifest_path)
 
-    def _run_with_replacements(self, paths: list[Path]) -> tuple[dict[str, Any], ...]:
-        current = paths
-        accepted: list[dict[str, Any]] = []
-        replacement_limit = self.load_run()["retry_limits"][
-            "worker_replacements_per_stage"
+    def _repair_redirect(self, path: Path) -> Path:
+        assignment = _load_json(path)
+        run = self.load_run()
+        repair = run.get("artifact_repairs", {}).get(assignment["action_id"])
+        if not repair:
+            return path
+        repair_path = Path(repair["assignment"]["path"])
+        if _reference(repair_path) != repair["assignment"]:
+            raise WorkflowError("immutable artifact repair assignment changed")
+        repaired = _load_json(repair_path)
+        accepted = run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
+        # Only an explicit external-condition resume after a valid blocked repair
+        # can create new source work. A crash never spends a fresh repair budget.
+        if (run.get("external_resume_generation", 0) > repair["resume_generation"]
+                and repaired["action_id"] in accepted):
+            return path
+        return repair_path
+
+    def _artifact_repair_assignment(self, assignment: dict[str, Any]) -> Path:
+        original_path = self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json"
+        redirected = self._repair_redirect(original_path)
+        if redirected != original_path:
+            return redirected
+        output = Path(assignment["output_artifact"])
+        payload = _load_json(output)
+        artifact_guard.repairable_result(payload, output)
+        repair = dict(assignment)
+        repair["action_id"] = assignment["action_id"] + ":artifact-repair-1"
+        repair["created_at"] = self.now()
+        repair["execution_mode"] = "artifact-repair"
+        repair["thinking"] = "medium"
+        repair["timeout_seconds"] = 300
+        repair["project_file_access"] = repair["git_access"] = repair["forge_access"] = "none"
+        repair["repositories"] = [{**repo, "access": "read"} for repo in assignment["repositories"]]
+        states = {
+            repo["repo_id"]: workflow_tools.repository_state(Path(repo["worktree"]))
+            for repo in repair["repositories"]
+        }
+        repair["input_tree_fingerprint"] = states[assignment["repo_id"]]["fingerprint"]
+        repair["repair_of"] = {
+            "assignment": _reference(original_path),
+            "artifact": _reference(output),
+            "evidence": [_reference(path) for path in sorted(workflow_tools.artifact_evidence_paths(payload))],
+            "repository_states": states,
+        }
+        repair["output_artifact"] = str(output.with_name(f"{output.stem}-artifact-repair-1.json"))
+        repair["instructions"] = [
+            "Repair only missing blockers[*].kind using the existing blocker text and evidence.",
+            "Initialize the output from this assignment; it copies the original semantic payload.",
+            "Do not change existing fields, run tests, or modify project/Git/forge state.",
+            "If classification is ambiguous, leave the field missing and explain why in the worker log.",
         ]
+        path = self.run_dir / "assignments" / f"{_slug(repair['action_id'])}.json"
+        if not path.exists():
+            workflow_tools.atomic_write_json(path, repair)
+        artifact_guard.validate_assignment(_load_json(path))
+        with RunLock(self.run_dir):
+            current = self.load_run()
+            current.setdefault("artifact_repairs", {})[assignment["action_id"]] = {
+                "assignment": _reference(path),
+                "resume_generation": current.get("external_resume_generation", 0),
+            }
+            self._save_run(current)
+        return path
+
+    def _run_with_replacements(self, paths: list[Path]) -> tuple[dict[str, Any], ...]:
+        current = [self._repair_redirect(path) for path in paths]
+        accepted: list[dict[str, Any]] = []
+        run = self.load_run()
+        replacement_limit = run["retry_limits"]["worker_replacements_per_stage"]
+        repair_enabled = run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
+        # Recovered repairs retain their accepted result, including real blockers.
+        pending = []
+        for path in current:
+            assignment = _load_json(path)
+            refs = run["repositories"].get(assignment.get("repo_id"), {}).get("accepted_artifacts", {})
+            reference = refs.get(assignment["action_id"])
+            if assignment.get("execution_mode") == "artifact-repair" and reference:
+                if _reference(Path(reference["path"])) != reference:
+                    raise WorkflowError("accepted artifact repair evidence changed")
+                accepted.append(_load_json(Path(reference["path"])))
+            else:
+                repair = next((item for item in run.get("artifact_repairs", {}).values()
+                               if item["assignment"]["path"] == str(path.resolve())), {})
+                if assignment.get("execution_mode") == "artifact-repair" and repair.get("launch_started_at"):
+                    self._block(
+                        summary=f"Artifact repair {assignment['action_id']} was already launched without an accepted result.",
+                        evidence_path=self.run_dir / "run.json",
+                        required_action="Inspect the preserved repair output and supervisor evidence; its one attempt is exhausted and source work will not be replayed.",
+                        kind="decision", repo_id=assignment.get("repo_id"),
+                    )
+                    return tuple(accepted)
+                pending.append(path)
+        current = pending
         replacement_round = 0
         while current:
             result = self._execute_assignments(current)
@@ -1213,6 +1454,23 @@ class WorkflowEngine:
                 break
             replacements: list[Path] = []
             for assignment, worker in result.rejected:
+                is_repair = assignment.get("execution_mode") == "artifact-repair"
+                if repair_enabled and not is_repair and worker.get("error_code") == "missing-field" and re.fullmatch(
+                    r"\$\.blockers\[[0-9]+\]\.kind", worker.get("error_path", "")
+                ):
+                    try:
+                        replacements.append(self._artifact_repair_assignment(assignment))
+                        continue
+                    except (OSError, ValueError, artifact_guard.ValidationError) as error:
+                        worker = {**worker, "reason": str(error), "error_code": "invalid-evidence"}
+                if is_repair or (repair_enabled and worker.get("error_code") in {"invalid-evidence", "missing-field"}):
+                    self._block(
+                        summary=f"Artifact evidence rejected for {assignment['action_id']}: {worker.get('reason')}",
+                        evidence_path=result.manifest_path,
+                        required_action="Inspect the preserved artifact/evidence and resolve the reported decision; source work was not replayed.",
+                        kind="decision", repo_id=assignment.get("repo_id"),
+                    )
+                    return tuple(accepted)
                 if replacement_round < replacement_limit:
                     replacements.append(self._replacement(assignment))
                     continue
@@ -1227,7 +1485,8 @@ class WorkflowEngine:
                     repo_id=assignment.get("repo_id"),
                 )
                 return tuple(accepted)
-            replacement_round += 1
+            if any(_load_json(path).get("execution_mode") != "artifact-repair" for path in replacements):
+                replacement_round += 1
             current = replacements
         return tuple(accepted)
 
@@ -1415,6 +1674,11 @@ class WorkflowEngine:
     # ---------- Phase implementations ----------
 
     def execute_phase(self, phase: str) -> str:
+        run = self.load_run()
+        if run["status"] in {"blocked", "failed", "complete"}:
+            return run["status"]
+        if run["phase"] != phase:
+            return run["phase"]  # Reconciliation superseded the saved node's intent.
         handler = getattr(self, f"phase_{phase.replace('-', '_')}", None)
         if handler is None:
             raise WorkflowError(f"no phase handler for {phase}")
@@ -2692,18 +2956,66 @@ class WorkflowEngine:
         self, repo_id: str
     ) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
         values = self._artifacts(repo_id=repo_id, stage="deliver", kind="delivery")
-        complete = [item for item in values if item[1].get("status") == "complete"]
-        return complete[-1] if complete else None
+        return values[-1] if values and values[-1][1].get("status") == "complete" else None
 
     def _pipeline_fix_count(self, repo_id: str) -> int:
         return len(
             self._artifacts(repo_id=repo_id, stage="pipeline-fix", kind="result")
         )
 
+    def _handle_delivery_outcomes(self, artifacts: Iterable[dict[str, Any]]) -> str:
+        pipeline_fix_assignments: list[Path] = []
+        for artifact in artifacts:
+            if artifact.get("status") == "complete":
+                continue
+            code_blockers = [b for b in artifact.get("blockers", []) if b["kind"] == "code"]
+            repo_id = artifact["repo_id"]
+            count = self._pipeline_fix_count(repo_id)
+            limit = self.load_run()["retry_limits"]["pipeline_fix_cycles"]
+            if code_blockers and count < limit:
+                pipeline_fix_assignments.append(self.build_assignment(
+                    stage="pipeline-fix", repo_id=repo_id, scope=f"cycle-{count + 1}",
+                    inputs=self._canonical_inputs(self.load_run(), repo_id),
+                    instructions=[
+                        "Fix all compatible change-related pipeline failures in one batch.",
+                        "Run affected local validation once; do not modify delivery/Git state.",
+                    ],
+                    validation_commands=self._plan_commands(repo_id),
+                    validation_ids=self._plan_validation_ids(repo_id),
+                ))
+                continue
+            self._block_from_artifact(artifact)
+            return "blocked"
+        if pipeline_fix_assignments:
+            for fix in self._run_with_replacements(pipeline_fix_assignments):
+                if fix.get("status") != "complete":
+                    self._block_from_artifact(fix)
+                    return "blocked"
+        return "blocked" if self.load_run()["status"] == "blocked" else "deliver"
+
     def phase_deliver(self) -> str:
         run = self.load_run()
+        recovered_failures = []
+        for repo_id in sorted(run["repositories"]):
+            deliveries = self._artifacts(repo_id=repo_id, stage="deliver", kind="delivery")
+            if not deliveries:
+                continue
+            path, artifact, _assignment = deliveries[-1]
+            if artifact.get("status") == "complete" or not any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+                continue
+            fixes = self._artifacts(repo_id=repo_id, stage="pipeline-fix", kind="result")
+            if not any(self._assignment_pins(writer, path, _sha256(path)) for _p, _a, writer in fixes):
+                recovered_failures.append(artifact)
+        if recovered_failures:
+            return self._handle_delivery_outcomes(recovered_failures)
         assignments: list[Path] = []
         for repo_id in sorted(run["repositories"]):
+            pending = next((Path(action["assignment_path"]) for action in run["next_actions"]
+                            if action.get("repo_id") == repo_id and action.get("assignment_path")
+                            and _load_json(Path(action["assignment_path"]))["stage"] == "deliver"), None)
+            if pending is not None:
+                assignments.append(pending)
+                continue
             if self._latest_delivery(repo_id) is not None:
                 continue
             attempts = (
@@ -2724,44 +3036,7 @@ class WorkflowEngine:
                 )
             )
         if assignments:
-            artifacts = self._run_with_replacements(assignments)
-            pipeline_fix_assignments: list[Path] = []
-            for artifact in artifacts:
-                if artifact.get("status") == "complete":
-                    continue
-                code_blockers = [
-                    blocker
-                    for blocker in artifact.get("blockers", [])
-                    if blocker["kind"] == "code"
-                ]
-                repo_id = artifact["repo_id"]
-                count = self._pipeline_fix_count(repo_id)
-                limit = self.load_run()["retry_limits"]["pipeline_fix_cycles"]
-                if code_blockers and count < limit:
-                    pipeline_fix_assignments.append(
-                        self.build_assignment(
-                            stage="pipeline-fix",
-                            repo_id=repo_id,
-                            scope=f"cycle-{count + 1}",
-                            inputs=self._canonical_inputs(self.load_run(), repo_id),
-                            instructions=[
-                                "Fix all compatible change-related pipeline failures in one batch.",
-                                "Run affected local validation once; do not modify delivery/Git state.",
-                            ],
-                            validation_commands=self._plan_commands(repo_id),
-                            validation_ids=self._plan_validation_ids(repo_id),
-                        )
-                    )
-                    continue
-                self._block_from_artifact(artifact)
-                return "blocked"
-            if pipeline_fix_assignments:
-                fixes = self._run_with_replacements(pipeline_fix_assignments)
-                for fix in fixes:
-                    if fix.get("status") != "complete":
-                        self._block_from_artifact(fix)
-                        return "blocked"
-            return "deliver"
+            return self._handle_delivery_outcomes(self._run_with_replacements(assignments))
 
         # A delivery-only commit preserves the content fingerprint, so passing
         # writer evidence is reused. Any pipeline source change still invalidates it.
@@ -2816,8 +3091,8 @@ class WorkflowEngine:
 
     def phase_complete(self) -> str:
         run = self.load_run()
-        if run["next_actions"] or run["blockers"]:
-            raise WorkflowError("completion audit found pending actions or blockers")
+        if run["next_actions"] or run["blockers"] or run.get("pending_delivery_refresh"):
+            raise WorkflowError("completion audit found pending actions, delivery refresh, or blockers")
         unclosed_agents = [
             agent["name"]
             for agent in self.load_agents()["agents"]
@@ -2880,6 +3155,7 @@ class WorkflowEngine:
         worker_runtime: str = "auto",
         report_root: Path | None = None,
         now: Callable[[], str] = workflow_tools.utc_now,
+        delivery_runner: Callable[..., subprocess.CompletedProcess[str]] = delivery_tools.run_process,
     ) -> "WorkflowEngine":
         run_dir = run_dir.resolve()
         if run_dir.exists() and any(run_dir.iterdir()):
@@ -2943,7 +3219,19 @@ class WorkflowEngine:
                 )
             initial_status = artifact_dir / "initial-status.txt"
             initial_status.write_text(initial_status_value + "\n", encoding="utf-8")
+            try:
+                remote = _git(worktree, "config", "--get", "remote.origin.url")
+            except WorkflowError:
+                remote = ""
+            github = delivery_tools.github_repository(remote)
+            check_timeout = raw.get("delivery_check_timeout_seconds", 1800)
+            if type(check_timeout) is not int or not 0 <= check_timeout <= 1800:
+                raise WorkflowError("delivery_check_timeout_seconds must be an integer between 0 and 1800")
             repositories[repo_id] = {
+                "delivery_check_timeout_seconds": check_timeout,
+                "delivery_executor": "github-command" if github else "worker",
+                "delivery_repository": github,
+                "delivery_evidence_version": 2,
                 "root": str(root),
                 "worktree": str(worktree),
                 "artifact_dir": str(artifact_dir.resolve()),
@@ -3008,6 +3296,7 @@ class WorkflowEngine:
             "updated_at": created_at,
             "status": "working",
             "phase": "bootstrap",
+            "worker_reasoning_policy": "stage-v1",
             **policy,
             "request_path": str(request_path.resolve()),
             "request_sha256": _sha256(request_path),
@@ -3018,6 +3307,7 @@ class WorkflowEngine:
             "plan_review": None,
             "retry_limits": {
                 "worker_replacements_per_stage": 1,
+                "artifact_repairs_per_action": 1,
                 "contract_revisions": 1,
                 "plan_revision_cycles": 1,
                 "validation_fix_cycles": 1,
@@ -3044,6 +3334,7 @@ class WorkflowEngine:
             skill_dir=skill_dir,
             codebase_design_dir=codebase_design_dir,
             batch_runner=batch_runner,
+            delivery_runner=delivery_runner,
             worker_runtime=worker_runtime,
             report_root=report_root,
             now=now,
@@ -3115,7 +3406,7 @@ def build_graph(engine: WorkflowEngine, checkpointer: Any) -> Any:
     builder: Any = StateGraph(WorkflowState)
 
     def reconcile_node(state: WorkflowState) -> dict[str, str]:
-        phase = engine.reconcile()
+        phase = engine.reconcile(refresh_completed=False)
         return {
             "run_dir": str(engine.run_dir),
             "last_transition": f"reconciled:{phase}",
@@ -3135,6 +3426,12 @@ def build_graph(engine: WorkflowEngine, checkpointer: Any) -> Any:
             return "budget_checkpoint"
         return PHASE_NODE[run["phase"]]
 
+    def recovery_node(state: WorkflowState) -> dict[str, str]:
+        del state
+        phase = engine.reconcile(refresh_completed=True)
+        return {"run_dir": str(engine.run_dir), "last_transition": f"recovered:{phase}"}
+
+    builder.add_node("recover", recovery_node)
     builder.add_node("reconcile", reconcile_node)
 
     def terminal_node(state: WorkflowState) -> dict[str, str]:
@@ -3176,19 +3473,24 @@ def build_graph(engine: WorkflowEngine, checkpointer: Any) -> Any:
         return {"last_transition": f"plan-review:{outcome}", "outcome": outcome}
 
     builder.add_node("plan_review", plan_review_node)
-    builder.add_edge(START, "reconcile")
-    builder.add_conditional_edges(
-        "reconcile",
-        route_after_reconcile,
-        {
-            **{node: node for node in PHASE_NODE.values()},
-            "terminal": "terminal",
-            "budget_checkpoint": "budget_checkpoint",
-        },
-    )
+    builder.add_edge(START, "recover")
+    for reconciliation_node in ("recover", "reconcile"):
+        builder.add_conditional_edges(
+            reconciliation_node,
+            route_after_reconcile,
+            {
+                **{node: node for node in PHASE_NODE.values()},
+                "terminal": "terminal",
+                "budget_checkpoint": "budget_checkpoint",
+            },
+        )
     for node_name in PHASE_NODE.values():
         if node_name == "complete":
-            builder.add_edge(node_name, END)
+            builder.add_conditional_edges(
+                node_name,
+                lambda _state: "terminal" if engine.load_run()["status"] in {"complete", "blocked", "failed"} else "reconcile",
+                {"terminal": END, "reconcile": "reconcile"},
+            )
         else:
             builder.add_edge(node_name, "reconcile")
     builder.add_edge("terminal", END)

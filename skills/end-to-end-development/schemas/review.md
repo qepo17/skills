@@ -6,6 +6,8 @@ Initialize the assigned file first:
 python3 <validator_path> init <assignment_path>
 ```
 
+For a review that cannot finish, follow the [blocker contract](blockers.md). Must-fix findings from a finished review are not stage blockers.
+
 Round one uses `mode: full` and reviews the entire baseline-to-worktree state. New runs stop after that review and at most one fix batch. A resumed legacy run may schedule round two with `mode: verification` and exactly the assigned `verified_finding_ids`; it verifies the fix batch and affected hunks rather than repeating the whole review.
 
 Each finding contains stable ID, category (`standards` or `spec`), severity, actionable flag, `disposition` (`must-fix` or `advisory`), optional requirement ID, path/line, summary, and concrete evidence.

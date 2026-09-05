@@ -26,6 +26,7 @@ from typing import Any, Iterable
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
+import delivery_tools  # noqa: E402
 import worker_supervisor  # noqa: E402
 
 FORCE_FULL_RISKS = {
@@ -182,47 +183,35 @@ def _git(
 
 
 def worktree_fingerprint(worktree: Path) -> str:
-    """Return an efficient, commit-independent fingerprint of current content.
+    """Preserve the public v3 fingerprint seam shared with standalone delivery."""
+    return delivery_tools.content_fingerprint(worktree)
 
-    A temporary index lets Git reuse its stat cache and hash only changed or
-    untracked files. ``write-tree`` then produces the same identity before and
-    after a delivery-only commit without mutating the user's real index.
-    """
-    root = Path(_git(worktree, "rev-parse", "--show-toplevel").decode().strip()).resolve()
-    index_value = _git(root, "rev-parse", "--git-path", "index").decode().strip()
-    source_index = Path(index_value)
-    if not source_index.is_absolute():
-        source_index = root / source_index
-    descriptor, temporary_name = tempfile.mkstemp(prefix="e2e-content-index-")
-    os.close(descriptor)
-    temporary_index = Path(temporary_name)
-    try:
-        if source_index.is_file():
-            temporary_index.write_bytes(source_index.read_bytes())
-        else:
-            temporary_index.unlink(missing_ok=True)
-        git_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
-        _git(root, "add", "--all", "--", env=git_env)
-        tree = _git(root, "write-tree", env=git_env).strip()
-        digest = hashlib.sha256(b"end-to-end-development-content-v3\0" + tree)
 
-        # A parent tree stores only each submodule commit. Include recursive
-        # content identities so uncommitted submodule changes also invalidate.
-        staged = _git(root, "ls-files", "--stage", "-z", env=git_env)
-        for record in sorted(item for item in staged.split(b"\0") if item):
-            metadata, separator, encoded_relative = record.partition(b"\t")
-            if not separator or not metadata.startswith(b"160000 "):
-                continue
-            relative = encoded_relative.decode("utf-8", errors="surrogateescape")
-            submodule = root / relative
-            if (submodule / ".git").exists():
-                digest.update(b"\0submodule\0")
-                digest.update(encoded_relative)
-                digest.update(b"\0")
-                digest.update(worktree_fingerprint(submodule).encode())
-        return digest.hexdigest()
-    finally:
-        temporary_index.unlink(missing_ok=True)
+def repository_state(worktree: Path) -> dict[str, str]:
+    """Pin content and semantic Git state without depending on index stat-cache bytes."""
+    return {
+        "fingerprint": worktree_fingerprint(worktree),
+        "head": _git(worktree, "rev-parse", "HEAD").decode().strip(),
+        "branch": _git(worktree, "branch", "--show-current").decode().strip(),
+        "index_sha256": hashlib.sha256(_git(worktree, "ls-files", "--stage", "-z")).hexdigest(),
+    }
+
+
+def artifact_evidence_paths(value: Any) -> set[Path]:
+    """Collect on-disk evidence, not narrative strings or arbitrary source paths."""
+    paths: set[Path] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"evidence_path", "log_path", "status_short_path"} and isinstance(child, str):
+                paths.add(Path(child).resolve())
+            elif key == "source_artifact" and isinstance(child, dict):
+                paths.add(Path(child["path"]).resolve())
+            else:
+                paths.update(artifact_evidence_paths(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.update(artifact_evidence_paths(child))
+    return paths
 
 
 def normalize_worker_artifact(
@@ -237,6 +226,11 @@ def normalize_worker_artifact(
     and status snapshots so a correct result is not retried because a model
     copied stale mechanical metadata into its JSON artifact.
     """
+    if assignment.get("execution_mode") == "artifact-repair":
+        for repository in assignment["repositories"]:
+            expected = assignment["repair_of"]["repository_states"][repository["repo_id"]]
+            if repository_state(Path(repository["worktree"])) != expected:
+                raise artifact_guard.ValidationError("artifact-only repair changed pinned repository/Git state")
     resolved_assignment = assignment_path.resolve()
     artifact["assignment_path"] = str(resolved_assignment)
     artifact["assignment_sha256"] = hashlib.sha256(
@@ -350,6 +344,7 @@ def run_metrics(run_dir: Path) -> dict[str, Any]:
         "wall_minutes": round((updated - created).total_seconds() / 60, 2),
         "active_worker_minutes": round(_union_minutes(all_intervals), 2),
         "worker_attempts": len(agents),
+        "command_attempts": sum(event.get("event") == "command-started" for event in events),
         "resumes": sum(event.get("event") == "resumed" for event in events),
         "blocked_events": sum(event.get("event") == "blocked" for event in events),
         "event_counts": dict(
@@ -370,8 +365,8 @@ def _worker_prompt(assignment_path: Path) -> str:
     return (
         f"Execute the immutable assignment at {assignment_path}. Treat its hash-pinned inputs "
         "as authoritative. If the output does not exist, initialize its stage-specific skeleton "
-        "with the assignment's validator init command. Read only artifact_schema_path, not the "
-        "full coordinator contract. Write only the assigned output, allowed project files, and "
+        "with the assignment's validator init command. Read artifact_schema_path and its linked blocker "
+        "contract, not the full coordinator contract. Write only the assigned output, allowed project files, and "
         "log directory. Complete semantic fields and command outcomes; do not spend time "
         "recomputing assignment, Git-status, content-fingerprint, or command hashes because the "
         "coordinator normalizes and validates those after settlement. Do not spawn nested agents. "
@@ -448,6 +443,11 @@ def _enforce_user_plan_approval(
             )
 
 
+def effective_thinking(assignment: dict[str, Any], run: dict[str, Any]) -> str:
+    policy = assignment.get("reasoning_policy", run.get("worker_reasoning_policy", "legacy-xhigh"))
+    return worker_supervisor.runtime_thinking(str(assignment.get("thinking", "xhigh")), policy=policy)
+
+
 def recover_assignment_worker(
     assignment_path: Path,
     assignment: dict[str, Any],
@@ -505,9 +505,7 @@ def recover_assignment_worker(
         timeout_seconds=assignment["timeout_seconds"],
         runtime=runtime,
         prompt=_worker_prompt(assignment_path.resolve()),
-        thinking=worker_supervisor.runtime_thinking(
-            str(assignment.get("thinking", "xhigh"))
-        ),
+        thinking=str(record["thinking"]) if record and record.get("thinking") else effective_thinking(assignment, run),
     )
     recovered = supervisor.recover(request)
     if recovered is not None:
@@ -640,7 +638,7 @@ def run_assignment_batch(
             timeout_seconds=assignment["timeout_seconds"],
             runtime=resolved_runtime,
             prompt=_worker_prompt(path),
-            thinking=worker_supervisor.runtime_thinking(assignment["thinking"]),
+            thinking=effective_thinking(assignment, run),
         )
         for path, assignment in loaded
     ]
@@ -683,7 +681,7 @@ def run_assignment_batch(
             "output_artifact": assignment["output_artifact"],
             "runtime": resolved_runtime,
             "model": DEFAULT_WORKER_MODEL,
-            "thinking": worker_supervisor.runtime_thinking(assignment["thinking"]),
+            "thinking": effective_thinking(assignment, run),
             "status": "rejected",
         }
         if outcome["timed_out"]:
@@ -719,6 +717,7 @@ def run_assignment_batch(
                 artifact_guard.ValidationError,
             ) as error:
                 result["reason"] = str(error)
+                result.update(artifact_guard.rejection_details(error))
         entries.append(result)
         with batch_log.open("a", encoding="utf-8") as handle:
             handle.write(

@@ -873,6 +873,76 @@ class ArtifactGuardDesignChallengeTests(unittest.TestCase):
         )
         artifact_guard.validate_assignment(assignment)
 
+    def test_typed_blocker_only_writes_an_active_unaccepted_output(self) -> None:
+        output = self.artifact_dir / "validation.json"
+        assignment_path, assignment = self.assignment(
+            stage="validate", output_kind="result", output_path=output, input_paths=[self.contract],
+        )
+        artifact_guard.initialize_artifact(assignment_path)
+        run_path = self.root / "run" / "run.json"
+        run = {"run_id": self.run_id, "next_actions": [{"assignment_path": str(assignment_path),
+               "output_artifact": str(output)}], "accepted_artifacts": {}, "repositories": {}}
+        self.write_json(run_path, run)
+        evidence = self.log_dir / "environment.log"
+        evidence.write_text("The test service is unavailable.\n")
+        artifact_guard.record_blocker(
+            assignment_path, kind="environment", summary="Test service unavailable.",
+            evidence_path=evidence, required_action="Restore the isolated test service.",
+        )
+        data = json.loads(output.read_text())
+        self.assertEqual("blocked", data["status"])
+        artifact_guard.validate_blockers(data["blockers"])
+        self.assertEqual("environment", data["blockers"][0]["kind"])
+        before = output.read_bytes()
+        run["accepted_artifacts"]["validation"] = {"path": str(output), "sha256": self.sha(output)}
+        self.write_json(run_path, run)
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "accepted artifact"):
+            artifact_guard.record_blocker(assignment_path, kind="code", summary="No overwrite",
+                                         evidence_path=evidence, required_action="Inspect")
+        self.assertEqual(before, output.read_bytes())
+        run["accepted_artifacts"] = {}
+        run["next_actions"] = []
+        self.write_json(run_path, run)
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "active assignment"):
+            artifact_guard.record_blocker(assignment_path, kind="code", summary="No arbitrary writes",
+                                         evidence_path=evidence, required_action="Inspect")
+        self.assertEqual(before, output.read_bytes())
+
+    def test_missing_blocker_kind_has_a_structured_failure_location(self) -> None:
+        evidence = self.log_dir / "test.log"
+        evidence.write_text("unavailable\n")
+        with self.assertRaises(artifact_guard.ValidationError) as raised:
+            artifact_guard.validate_blockers([{"id": "BLOCK-001", "summary": "Unavailable",
+                                              "evidence_path": str(evidence), "required_action": "Restore"}])
+        self.assertEqual("missing-field", raised.exception.code)
+        self.assertEqual("$.blockers[0].kind", raised.exception.path)
+        self.assertIn("missing required field 'kind'", str(raised.exception))
+
+    def test_delivery_rejects_checks_for_a_different_head(self) -> None:
+        output = self.artifact_dir / "delivery.json"
+        assignment_path, assignment = self.assignment(
+            stage="deliver", output_kind="delivery", output_path=output,
+            input_paths=[self.contract], thinking="medium",
+        )
+        assignment.update(git_access="write", forge_access="write", delivery_evidence_version=2)
+        self.write_json(assignment_path, assignment)
+        log = self.log_dir / "checks.log"
+        log.write_text("Checks passed for the earlier commit.\n")
+        artifact = artifact_guard.artifact_skeleton(assignment_path, assignment)
+        artifact.update(
+            status="complete", branch="feat/example", base_branch="main",
+            commits=["a" * 40], pr_url="https://example.test/pull/1",
+            head_sha="a" * 40, pushed_head_sha="a" * 40, checked_head_sha="b" * 40,
+            check_policy={"status": "required", "required_checks": [{"name": "tests", "app_id": None}],
+                          "evidence": [{"path": str(log), "sha256": self.sha(log)}]},
+            checks=[{"name": "tests", "url": "https://example.test/check/1", "required": True,
+                     "state": "passed", "evidence_path": str(log)}], blockers=[],
+        )
+        self.write_json(output, artifact)
+        artifact_guard.CURRENT_ARTIFACT_PATH = output
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "head"):
+            artifact_guard.validate_delivery(artifact)
+
     def test_routes_medium_thinking_to_mechanical_stages_only(self) -> None:
         validation_output = self.artifact_dir / "validation-1.json"
         _, validation_assignment = self.assignment(

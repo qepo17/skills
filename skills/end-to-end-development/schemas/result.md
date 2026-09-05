@@ -6,7 +6,9 @@ Initialize the assigned file first:
 python3 <validator_path> init <assignment_path>
 ```
 
-Used by implementation, validation, batched fixes, and pipeline fixes.
+Used by implementation, validation, batched fixes, and pipeline fixes. For a stage that cannot finish, follow the [blocker contract](blockers.md) and prefer the typed `block` command.
+
+For `execution_mode: artifact-repair`, initialization copies the original result. Repair only missing existing blocker classifications from the pinned evidence. Keep all other semantic fields unchanged, including status, outcomes, validations, blocker text, and IDs. Do not run tests or write project/Git/forge state. The graph pins the original assignment/output, evidence files, content, HEAD, branch, and index; any mutation or failed repair blocks rather than starting another source writer.
 
 Required rules:
 

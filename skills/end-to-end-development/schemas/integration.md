@@ -6,6 +6,8 @@ Initialize the assigned file first:
 python3 <validator_path> init <assignment_path>
 ```
 
+For a stage that cannot finish, follow the [blocker contract](blockers.md) and use the typed `block` command.
+
 Integration is used only when the selected workflow requires it. Record:
 
 - one requirement-matrix row per requirement with repositories and existing validation evidence;
