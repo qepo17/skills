@@ -540,10 +540,14 @@ class WorkflowEngine:
                 self._record_accepted_reference(run, assignment, output_path)
                 self._apply_recovered_projection(run, assignment, artifact, output_path)
                 recovered.append((assignment, artifact))
-                agent_name = workflow_tools._agent_name(assignment)
+                worker = recovered_workers.get(assignment["action_id"], {})
+                agent_name = worker.get("agent_name") or next(
+                    (item["name"] for item in agents["agents"]
+                     if item["output_artifact"] == assignment["output_artifact"]),
+                    workflow_tools._agent_name(assignment),
+                )
                 if assignment.get("execution_mode") != "command" and not any(item["name"] == agent_name for item in agents["agents"]):
                     recovered_at = self.now()
-                    worker = recovered_workers.get(assignment["action_id"], {})
                     cleanup_status = worker.get("cleanup_status", "complete")
                     agents["agents"].append(
                         {

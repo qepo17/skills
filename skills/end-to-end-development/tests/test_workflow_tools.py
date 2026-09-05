@@ -243,6 +243,54 @@ class WorktreeFingerprintTests(unittest.TestCase):
             )
 
 
+class AgentNameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assignment = {
+            "run_id": "20260905T053000Z-kan-229-assigned-deconsolidation",
+            "action_id": "contract:global:v1:attempt-2",
+            "repo_id": None,
+            "stage": "contract",
+            "attempt": 2,
+        }
+
+    def test_reported_contract_name_obeys_herdr_rules(self) -> None:
+        name = workflow_tools._agent_name(self.assignment)
+        self.assertRegex(name, r"\Ae2e-global-contract-[a-f0-9]{8}-a2\Z")
+        self.assertLessEqual(len(name), 32)
+        self.assertEqual(name, workflow_tools._agent_name(dict(self.assignment)))
+
+    def test_names_are_bounded_and_sanitized_without_losing_identity(self) -> None:
+        names = set()
+        for repo in (None, "9" + "long-repo-" * 20, "API / Ünicode", "api___", "!!!"):
+            for attempt in (1, 2, 123, 10**40):
+                with self.subTest(repo=repo, attempt=attempt):
+                    assignment = {**self.assignment, "repo_id": repo, "attempt": attempt,
+                                  "action_id": f"plan:{repo}:attempt-{attempt}"}
+                    name = workflow_tools._agent_name(assignment)
+                    self.assertRegex(name, r"\A[a-z][a-z0-9_-]{0,31}\Z")
+                    self.assertNotIn(name, names)
+                    names.add(name)
+
+    def test_run_action_and_attempt_each_distinguish_names(self) -> None:
+        variants = [
+            {},
+            {"run_id": "20260905T053000Z-another-run"},
+            {"run_id": "20260906T053000Z-kan-229-assigned-deconsolidation"},
+            {"action_id": self.assignment["action_id"] + ":artifact-repair-1"},
+            {"attempt": 3},
+        ]
+        names = [workflow_tools._agent_name({**self.assignment, **change}) for change in variants]
+        self.assertEqual(len(variants), len(set(names)))
+
+    def test_truncated_labels_do_not_collapse_distinct_actions(self) -> None:
+        prefix = "same-long-repository-" * 10
+        names = [workflow_tools._agent_name({
+            **self.assignment, "repo_id": prefix + suffix,
+            "action_id": f"plan:{prefix}{suffix}:attempt-2",
+        }) for suffix in ("one", "two")]
+        self.assertNotEqual(*names)
+
+
 class BatchSupervisorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -512,12 +560,16 @@ class BatchSupervisorTests(unittest.TestCase):
         command_log = self.root / "herdr-commands.jsonl"
         fake_herdr.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, pathlib, sys\n"
+            "import json, pathlib, re, sys\n"
             f"log = pathlib.Path({str(command_log)!r})\n"
             "with log.open('a', encoding='utf-8') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:4] == ['status', 'server', '--json']:\n"
             "    print(json.dumps({'running': True, 'compatible': True, 'protocol': 20}))\n"
+            "elif sys.argv[1:3] == ['agent', 'start']:\n"
+            "    if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', sys.argv[3]):\n"
+            "        sys.exit('invalid Herdr agent name: ' + sys.argv[3])\n"
+            "    print(json.dumps({'result': {'ready': True}}))\n"
             "elif sys.argv[1:3] == ['workspace', 'create']:\n"
             "    print(json.dumps({'result': {'workspace': 'workspace-test', "
             "'root_pane': {'pane_id': 'pane-test'}}}))\n"
@@ -536,13 +588,79 @@ class BatchSupervisorTests(unittest.TestCase):
                 allow_existing=True,
             )
         commands = [json.loads(line) for line in command_log.read_text().splitlines()]
-        self.assertEqual(0, code)
+        self.assertEqual(0, code, manifest["workers"][0].get("reason"))
         self.assertEqual("accepted", manifest["workers"][0]["status"])
         self.assertIn(["workspace", "close", "workspace-test"], commands)
         self.assertNotIn(["pane", "close", "pane-test"], commands)
         self.assertEqual("herdr", manifest["workers"][0]["backend"])
         self.assertEqual("complete", manifest["workers"][0]["cleanup_status"])
         self.assertTrue(Path(manifest["batch_log"]).is_file())
+        name = manifest["workers"][0]["agent_name"]
+        self.assertRegex(name, r"\A[a-z][a-z0-9_-]{0,31}\Z")
+        create = next(command for command in commands if command[:2] == ["workspace", "create"])
+        self.assertEqual(name, create[create.index("--label") + 1])
+        for verb in ("start", "prompt", "wait"):
+            command = next(command for command in commands if command[:2] == ["agent", verb])
+            self.assertEqual(name, command[2])
+        records = list((self.root / "run" / "supervisor").glob("worker-*.json"))
+        self.assertEqual(1, len(records))
+        record = json.loads(records[0].read_text())
+        self.assertEqual(name, record["agent_name"])
+        self.assertEqual(name, record["handle_id"])
+
+
+class WorkerNameRecoveryTests(unittest.TestCase):
+    def test_recovery_keeps_the_recorded_name_even_without_a_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            assignment = {
+                "run_id": "20260905T053000Z-saved-run",
+                "action_id": "contract:global:v1:attempt-2",
+                "repo_id": None,
+                "stage": "contract",
+                "attempt": 2,
+                "cwd": directory,
+                "timeout_seconds": 30,
+            }
+            old_name = "20260905T053000Z-global-contract-8daf9d03-a2"
+            record_path = run_dir / "supervisor" / workflow_tools.worker_supervisor.WorkerSupervisor.record_name(assignment["action_id"])
+            record_path.parent.mkdir()
+            record_path.write_text(json.dumps({
+                "backend": "herdr", "runtime": "pi", "agent_name": old_name,
+                "handle_id": None, "thinking": "high",
+            }))
+            with mock.patch.object(workflow_tools.worker_supervisor, "WorkerSupervisor") as factory:
+                factory.record_name.return_value = record_path.name
+                outcome = {"agent_name": old_name, "cleanup_status": "complete"}
+                factory.return_value.recover.return_value = outcome
+                recovered = workflow_tools.recover_assignment_worker(
+                    run_dir / "assignment.json", assignment, run_dir=run_dir,
+                )
+                request = factory.return_value.recover.call_args.args[0]
+                self.assertEqual(old_name, request.agent_name)
+                self.assertEqual("high", request.thinking)
+                self.assertEqual(outcome, recovered)
+
+    def test_schema_v1_recovery_uses_the_legacy_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            assignment = {
+                "run_id": "20260905T053000Z-saved-run",
+                "action_id": "contract:global:v1:attempt-2",
+                "repo_id": None,
+                "stage": "contract",
+                "attempt": 2,
+                "cwd": directory,
+                "timeout_seconds": 30,
+            }
+            with mock.patch.object(workflow_tools.worker_supervisor, "WorkerSupervisor") as factory:
+                factory.record_name.return_value = "worker-unused.json"
+                factory.return_value.recover.return_value = None
+                workflow_tools.recover_assignment_worker(
+                    run_dir / "assignment.json", assignment, run_dir=run_dir,
+                )
+                request = factory.return_value.recover_legacy_herdr.call_args.args[0]
+                self.assertEqual("20260905T053000Z-global-contract-8daf9d03-a2", request.agent_name)
 
 
 class DeterministicReportTests(unittest.TestCase):
