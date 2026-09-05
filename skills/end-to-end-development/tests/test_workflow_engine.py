@@ -838,6 +838,38 @@ class LongHandoffBatch(FakeSuccessfulBatch):
         return code, manifest
 
 
+class DisappearingSchemaBatch(FakeSuccessfulBatch):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_writes = 0
+        self.schema: Path | None = None
+        self.schema_content = ""
+
+    def __call__(self, paths: list[Path], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        assignment = json.loads(paths[0].read_text())
+        if assignment["stage"] == "implement":
+            if self.schema is not None:
+                # Recover the surviving artifact as the real supervisor does, without relaunch.
+                return 0, {"workers": [{"action_id": assignment["action_id"], "status": "accepted",
+                                      "agent_name": "recovered-schema", "cleanup_status": "complete",
+                                      "started_at": "2026-08-22T10:00:00Z", "ended_at": "2026-08-22T10:01:00Z"}]}
+            self.schema_content = Path(assignment["artifact_schema_path"]).read_text()
+            self.schema = Path(assignment["log_dir"]) / "temporary-result-schema.md"
+            self.schema.write_text(self.schema_content)
+            assignment["artifact_schema_path"] = str(self.schema)
+            paths[0].write_text(json.dumps(assignment))
+        code, manifest = super().__call__(paths, **kwargs)
+        if assignment["stage"] == "implement":
+            self.source_writes += 1
+            assert self.schema is not None
+            self.schema.unlink()
+            manifest["workers"][0].update(status="rejected", cleanup_status="complete",
+                error_code="invalid-evidence", error_path="$.artifact_schema_path",
+                reason=f"$.artifact_schema_path: does not exist: {self.schema}")
+            code = 1
+        return code, manifest
+
+
 class WorkflowEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1077,6 +1109,38 @@ class WorkflowEngineTests(unittest.TestCase):
                 mock.patch("builtins.print"):
             self.assertEqual(0, orchestrator.main())
         self.assertEqual("retry-result-handoff", invoke.call_args.args[1]["last_transition"])
+
+    def test_restored_schema_recovers_valid_result_without_a_source_replay(self) -> None:
+        batch = DisappearingSchemaBatch()
+        engine = self.initialize(batch)
+        config = {"configurable": {"thread_id": "schema-recovery"}, "recursion_limit": 150}
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertIn("$.artifact_schema_path: does not exist", engine.load_run()["blockers"][0]["summary"])
+        self.assertFalse(engine.resume_external_blockers())
+        with self.assertRaises(artifact_guard.ValidationError):
+            engine.retry_restored_schema()
+        assert batch.schema is not None
+        batch.schema.write_text(batch.schema_content)
+        self.assertFalse(engine.retry_result_handoff())
+        self.assertTrue(engine.retry_restored_schema())
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual("complete", engine.load_run()["status"])
+        self.assertEqual(1, batch.source_writes)
+        self.assertNotIn("artifact_repairs", engine.load_run())
+
+    def test_restored_schema_does_not_accept_stale_source_evidence(self) -> None:
+        batch = DisappearingSchemaBatch()
+        engine = self.initialize(batch)
+        build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "schema-stale"}, "recursion_limit": 150})
+        assert batch.schema is not None
+        batch.schema.write_text(batch.schema_content)
+        (self.worktree / "feature.txt").write_text("stale source\n")
+        before = engine.run_path.read_bytes()
+        with self.assertRaisesRegex(WorkflowError, "stale"):
+            engine.retry_restored_schema()
+        self.assertEqual(before, engine.run_path.read_bytes())
+        self.assertEqual(1, batch.source_writes)
 
     def test_engine_normalizes_assignment_metadata_from_its_own_intent(self) -> None:
         batch = FakeSuccessfulBatch()

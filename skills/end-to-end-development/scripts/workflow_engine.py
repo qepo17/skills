@@ -416,24 +416,29 @@ class WorkflowEngine:
 
     def retry_result_handoff(self) -> bool:
         """Opt in to one read-only repair of the exact overlong next_action rejection."""
+        return self._retry_rejected_result(kind="next-action-length")
+
+    def retry_restored_schema(self) -> bool:
+        """Recover an unchanged valid result after restoring its missing schema file."""
+        return self._retry_rejected_result(kind="restored-schema")
+
+    def _retry_rejected_result(self, *, kind: str) -> bool:
         run = self.load_run()
-        reason = "$.next_action: must be at most 300 characters"
+        error_path = "$.next_action" if kind == "next-action-length" else "$.artifact_schema_path"
         if (run["status"] != "blocked" or len(run["blockers"]) != 1 or run["next_actions"]
                 or run["retry_limits"].get("artifact_repairs_per_action", 0) != 1):
             return False
         blocker = run["blockers"][0]
         if (blocker["kind"] != "decision"
-                or not blocker["summary"].startswith("Artifact evidence rejected for ")
-                or not blocker["summary"].endswith(": " + reason)):
+                or not blocker["summary"].startswith("Artifact evidence rejected for ")):
             return False
         manifest_path = Path(blocker["evidence_path"]).resolve()
         if manifest_path.parent != (self.run_dir / "supervisor").resolve():
             return False
         matches = [worker for worker in _load_json(manifest_path).get("workers", [])
                    if worker.get("error_code") == "invalid-evidence"
-                   and worker.get("error_path") == "$.next_action"
-                   and worker.get("reason") == reason
-                   and blocker["summary"] == f"Artifact evidence rejected for {worker['action_id']}: {reason}"]
+                   and worker.get("error_path") == error_path
+                   and blocker["summary"] == f"Artifact evidence rejected for {worker['action_id']}: {worker.get('reason')}"]
         if len(matches) != 1:
             return False
         worker = matches[0]
@@ -441,6 +446,10 @@ class WorkflowEngine:
         if path != self.run_dir / "assignments" / f"{_slug(worker['action_id'])}.json":
             return False
         assignment = _load_json(path)
+        reason = ("$.next_action: must be at most 300 characters" if kind == "next-action-length" else
+                  f"$.artifact_schema_path: does not exist: {assignment['artifact_schema_path']}")
+        if worker.get("reason") != reason:
+            return False
         artifact_guard.validate_assignment(assignment)
         if (assignment["run_id"] != run["run_id"] or assignment["stage"] != run["phase"]
                 or assignment["action_id"] != worker["action_id"]
@@ -465,7 +474,11 @@ class WorkflowEngine:
         if any(ref["path"] == str(output) for ref in repo["accepted_artifacts"].values()):
             return False
         payload = _load_json(output)
-        artifact_guard.repairable_result(payload, output, kind="next-action-length")
+        if kind == "next-action-length":
+            artifact_guard.repairable_result(payload, output, kind=kind)
+        else:
+            artifact_guard.CURRENT_ARTIFACT_PATH = output
+            artifact_guard.validate_result(payload)
         # Never normalize stale source evidence into a fresh pass during recovery.
         state = workflow_tools.repository_state(Path(repo["worktree"]))
         if (payload["tree_fingerprint"] != state["fingerprint"]
@@ -473,16 +486,17 @@ class WorkflowEngine:
                 or Path(payload["git"]["status_short_path"]).read_text().strip()
                 != _git(Path(repo["worktree"]), "status", "--short").strip()):
             raise WorkflowError("rejected result has stale repository/Git evidence")
-        repair_path = self._artifact_repair_assignment(assignment, kind="next-action-length")
+        intent = self._artifact_repair_assignment(assignment, kind=kind) if kind == "next-action-length" else output
+        transition = "retry-result-handoff" if kind == "next-action-length" else "retry-restored-schema"
         with RunLock(self.run_dir):
             current = self.load_run()
             if current["blockers"] != run["blockers"]:
-                raise WorkflowError("blockers changed while preparing the handoff repair")
+                raise WorkflowError("blockers changed while preparing result recovery")
             current["status"] = "working"
             current["blockers"] = []
             current["repositories"][assignment["repo_id"]]["status"] = "pending"
             self._save_run(current)
-        self._append_event("resumed", reason="retry-result-handoff", artifact=str(repair_path),
+        self._append_event("resumed", reason=transition, artifact=str(intent),
                            next_action=run["phase"])
         return True
 

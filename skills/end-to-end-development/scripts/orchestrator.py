@@ -147,6 +147,9 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         elif args.command == "retry-result-handoff":
             if not engine.retry_result_handoff():
                 raise WorkflowError("run is not eligible for the exact overlong result handoff repair")
+        elif args.command == "retry-restored-schema":
+            if not engine.retry_restored_schema():
+                raise WorkflowError("run is not eligible for restored-schema result recovery")
         elif args.command == "retry-dependent-fixes":
             if not engine.retry_dependent_fixes():
                 raise WorkflowError(
@@ -239,12 +242,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validation_retry.add_argument("--report-root", type=Path)
 
-    handoff_retry = subparsers.add_parser(
-        "retry-result-handoff", help="repair only an overlong result next_action without replaying source work",
-    )
-    handoff_retry.add_argument("run_dir", type=Path)
-    handoff_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
-    handoff_retry.add_argument("--report-root", type=Path)
+    for name, help_text in (
+        ("retry-result-handoff", "repair only an overlong result next_action without replaying source work"),
+        ("retry-restored-schema", "recover a valid result after restoring its missing schema file"),
+    ):
+        recovery = subparsers.add_parser(name, help=help_text)
+        recovery.add_argument("run_dir", type=Path)
+        recovery.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+        recovery.add_argument("--report-root", type=Path)
 
     dependent_fix_retry = subparsers.add_parser(
         "retry-dependent-fixes",
@@ -321,10 +326,10 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command == "retry-result-handoff":
+        elif args.command in {"retry-result-handoff", "retry-restored-schema"}:
             output = _invoke(
                 args,
-                {"run_dir": str(args.run_dir.resolve()), "last_transition": "retry-result-handoff"},
+                {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},
             )
         elif args.command == "retry-dependent-fixes":
             output = _invoke(

@@ -147,6 +147,14 @@ For the exact settled-result rejection `$.next_action: must be at most 300 chara
 
 The command verifies the rejection manifest, otherwise-valid artifact and current repository/Git evidence before pinning a new repair assignment. It replaces only the routing hint with a reference to the preserved original text, never edits the original artifact or authoritative semantic evidence, never converts a failed check into a pass, and never replays a source writer. Other decision blockers are refused. The existing one-repair budget and crash recovery apply; no active-run policy or allowance is reset.
 
+If the worker result was rejected solely because its `artifact_schema_path` disappeared during a skill reinstall, restore that exact path first, then run:
+
+```bash
+"$ORCHESTRATOR" retry-restored-schema "$RUN_DIR" --worker-runtime auto
+```
+
+This rejects other errors and requires the preserved result to validate fully against the restored assignment and match current content/HEAD/branch/index status. It clears only that proven environmental rejection; the graph recovers the existing output without replaying source work or spending an artifact repair. Missing schemas, stale or still-invalid results remain blocked. Do not reinstall/remove skill paths while a run is active.
+
 A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 
 ```bash
