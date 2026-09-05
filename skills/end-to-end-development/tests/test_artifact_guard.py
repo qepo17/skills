@@ -994,6 +994,64 @@ class ArtifactGuardDesignChallengeTests(unittest.TestCase):
         with self.assertRaisesRegex(artifact_guard.ValidationError, "refusing to overwrite"):
             artifact_guard.initialize_artifact(assignment_path)
 
+    def test_next_action_bound_and_narrow_repair_eligibility(self) -> None:
+        output = self.artifact_dir / "handoff.json"
+        assignment_path, assignment = self.assignment(
+            stage="validate", output_kind="result", output_path=output, input_paths=[self.contract],
+        )
+        result = artifact_guard.artifact_skeleton(assignment_path, assignment)
+        result["git"]["status_short_path"] = str(self.initial_status)
+        for value in (None, "x" * 300, "x" * 301, "界" * 301, "", 301):
+            with self.subTest(value=value):
+                result["next_action"] = value
+                self.write_json(output, result)
+                oversized = isinstance(value, str) and len(value) > 300
+                if value is None or value == "x" * 300:
+                    self.validate_worker_artifact("result", output, result)
+                else:
+                    with self.assertRaises(artifact_guard.ValidationError) as rejected:
+                        self.validate_worker_artifact("result", output, result)
+                    self.assertEqual("$.next_action", rejected.exception.path)
+                before = output.read_bytes()
+                if oversized:
+                    artifact_guard.repairable_result(result, output)
+                else:
+                    with self.assertRaises(artifact_guard.ValidationError):
+                        artifact_guard.repairable_result(result, output)
+                self.assertEqual(before, output.read_bytes())
+        del result["next_action"]
+        with self.assertRaises(artifact_guard.ValidationError):
+            artifact_guard.repairable_result(result, output)
+
+    def test_handoff_repair_preserves_genuine_blockers_and_other_fields(self) -> None:
+        output = self.artifact_dir / "handoff-blocked.json"
+        assignment_path, assignment = self.assignment(
+            stage="validate", output_kind="result", output_path=output, input_paths=[self.contract],
+        )
+        result = artifact_guard.artifact_skeleton(assignment_path, assignment)
+        result.update(status="blocked", next_action="x" * 301, blockers=[{
+            "id": "BLOCK-001", "summary": "Test service unavailable.",
+            "evidence_path": str(self.initial_status), "required_action": "Restore the service.",
+        }])
+        result["git"]["status_short_path"] = str(self.initial_status)
+        self.write_json(output, result)
+        artifact_guard.repairable_result(result, output)
+        repaired = json.loads(output.read_text())
+        repaired["next_action"] = None
+        repaired["blockers"][0]["kind"] = "environment"
+        repair = {"repair_of": {"artifact": {"path": str(output)}}}
+        artifact_guard.validate_repaired_payload(repair, repaired)
+        self.validate_worker_artifact("result", output, repaired)
+        for field, value in (("status", "complete"), ("summary", "Different facts"), ("task_ids", ["NEW-TASK"])):
+            with self.subTest(field=field):
+                modified = {**repaired, field: value}
+                with self.assertRaisesRegex(artifact_guard.ValidationError, "semantic evidence"):
+                    artifact_guard.validate_repaired_payload(repair, modified)
+        result["next_action"] = "Already concise."
+        self.write_json(output, result)
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "semantic evidence"):
+            artifact_guard.validate_repaired_payload(repair, repaired)
+
     def test_batched_review_fix_resolves_every_assigned_finding(self) -> None:
         output_path = self.artifact_dir / "fix-1-batch-1.json"
         assignment_path, _ = self.assignment(

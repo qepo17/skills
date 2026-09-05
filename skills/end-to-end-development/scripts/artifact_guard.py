@@ -3228,23 +3228,39 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
     return common
 
 
-def repairable_result(data: dict[str, Any], output_path: Path) -> list[int]:
-    """Validate an otherwise intact blocked result without guessing its missing kinds.
+def oversized_next_action(data: dict[str, Any]) -> bool:
+    value = data.get("next_action")
+    return isinstance(value, str) and len(value) > 300
 
-    The temporary enum values are used only for schema checking and never written
-    or accepted. The repair worker must supply an evidence-backed classification.
+
+def repairable_rejection(code: str | None, path: str | None) -> bool:
+    """Recognize narrow repair candidates; the entire payload still needs validation."""
+    return bool(
+        (code == "missing-field" and re.fullmatch(r"\$\.blockers\[[0-9]+\]\.kind", path or ""))
+        or (code == "invalid-evidence" and path == "$.next_action")
+    )
+
+
+def repairable_result(data: dict[str, Any], output_path: Path) -> list[int]:
+    """Validate intact evidence with only missing kinds or oversized advisory text.
+
+    Temporary values are used only for schema checking, never written or accepted.
+    Outcomes and evidence must already be valid without either metadata field.
     """
-    if data.get("artifact_kind") != "result" or data.get("status") != "blocked":
-        fail("$.status", "only intact blocked results are eligible for artifact repair")
+    if data.get("artifact_kind") != "result":
+        fail("$.artifact_kind", "only intact results are eligible for artifact repair")
     missing = [
         index for index, blocker in enumerate(array(field(data, "blockers", "$"), "$.blockers"))
         if isinstance(blocker, dict) and "kind" not in blocker
     ]
-    if not missing:
-        fail("$.blockers", "no missing blocker classification to repair")
+    oversized = oversized_next_action(data)
+    if not missing and not oversized:
+        fail("$", "no missing blocker classification or oversized next_action to repair")
     candidate = copy.deepcopy(data)
     for index in missing:
         candidate["blockers"][index]["kind"] = "decision"
+    if oversized:
+        candidate["next_action"] = None
     global CURRENT_ARTIFACT_PATH
     previous = CURRENT_ARTIFACT_PATH
     CURRENT_ARTIFACT_PATH = output_path
@@ -3264,6 +3280,8 @@ def validate_repair_assignment(data: dict[str, Any]) -> None:
     validate_assignment(original)
     if original["output_kind"] != "result":
         fail("$.repair_of", "only result artifacts can be repaired")
+    if data["action_id"] == original["action_id"]:
+        fail("$.action_id", "repair requires a distinct action identity")
     for key in ("stage", "repo_id", "run_id", "attempt", "cwd", "baseline", "requirement_ids",
                 "task_ids", "finding_ids", "validation_ids", "validation_commands", "packet_id", "input_artifacts"):
         if data.get(key) != original.get(key):
@@ -3296,7 +3314,7 @@ def validate_repair_assignment(data: dict[str, Any]) -> None:
 
 
 def validate_repaired_payload(assignment: dict[str, Any], data: dict[str, Any]) -> None:
-    """A classification repair cannot rewrite prior facts or manufacture a pass."""
+    """A metadata repair cannot rewrite prior facts or manufacture a pass."""
     original = load_json_object(assignment["repair_of"]["artifact"]["path"], "$.repair_of.artifact")
     candidate = copy.deepcopy(data)
     if len(candidate.get("blockers", [])) != len(original["blockers"]):
@@ -3304,6 +3322,10 @@ def validate_repaired_payload(assignment: dict[str, Any], data: dict[str, Any]) 
     for index, blocker in enumerate(original["blockers"]):
         if "kind" not in blocker:
             candidate["blockers"][index].pop("kind", None)
+    # Handoff text is advisory, not routing or validation evidence. Only an
+    # originally oversized value may change; the normal schema enforces its bound.
+    if oversized_next_action(original):
+        candidate["next_action"] = original["next_action"]
     # These fields are owned by the coordinator, not the semantic worker.
     for payload in (original, candidate):
         for key in ("assignment_path", "assignment_sha256", "git", "tree_fingerprint"):

@@ -20,7 +20,7 @@ Thinking classification:
 
 New assignments pin `reasoning_policy: stage-v1`; the runtime honors the classification with `gpt-6-astra`. Legacy assignments/runs use `legacy-xhigh` when no newer policy was pinned. Existing handles are recovered with their recorded runtime configuration. Deterministic delivery/report work does not launch an agent.
 
-`execution_mode: artifact-repair` retains the original result stage and scope but has no project/Git/forge write access, a five-minute timeout, and medium reasoning. Its `repair_of` binds the original assignment, rejected output, referenced evidence, and repository states. Initialize from the original payload and follow the [blocker contract](blockers.md); this is not another implementation attempt.
+`execution_mode: artifact-repair` retains the original result stage and scope but has no project/Git/forge write access, a five-minute timeout, and medium reasoning. Its `repair_of` binds the original assignment, rejected output, referenced evidence, and repository states. Initialize from the original payload and follow the [result repair rules](result.md) and [blocker contract](blockers.md): only missing blocker kinds and/or an originally oversized advisory `next_action` may change. This is not another implementation or validation attempt.
 
 New GitHub delivery uses `execution_mode: command`, `delivery_evidence_version: 2`, and a pinned `check_timeout_seconds` (0–1800). The graph executes it directly, with durable intent/reconciliation and no worker handle. A `verify_only: true` command assignment refreshes accepted delivery after interruption with `git_access: none` and `forge_access: none`; it cannot commit, push, or create a PR. Other forges retain worker delivery with version-2 final-head evidence.
 
