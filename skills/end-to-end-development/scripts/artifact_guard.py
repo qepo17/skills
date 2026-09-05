@@ -1171,10 +1171,20 @@ def validate_assignment(data: dict[str, Any]) -> None:
     timestamp(field(data, "created_at", "$"), "$.created_at")
     stage = enum(field(data, "stage", "$"), ASSIGNMENT_STAGES, "$.stage")
     execution_mode = enum(data.get("execution_mode", "worker"), {"worker", "artifact-repair", "command"}, "$.execution_mode")
-    if execution_mode == "command" and stage != "deliver":
-        fail("$.execution_mode", "only delivery uses command assignments")
+    if execution_mode == "command" and stage not in {"deliver", "validate"}:
+        fail("$.execution_mode", "only delivery or coordinator validation uses command assignments")
+    if execution_mode == "command" and stage == "validate":
+        hashed_file_reference(field(data, "coordinator_validation_source", "$"), "$.coordinator_validation_source")
+        state = obj(field(data, "coordinator_repository_state", "$"), "$.coordinator_repository_state")
+        for key in ("fingerprint", "index_sha256"):
+            sha256(field(state, key, "$.coordinator_repository_state"), f"$.coordinator_repository_state.{key}")
+        sha(field(state, "head", "$.coordinator_repository_state"), "$.coordinator_repository_state.head")
+        string(field(state, "branch", "$.coordinator_repository_state"), "$.coordinator_repository_state.branch")
+        for permission in ("project_file_access", "git_access", "forge_access"):
+            if data.get(permission) != "none":
+                fail(f"$.{permission}", "coordinator validation cannot grant worker write access")
     verify_only = boolean(data.get("verify_only", False), "$.verify_only")
-    if verify_only and execution_mode != "command":
+    if verify_only and (execution_mode != "command" or stage != "deliver"):
         fail("$.verify_only", "read-only delivery verification requires a command assignment")
     if data.get("delivery_evidence_version", 1) not in {1, 2}:
         fail("$.delivery_evidence_version", "unsupported delivery evidence version")

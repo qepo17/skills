@@ -144,6 +144,12 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                 raise WorkflowError(
                     "run is not blocked by an eligible oversized next_action rejection with an unused repair allowance"
                 )
+        elif args.command == "complete-handoff-metadata":
+            if not engine.complete_handoff_metadata():
+                raise WorkflowError("run has no eligible settled, output-less advisory-text repair")
+        elif args.command == "retry-coordinator-validation":
+            if not engine.retry_coordinator_validation():
+                raise WorkflowError("run is not blocked by an exhausted, unexecuted coordinator diff check")
         elif args.command == "retry-validation-evidence":
             if not engine.retry_validation_evidence():
                 raise WorkflowError(
@@ -241,6 +247,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     artifact_retry.add_argument("--report-root", type=Path)
 
+    metadata_completion = subparsers.add_parser(
+        "complete-handoff-metadata", help="deterministically finish a settled, output-less advisory-text repair"
+    )
+    metadata_completion.add_argument("run_dir", type=Path)
+    metadata_completion.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    metadata_completion.add_argument("--report-root", type=Path)
+
+    coordinator_retry = subparsers.add_parser(
+        "retry-coordinator-validation",
+        help="recover only an exhausted unexecuted coordinator-owned Git whitespace check",
+    )
+    coordinator_retry.add_argument("run_dir", type=Path)
+    coordinator_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    coordinator_retry.add_argument("--report-root", type=Path)
+
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",
         help="retry an exact validation-coverage blocker after fixing the engine",
@@ -326,6 +347,11 @@ def main() -> int:
                     "last_transition": "retry-artifact-repair",
                 },
             )
+        elif args.command in {"retry-coordinator-validation", "complete-handoff-metadata"}:
+            output = _invoke(args, {
+                "run_dir": str(args.run_dir.resolve()),
+                "last_transition": args.command,
+            })
         elif args.command == "retry-validation-evidence":
             output = _invoke(
                 args,

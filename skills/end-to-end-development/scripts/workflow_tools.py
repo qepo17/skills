@@ -220,8 +220,13 @@ def normalize_worker_artifact(
     assignment: dict[str, Any],
     output_path: Path,
     artifact: dict[str, Any],
+    *,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Attach mechanically verifiable repository evidence before acceptance.
+
+    persist=False computes the same metadata without writing output/status files,
+    allowing recovery to reject ambiguous existing evidence before any mutation.
 
     Workers own semantic conclusions. The coordinator owns hashes, Git state,
     and status snapshots so a correct result is not retried because a model
@@ -238,13 +243,15 @@ def normalize_worker_artifact(
         resolved_assignment.read_bytes()
     ).hexdigest()
     if assignment.get("repo_id") is None:
-        atomic_write_json(output_path, artifact)
+        if persist:
+            atomic_write_json(output_path, artifact)
         return artifact
     worktree = Path(assignment["cwd"])
     if not (worktree / ".git").exists():
         # Standalone artifact-validation fixtures may intentionally use a plain
         # directory. Initialized workflow repositories are always Git worktrees.
-        atomic_write_json(output_path, artifact)
+        if persist:
+            atomic_write_json(output_path, artifact)
         return artifact
     _git(worktree, "rev-parse", "--show-toplevel")
     current_fingerprint = worktree_fingerprint(worktree)
@@ -258,12 +265,14 @@ def normalize_worker_artifact(
             "read-only worker changed repository content after assignment creation"
         )
     log_dir = Path(assignment["log_dir"])
-    log_dir.mkdir(parents=True, exist_ok=True)
+    if persist:
+        log_dir.mkdir(parents=True, exist_ok=True)
     status_path = log_dir / f"{output_path.stem}-coordinator-status.txt"
     status = _git(worktree, "status", "--short").decode(
         "utf-8", errors="replace"
     )
-    status_path.write_text(status.rstrip("\n") + "\n", encoding="utf-8")
+    if persist:
+        status_path.write_text(status.rstrip("\n") + "\n", encoding="utf-8")
 
     if artifact.get("artifact_kind") == "result":
         fingerprint = current_fingerprint
@@ -285,7 +294,8 @@ def normalize_worker_artifact(
         artifact["baseline"] = assignment["baseline"]
         artifact["reviewed_status_path"] = str(status_path.resolve())
 
-    atomic_write_json(output_path, artifact)
+    if persist:
+        atomic_write_json(output_path, artifact)
     return artifact
 
 
