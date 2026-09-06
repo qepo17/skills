@@ -45,6 +45,7 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ├── assignments/<action-id>.json
 ├── plan-review-vN.md                    # complete hash-pinned plan-decision bundle
 ├── plan-feedback-vN.json                # exact user-requested revision basis
+├── decision-replan-vN.json              # preserved implementation decision/approval/work evidence
 ├── profile-escalation-*.json            # deterministic escalation evidence
 ├── contract-vN*.json                    # coordinated multi-repository runs only
 ├── integration-*.json                   # when policy requires it
@@ -199,6 +200,8 @@ The graph may add these coordinator fields when applicable:
 
 - `worker_execution`: the automatically detected and pinned backend/runtime plus non-secret probe evidence;
 - `plan_feedback`: path/hash plus sorted affected repository IDs;
+- `decision_replans`: ordered hashed `decision-replan-vN.json` references. Each immutable plan-feedback artifact preserves exact user `text`, separate coordinator `context`, `previous_plan_review`, the resolved `blocker`, the caller's `blocker_evidence_sha256` captured when reviewing that decision, `repository_states`, and nested hashed `evidence` references. Auxiliary logs are transition-time preservation snapshots, not retroactive accepted-time proof. All references are verified on subsequent run validation. Old approval is evidence only, never current authorization;
+- `pending_contract_revision`: the next bounded contract `revision` and hashed decision `feedback`, valid only in the contract phase and removed atomically on contract acceptance (including crash recovery);
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
 - `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
@@ -385,7 +388,7 @@ Every task belongs to exactly one packet; a packet follows its profile's three-o
 }
 ```
 
-`reused` evidence hash-pins the earlier result artifact. Reuse only when command hash and content fingerprint match. The final implementation/fix writer is assigned every planned validation so its passing evidence can satisfy the gate directly. The fingerprint excludes parent `HEAD`, so an identical delivery commit reuses evidence; file content, mode, symlink, deletion, untracked content, or submodule-state changes invalidate it. Compute it with:
+`reused` evidence hash-pins the earlier result artifact. Reuse only when command hash and content fingerprint match; after decision replanning, the result assignment must also pin the current canonical plan. The final implementation/fix writer is assigned every planned validation so its passing evidence can satisfy the gate directly. The fingerprint excludes parent `HEAD`, so an identical delivery commit reuses evidence; file content, mode, symlink, deletion, untracked content, or submodule-state changes invalidate it. Compute it with:
 
 ```bash
 python3 "$SKILL_DIR/scripts/workflow_tools.py" fingerprint <worktree>

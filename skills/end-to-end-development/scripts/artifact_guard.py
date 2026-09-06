@@ -994,6 +994,27 @@ def validate_run(data: dict[str, Any]) -> None:
         for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
             hashed_file_reference(reference, f"{loc}.evidence[{index}]")
 
+    replans = array(data.get("decision_replans", []), "$.decision_replans")
+    for index, reference in enumerate(replans):
+        loc = f"$.decision_replans[{index}]"
+        feedback_path = hashed_file_reference(reference, loc)
+        feedback = load_json_object(feedback_path, loc)
+        blocker = obj(field(feedback, "blocker", loc), f"{loc}.blocker")
+        hashed_file_reference({
+            "path": field(blocker, "evidence_path", f"{loc}.blocker"),
+            "sha256": field(feedback, "blocker_evidence_sha256", loc),
+        }, f"{loc}.reviewed_blocker_evidence")
+        for evidence_index, evidence in enumerate(array(field(feedback, "evidence", loc), f"{loc}.evidence")):
+            hashed_file_reference(evidence, f"{loc}.evidence[{evidence_index}]")
+    pending_contract = data.get("pending_contract_revision")
+    if pending_contract is not None:
+        loc = "$.pending_contract_revision"
+        pending_contract = obj(pending_contract, loc)
+        integer(field(pending_contract, "revision", loc), f"{loc}.revision", minimum=2)
+        hashed_file_reference(field(pending_contract, "feedback", loc), f"{loc}.feedback")
+        if pending_contract["feedback"] not in replans or phase != "contract":
+            fail(loc, "must pin decision feedback during contract revision")
+
     pending_refresh = obj(data.get("pending_delivery_refresh", {}), "$.pending_delivery_refresh")
     for repository_id, reference in pending_refresh.items():
         location = f"$.pending_delivery_refresh.{repository_id}"

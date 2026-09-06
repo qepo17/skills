@@ -168,6 +168,28 @@ Generic continuation words are rejected. Requested changes return selected repos
 
 Omit `--repository` to revise every repository plan.
 
+After explicit user authorization of a material product/contract choice discovered during implementation, use the separate guarded transition (not `resume` or `request-changes`):
+
+```bash
+"$ORCHESTRATOR" replan-decision "$RUN_DIR" \
+  --review-sha256 "$APPROVED_BUNDLE_SHA256" \
+  --blocker-id "$CURRENT_DECISION_BLOCKER_ID" \
+  --blocker-evidence-sha256 "$REVIEWED_BLOCKER_EVIDENCE_SHA256" \
+  --text "$EXACT_USER_FEEDBACK" \
+  --context "$COORDINATOR_EXPLANATION_OF_THE_CHOICE" \
+  --worker-runtime auto
+```
+
+Read the blocker evidence and capture its SHA-256 when reviewing the decision; do not recompute it merely to make a stale decision pass. The supplied hash must still match at transition time. This pins the reviewed evidence, not a claim of retroactive accepted-time log verification. Existing unpinned auxiliary logs are preservation snapshots only and cannot validate a revised plan.
+
+It accepts only a settled, blocked full-profile implementation run with one decision matching an accepted blocked result bound to the current user-approved bundle. Closed/cleaned handles, no actions/leases, unchanged worktree/HEAD/branch/status and unstaged index, and remaining contract/plan revision budgets are mandatory. It does not recover schema rejections or arbitrary blockers. `--text` preserves exact user wording; optional `--context` is separately labelled interpretation, never approval.
+
+The transition hash-pins immutable `decision-replan-vN.json` feedback containing the old approval, blocker, repository states, and existing artifact/assignment/evidence references. It atomically invalidates approval and returns every repository to planning, first revising the shared contract when required. Existing worktrees, baselines, source work, accepted artifacts, worker history, and retry limits are preserved. Revised plans describe remaining deltas; revised implementation actions have new plan-version scopes, so old packets cannot satisfy new plans or be overwritten. Validation must bind the new plan. Independent review remains mandatory. The graph stops for approval of the new whole bundle before any writer. Numerical proposals in new plans are not pre-approved by the original choice.
+
+Accepted replanning contract/plan/challenge outputs are reused without relaunching their workers after an acceptance-to-projection crash. Latest repository outcomes are selected from recorded worker order, not second-resolution timestamps or packet names.
+
+A crash after the projection write resumes through ordinary `run`/`resume`; repeating `replan-decision` cannot spend another revision or revive the old approval. A pre-projection crash may reuse only identical immutable feedback intent. A pending SQLite cursor is refused rather than redirected manually. Never edit coordinator state or accepted evidence to force eligibility.
+
 ## Database-target gate
 
 The graph refuses to schedule any migration-capable validation until non-secret evidence identifies an isolated local/test database. Record only a classification and description—never a URL, credential, or secret:
