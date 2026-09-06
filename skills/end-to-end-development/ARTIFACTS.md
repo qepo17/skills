@@ -46,6 +46,7 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ├── plan-review-vN.md                    # complete hash-pinned plan-decision bundle
 ├── plan-feedback-vN.json                # exact user-requested revision basis
 ├── decision-replan-vN.json              # preserved implementation decision/approval/work evidence
+├── external-repair-<action-hash>.json    # explicit rejected-packet source transition; not a pass
 ├── run-amendment-vN.json                # scoped validation/remediation decision
 ├── amendment-evidence/<request-sha>/*   # immutable decision-time log snapshots
 ├── profile-escalation-*.json            # deterministic escalation evidence
@@ -212,6 +213,8 @@ The graph may add these coordinator fields when applicable:
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
 - `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
+- `external_repair_recoveries`: one hashed immutable [`external-repair-recovery`](schemas/external-repair-recovery.md) record per rejected implementation action. It preserves the caller's reviewed request/digest, exact external and later recovery authorization separately from coordinator interpretation, old approval/blocker, historical evidence and old/current source bindings. The old rejected result stays unaccepted and unchanged. Admission schedules fresh read-only packet verification; it does not assert completion or a passing check;
+- `external_repair_attempts`: one hashed `packet-verification` assignment per new verification action, saved before launch. This is a one-shot launch claim, not a retry-budget reset. Accepted fresh results and their scope/check logs are revalidated on subsequent run loads. No missing/invalid claimed result can cause another worker launch;
 - `run_amendments`: ordered hashed references to immutable [`run-amendment`](schemas/run-amendment.md) artifacts. This field is valid only with `validation_policy_version: 1`; repeated request hashes are invalid;
 - `pending_check_remediations`: at most one hashed `fix-related` amendment per repository, consumed by the existing `validation-fix` or `pipeline-fix` route;
 - `pending_validation_refresh`: at most one hashed restoration amendment per repository, consumed by validation-only work. Neither pending map adds a graph phase or resets a retry budget;
@@ -351,6 +354,12 @@ An `execution_mode: artifact-repair` assignment keeps the original result stage,
 
 `run.json.artifact_repairs` maps the original action ID to a hashed repair assignment and its `resume_generation`, persisted before launch. Its `launch_started_at` claim is saved before entering the supervisor: after a crash, adopt/wait for surviving work and accept a valid output, but never relaunch a claimed repair with missing/invalid output. An indeterminate launch blocks conservatively. `external_resume_generation` advances only on supported explicit external-condition resume; crash recovery never replenishes the one-repair allowance. Accepted repairs remain immutable. Only previously missing blocker kinds and coordinator-owned metadata can differ from the original payload. Genuine blocked outcomes remain blocked; arbitrary field edits, changed input/evidence/Git state, or invalid/ambiguous classification do not become replacement source work.
 
+### External-repair packet verification
+
+An `execution_mode: packet-verification` assignment retains the rejected packet's implementation stage, task/packet IDs and exact check IDs/commands, but all repository access is read-only and project/Git/forge writes are forbidden. `external_repair` pins its immutable recovery record. It binds the current approved plan, source fingerprint and all repository Git states, uses a unique output and log directory, and honors medium reasoning under an existing stage-v1 policy without upgrading legacy run policies. The new result inventories preserved packet files plus authorized test repairs; it does not claim the verifier wrote them.
+
+The result adds `packet_verification` with `outcome: compatible|material-change|incomplete`, concise `summary`, fresh assignment-local `evidence_path`, and coordinator-owned `evidence_sha256`. Only compatible inspected work can be `complete`; material/unfinished work must be blocked. Material change requires decision blockers and normal renewed plan approval. Every original assigned check must be reported with exact canonical command/cwd, fresh cache status, null source artifact, a new assignment-local log and acceptance-time hash, including on legacy runs. Complete reporting with failed checks is valid factual evidence, but the recovery gate remains blocked until passing evidence exists; the one-shot transition does not rerun or fix it automatically. Full-plan validation, independent review, integration and delivery remain mandatory. See [the complete contract](schemas/external-repair-recovery.md).
+
 ### Command delivery evidence
 
 New GitHub delivery uses `execution_mode: command` and `delivery_evidence_version: 2`. Delivery-policy version 1 additionally supplies `pr_lifecycle: draft-until-verified`, run identity, and a stable `pr_intent_path` to the helper. Local nonce-bearing creation intent and its matching PR marker jointly establish ownership; public markers alone do not. Immutable local readiness observations prevent undoing a later human redraft. The graph persists ordinary action intent, a portable input JSON, command logs/results, and a delivery artifact; it does not construct an agent handle. Active output projections may be completed during recovery, preserving prior snapshots and unique command result files; accepted artifacts remain immutable. Recovered outputs require fresh read-only forge queries, and cold recovery after acceptance schedules a new `verify_only: true` command assignment with no Git/forge write access. `verify_only` cannot commit, push, create/edit a PR, or change readiness. `pending_delivery_refresh` hash-pins accepted observations that need refresh after cold recovery. It survives other repositories' active actions and is cleared only when a new delivery artifact bound to the old observation is accepted (command, or a version-1 read-only fallback worker); completion rejects an outstanding refresh. A saved graph node cannot execute after recovery blocks or supersedes its intent. Command manifests have a separate `commands` array. Other forges retain worker execution with the same policy obligations; unsupported drafts/draft-only CI block rather than silently downgrading.
@@ -471,5 +480,6 @@ Events describe transitions; they never duplicate artifact narratives.
 | `delivery` | 64 KiB |
 | `report` | 32 KiB |
 | `run-amendment` | 64 KiB |
+| coordinator `external-repair-recovery` | 128 KiB |
 
 Move verbose evidence into logs rather than growing an artifact.

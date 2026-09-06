@@ -10,6 +10,19 @@ Used by implementation, validation, batched fixes, and pipeline fixes. For a sta
 
 For `execution_mode: artifact-repair`, initialization copies the original result. Repair only missing existing blocker classifications from the pinned evidence. Keep all other semantic fields unchanged, including status, outcomes, validations, blocker text, and IDs. Do not run tests or write project/Git/forge state. The graph pins the original assignment/output, evidence files, content, HEAD, branch, and index; any mutation or failed repair blocks rather than starting another source writer.
 
+For `execution_mode: packet-verification`, do not edit or replay source work. Independently inspect existing packet completion and compatibility with approved requirements/contract, including the pinned external repair/rebase. Add:
+
+```json
+"packet_verification": {
+  "outcome": "compatible",
+  "summary": "Concise factual packet/scope inspection conclusion.",
+  "evidence_path": "/absolute/assigned/log_dir/scope.md",
+  "evidence_sha256": null
+}
+```
+
+The coordinator fills `evidence_sha256`. Outcomes are `compatible`, `material-change`, or `incomplete`. Only compatible fully present work can report complete; material/unfinished work must be blocked. Material change needs a decision blocker for normal replanning and renewed whole-bundle approval. Inventory exactly the recovery record's `changed_files` (preserved packet work plus authorized repairs), not invented verifier edits. Report every assigned check freshly in its canonical cwd with a new assignment-local log, null `source_artifact` and `cache_status: fresh`. No external or cached evidence is admissible. Complete factual reporting can include failed checks even on legacy runs, but **does not pass the recovery gate** or grant an automatic fix/retry. All historical evidence remains untouched.
+
 Required rules:
 
 - For an assignment with `validation_policy_version: 1`, return `status: complete` when the assigned source work and factual check reporting are finished, even when one or more checks failed. Return `blocked` only when the assigned work/reporting could not finish. Never omit a failed record, invent a passing result, or use a blocker solely because a command exited nonzero.

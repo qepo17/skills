@@ -30,6 +30,7 @@ sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
 import delivery_tools  # noqa: E402
+import external_repair  # noqa: E402
 import worker_supervisor  # noqa: E402
 import workflow_tools  # noqa: E402
 import validation_policy  # noqa: E402
@@ -706,6 +707,301 @@ class WorkflowEngine:
                            next_action=run["phase"])
         return True
 
+    def _external_repair_evidence_paths(self, artifact: dict[str, Any]) -> set[Path]:
+        paths = workflow_tools.artifact_evidence_paths(artifact)
+        for decision in artifact.get("decisions", []):
+            value = decision.get("evidence", "")
+            path = Path(value)
+            if path.is_absolute() and path.is_file() and path.resolve().is_relative_to(self.run_dir):
+                paths.add(path.resolve())
+        return paths
+
+    def recover_external_repair(self, request: dict[str, Any], *, request_sha256: str,
+                                text: str, context: str = "") -> str:
+        """Pin explicit authority for one fresh read-only packet verification.
+
+        Historical rejection is never accepted, normalized, or rewritten. The
+        graph must independently verify preserved work before packet progress.
+        """
+        if not isinstance(request, dict) or len(json.dumps(request).encode()) > 128 * 1024:
+            raise WorkflowError("recovery request must be a JSON object of at most 128 KiB")
+        if external_repair.digest(request) != request_sha256:
+            raise WorkflowError("reviewed recovery request hash changed")
+        if (not text.strip() or len(text) > 4000 or len(context) > 8000
+                or not re.search(r"\b(authorize[d]?|approve[d]?)\b", text, re.IGNORECASE)
+                or not re.search(r"\b(recovery|verification)\b", text, re.IGNORECASE)
+                or re.search(r"\b(not|don't|cannot|can't|reject|decline)\b", text, re.IGNORECASE)
+                or QUALIFIED_APPROVAL_RE.search(text)):
+            raise WorkflowError("recovery needs explicit affirmative user authorization (1-4000 chars) and separate context (<=8000)")
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            for ref in run.get("external_repair_recoveries", {}).values():
+                prior = _load_json(Path(ref["path"]))
+                if prior["request_sha256"] == request_sha256:
+                    if prior["authorization_text"] != text or prior["coordinator_context"] != context:
+                        raise WorkflowError("conflicting recovery authorization")
+                    return "already-applied"
+            expected_keys = {"run_id", "repo_id", "blocker_id", "expected_run_sha256", "result", "assignment",
+                             "rejection", "transition", "external_authorization", "reviewed_evidence", "database_target"}
+            if set(request) != expected_keys or request["run_id"] != run["run_id"]:
+                raise WorkflowError("invalid external recovery request shape or run identity")
+            if (run["status"] != "blocked" or run["phase"] != "implement" or run.get("profile") != "full"
+                    or run["next_actions"] or len(run["blockers"]) != 1
+                    or _sha256(self.run_path) != request["expected_run_sha256"]):
+                raise WorkflowError("recovery requires the exact reviewed, settled implementation rejection")
+            review = run.get("plan_review") or {}
+            if review.get("status") != "approved" or review.get("approval_source") != "user":
+                raise WorkflowError("recovery requires the canonical user-approved plan bundle")
+            repo_id = artifact_guard.repo_id(request["repo_id"], "$.repo_id")
+            repo = run["repositories"].get(repo_id)
+            if not repo or any(r.get("active_writer") for r in run["repositories"].values()):
+                raise WorkflowError("recovery requires a known repository and no writer leases")
+            agents = self.load_agents()["agents"]
+            if any(a["status"] not in {"closed", "failed"} or a.get("cleanup_status") != "complete" for a in agents):
+                raise WorkflowError("recovery requires closed, cleaned worker handles")
+            for path in (self.run_dir / "supervisor").glob("worker-*.json"):
+                handle = _load_json(path)
+                if handle.get("status") not in {"settled", "failed"} or handle.get("cleanup_status") != "complete":
+                    raise WorkflowError("recovery requires settled, cleaned supervisor handles")
+            for key in ("pending_check_remediations", "pending_validation_refresh", "pending_delivery_refresh"):
+                if run.get(key):
+                    raise WorkflowError("unrelated pending work prevents external recovery")
+            for key in ("result", "assignment", "rejection"):
+                artifact_guard.hashed_file_reference(request[key], f"$.{key}")
+            output, assignment_path, manifest = [Path(request[key]["path"]).resolve()
+                                                 for key in ("result", "assignment", "rejection")]
+            assignment = _load_json(assignment_path)
+            artifact_guard.validate_assignment(assignment)
+            action_id = assignment["action_id"]
+            if (assignment_path != self.run_dir / "assignments" / f"{_slug(action_id)}.json"
+                    or assignment["stage"] != "implement" or assignment.get("execution_mode", "worker") != "worker"
+                    or assignment["repo_id"] != repo_id or assignment["run_id"] != run["run_id"]
+                    or assignment["cwd"] != repo["worktree"] or assignment["baseline"] != repo["baseline"]
+                    or assignment["output_artifact"] != str(output)
+                    or not output.is_relative_to(self.run_dir / "repos" / repo_id)
+                    or manifest.parent != self.run_dir / "supervisor"
+                    or assignment.get("plan_review") != {"path": review["review_path"], "sha256": review["review_sha256"]}
+                    or not self._assignment_pins(assignment, Path(repo["plan_path"]), repo["plan_sha256"])
+                    or any(action_id in run.get(key, {}) for key in
+                           ("artifact_repairs", "corrected_handoff_recoveries", "external_repair_recoveries"))
+                    or action_id in repo["accepted_artifacts"]
+                    or any(ref["path"] == str(output) for ref in repo["accepted_artifacts"].values())):
+                raise WorkflowError("wrong rejected implementation assignment or approved plan")
+            blocker = run["blockers"][0]
+            reason = "$.next_action: must be at most 300 characters"
+            if (blocker["id"] != request["blocker_id"] or blocker["kind"] != "decision"
+                    or blocker["evidence_path"] != str(manifest)
+                    or blocker["summary"] != f"Artifact evidence rejected for {action_id}: {reason}"):
+                raise WorkflowError("wrong recovery blocker")
+            workers = _load_json(manifest).get("workers", [])
+            matches = [w for w in workers if w.get("action_id") == action_id and w.get("status") == "rejected"
+                       and w.get("assignment_path") == str(assignment_path) and w.get("output_artifact") == str(output)
+                       and w.get("error_code") == "invalid-evidence" and w.get("error_path") == "$.next_action"
+                       and w.get("reason") == reason and w.get("cleanup_status") == "complete"]
+            if len(matches) != 1 or any(w.get("status") != "accepted" for w in workers if w not in matches):
+                raise WorkflowError("recovery requires exactly the identified rejection, not peer failures")
+            if not any(a["output_artifact"] == str(output) for a in agents):
+                raise WorkflowError("rejected worker history is missing")
+            if output.stat().st_size > artifact_guard.MAX_BYTES["result"]:
+                raise WorkflowError("rejected result exceeds its size limit")
+            original = _load_json(output)
+            if (original.get("status") != "blocked" or not isinstance(original.get("next_action"), str)
+                    or len(original["next_action"]) <= 300
+                    or any(b.get("kind") != "code" for b in original.get("blockers", []))
+                    or not any(v.get("result") == "fail" and v.get("exit_code") not in {None, 0}
+                               for v in original.get("validations", []))):
+                raise WorkflowError("requires a genuinely failed, code-blocked implementation with overlong next_action")
+            previous = artifact_guard.CURRENT_ARTIFACT_PATH
+            try:
+                artifact_guard.CURRENT_ARTIFACT_PATH = output
+                artifact_guard.validate_result(dict(original, next_action="Preserved rejected hint; schema probe only."))
+            finally:
+                artifact_guard.CURRENT_ARTIFACT_PATH = previous
+            expected_checks = dict(zip(assignment["validation_ids"], assignment["validation_commands"], strict=True))
+            if {v["id"]: v["command"] for v in original["validations"]} != expected_checks:
+                raise WorkflowError("rejected result must report all exact assigned checks")
+            plan = self._current_plan(repo_id)[1]
+            packet = next((p for p in plan["work_packets"] if p["id"] == original["packet_id"]), None)
+            if not packet or packet["task_ids"] != original["task_ids"]:
+                raise WorkflowError("rejected packet differs from canonical plan")
+            definitions = {v["id"]: v for v in plan["validations"]}
+            if (any(i not in definitions or definitions[i]["command"] != command for i, command in expected_checks.items())
+                    or any(v["cwd"] != definitions[v["id"]]["cwd"] for v in original["validations"])):
+                raise WorkflowError("assigned checks differ from canonical plan")
+            history = {output, assignment_path, manifest, Path(review["review_path"])}
+            states = {}
+            order = {a["output_artifact"]: i for i, a in enumerate(agents)}
+            for key, repository in run["repositories"].items():
+                state = workflow_tools.repository_state(Path(repository["worktree"]))
+                states[key] = state
+                writers = self._artifacts(repo_id=key, stage="implement", kind="result")
+                if any(str(p) not in order for p, _, _ in writers):
+                    raise WorkflowError("missing accepted worker history")
+                latest = max(writers, key=lambda item: order[str(item[0])]) if writers else None
+                source_agents = [a for a in agents if a.get("repo_id") == key and a["stage"] in PROJECT_WRITE_STAGES]
+                latest_output = str(output) if key == repo_id else str(latest[0]) if latest else None
+                if source_agents and source_agents[-1]["output_artifact"] != latest_output:
+                    raise WorkflowError("unresolved latest source action must not be cleared or replayed")
+                if latest and latest[1]["status"] != "complete":
+                    raise WorkflowError("unresolved accepted source outcome prevents recovery")
+                if key == repo_id:
+                    if latest and order[str(latest[0])] >= order[str(output)]:
+                        raise WorkflowError("rejected packet is not the latest source action")
+                else:
+                    source = latest[1] if latest else None
+                    if (repository["status"] in {"blocked", "failed"} or source and source["status"] != "complete"
+                            or state["head"] != (source["git"]["head"] if source else repository["baseline"])
+                            or state["fingerprint"] != (source["tree_fingerprint"] if source else
+                                _load_json(Path(self._current_plan(key)[1]["assignment_path"]))["input_tree_fingerprint"])
+                            or state["branch"] != repository["branch"]
+                            or _git(Path(repository["worktree"]), "diff", "--cached", "--name-only")):
+                        raise WorkflowError("unauthorized peer source change or unresolved outcome")
+                for path, artifact, _ in self._artifacts(repo_id=key):
+                    history.update({path, Path(artifact["assignment_path"])})
+                    history.update(self._external_repair_evidence_paths(artifact))
+            for path, artifact, _ in [*self._artifacts(), (output, original, assignment)]:
+                history.update({path, Path(artifact["assignment_path"])})
+                history.update(self._external_repair_evidence_paths(artifact))
+            target = request["database_target"]
+            if any(v["migration_capable"] for v in plan["validations"]):
+                if target != repo.get("database_target_evidence") or not target:
+                    raise WorkflowError("reviewed isolated database-target evidence is required")
+                artifact_guard.hashed_file_reference(target, "$.database_target")
+                database = _load_json(Path(target["path"]))
+                if (database.get("classification") not in {"isolated-local", "isolated-test"}
+                        or database.get("run_id") != run["run_id"] or database.get("repo_id") != repo_id):
+                    raise WorkflowError("unsafe or mismatched database target")
+                history.add(Path(target["path"]))
+            elif target is not None:
+                raise WorkflowError("unexpected database target")
+            authorization = request["external_authorization"]
+            if (not isinstance(authorization, dict) or set(authorization) != {"text", "evidence"}
+                    or not isinstance(authorization["text"], str) or not 1 <= len(authorization["text"].strip()) <= 4000
+                    or not isinstance(authorization["evidence"], list) or not authorization["evidence"]):
+                raise WorkflowError("pin original external source authorization separately from interpretation")
+            evidence = request["reviewed_evidence"]
+            if not isinstance(evidence, list):
+                raise WorkflowError("reviewed_evidence must be a list of hashed file references")
+            for ref in [*evidence, *authorization["evidence"]]:
+                artifact_guard.hashed_file_reference(ref, "$.reviewed_evidence")
+                path = Path(ref["path"]).resolve()
+                if path in {self.run_path, self.agents_path, self.run_dir / "events.jsonl", self.run_dir / "langgraph.sqlite"}:
+                    raise WorkflowError("mutable workflow projections cannot be historical file references")
+            if not history <= {Path(ref["path"]).resolve() for ref in evidence}:
+                raise WorkflowError("reviewed evidence must pin all rejected and historical artifact/log bindings")
+            changed_files = external_repair.validate_transition(Path(repo["worktree"]), request["transition"],
+                                                               original, repo, states[repo_id])
+            record = {"schema_version": 1, "artifact_kind": "external-repair-recovery", "run_id": run["run_id"],
+                      "created_at": self.now(), "request": request, "request_sha256": request_sha256,
+                      "authorization_text": text, "coordinator_context": context, "previous_plan_review": review,
+                      "blocker": blocker, "repository_states": states, "changed_files": changed_files,
+                      "action_id": action_id, "packet_id": packet["id"]}
+            path = self.run_dir / f"external-repair-{hashlib.sha256(action_id.encode()).hexdigest()[:16]}.json"
+            if len(json.dumps(record).encode()) > 128 * 1024:
+                raise WorkflowError("external recovery record exceeds 128 KiB")
+            if path.exists():
+                prior = _load_json(path)
+                record["created_at"] = prior.get("created_at")
+                if record != prior:
+                    raise WorkflowError("existing immutable recovery intent differs")
+            else:
+                workflow_tools.atomic_write_json(path, record)
+            run.setdefault("external_repair_recoveries", {})[action_id] = _reference(path)
+            run["status"], run["blockers"], repo["status"] = "working", [], "pending"
+            self._save_run(run)
+        self._append_event("resumed", reason="recover-external-repair", artifact=str(path), next_action="implement")
+        return "applied"
+
+    def _verify_external_repairs(self, run: dict[str, Any]) -> str | None:
+        for action_id, reference in run.get("external_repair_recoveries", {}).items():
+            record = _load_json(Path(reference["path"]))
+            repo_id = record["request"]["repo_id"]
+            # A renewed plan cannot use old recovery authority or packet evidence.
+            if record["previous_plan_review"] != run.get("plan_review"):
+                continue
+            scope = f"external-repair-{hashlib.sha256(action_id.encode()).hexdigest()[:16]}"
+            verify_id = f"implement:{repo_id}:{scope}:attempt-1"
+            accepted = run["repositories"][repo_id]["accepted_artifacts"].get(verify_id)
+            if accepted:
+                result = _load_json(Path(accepted["path"]))
+                self._verify_validation_evidence(result)
+                agents = self.load_agents()["agents"]
+                if any(a["output_artifact"] == accepted["path"] and
+                       (a["status"] != "closed" or a.get("cleanup_status") != "complete") for a in agents):
+                    self._block(summary="Packet verification handle is not closed and cleaned.",
+                                evidence_path=Path(accepted["path"]), kind="infrastructure", repo_id=repo_id,
+                                required_action="Reconcile the settled verifier cleanup before scheduling any further work.")
+                    return "blocked"
+                order = {a["output_artifact"]: i for i, a in enumerate(agents)}
+                verification_order = order.get(accepted["path"])
+                if verification_order is None:
+                    raise WorkflowError("accepted packet verification has no worker history")
+                for key, state in record["repository_states"].items():
+                    worktree = Path(run["repositories"][key]["worktree"])
+                    current = workflow_tools.repository_state(worktree)
+                    later = [item for item in self._artifacts(repo_id=key, kind="result")
+                             if item[2].get("project_file_access") == "write"
+                             and order.get(str(item[0]), -1) > verification_order]
+                    latest = max(later, key=lambda item: order[str(item[0])])[1] if later else None
+                    unchanged = current == state if latest is None else (
+                        current["fingerprint"] == latest["tree_fingerprint"] and current["head"] == latest["git"]["head"]
+                        and current["branch"] == state["branch"] and not _git(worktree, "diff", "--cached", "--name-only"))
+                    if not unchanged:
+                        raise WorkflowError("unauthorized source change after packet verification")
+                if result["status"] != "complete":
+                    self._block_from_artifact(result)
+                    return "blocked"
+                if any(v["result"] != "pass" for v in result["validations"]):
+                    self._block(summary=f"Fresh external-repair verification failed for {repo_id}.",
+                                evidence_path=Path(accepted["path"]), kind="code", repo_id=repo_id,
+                                required_action="Inspect the fresh failed checks; recovery grants no source repair or retry budget.")
+                    return "blocked"
+                continue
+            if any(workflow_tools.repository_state(Path(run["repositories"][key]["worktree"])) != state
+                   for key, state in record["repository_states"].items()):
+                raise WorkflowError("source/Git state changed after external recovery authorization")
+            if verify_id in run.get("external_repair_attempts", {}):
+                self._block(summary=f"External-repair verification {verify_id} already launched without accepted evidence.",
+                            evidence_path=Path(run["external_repair_attempts"][verify_id]["path"]), kind="decision", repo_id=repo_id,
+                            required_action="Inspect preserved output and supervisor evidence; the one-shot verification cannot relaunch.")
+                return "blocked"
+            existing = self.run_dir / "assignments" / f"{_slug(verify_id)}.json"
+            if existing.exists() and Path(_load_json(existing)["output_artifact"]).exists():
+                raise WorkflowError("unclaimed verification output cannot substitute for a fresh worker")
+            original_assignment = _load_json(Path(record["request"]["assignment"]["path"]))
+            assignment_path = self.build_assignment(
+                stage="implement", repo_id=repo_id, scope=scope,
+                instructions=["Independently inspect and verify the preserved packet on the current tree; do not replay or edit source.",
+                    "Audit the authorized rebase/test-only repair against the exact approved requirements, contract and packet. "
+                    "Report packet_verification as compatible only if the assigned work is fully present and no material scope/contract change exists. "
+                    "Otherwise report blocked with a decision blocker for material change (normal replanning and renewed whole-bundle approval), "
+                    "or a code blocker for unfinished work. Never infer completion from external logs.",
+                    "Run all assigned checks freshly using new logs; preserve actual failures. No cached/external evidence is acceptable. "
+                    "changed_files inventories preserved packet work and authorized test repairs, not edits by this read-only worker.",
+                    "Confirm the isolated database target before migration-capable checks; never use inherited/shared targets or destructive unplanned commands."],
+                validation_ids=original_assignment["validation_ids"], validation_commands=original_assignment["validation_commands"],
+                task_ids=original_assignment["task_ids"], packet_id=record["packet_id"],
+                extras={"execution_mode": "packet-verification", "external_repair": reference,
+                        "project_file_access": "none", "thinking": "medium",
+                        "repositories": self._repository_scope(run, None, write=False),
+                        "input_tree_fingerprint": record["repository_states"][repo_id]["fingerprint"]},
+            )
+            if Path(_load_json(assignment_path)["output_artifact"]).exists():
+                raise WorkflowError("unclaimed verification output cannot substitute for a fresh worker")
+            self._install_actions([assignment_path])
+            with RunLock(self.run_dir):
+                current = self.load_run()
+                current.setdefault("external_repair_attempts", {})[verify_id] = _reference(assignment_path)
+                self._save_run(current)
+            result = self._execute_assignments([assignment_path])
+            if result.rejected:
+                self._block(summary=f"External-repair verification evidence rejected for {verify_id}.",
+                            evidence_path=result.manifest_path, kind="decision", repo_id=repo_id,
+                            required_action="Inspect the new immutable verification evidence; no automatic repair or source replay is authorized.")
+                return "blocked"
+            return "implement"
+        return None
+
     def retry_dependent_fixes(self) -> bool:
         """Retry only a fix blocked by a concurrently changed upstream contract."""
         with RunLock(self.run_dir):
@@ -990,6 +1286,7 @@ class WorkflowEngine:
         """Return current canonical inputs without stale plan/critic generations."""
         paths = [Path(run["request_path"]), Path(run["requirements_path"])]
         paths.extend(Path(ref["path"]) for ref in run.get("run_amendments", []))
+        paths.extend(Path(ref["path"]) for ref in run.get("external_repair_recoveries", {}).values())
         if run.get("contract_path"):
             paths.append(Path(run["contract_path"]))
 
@@ -1154,7 +1451,7 @@ class WorkflowEngine:
             if repo_id is None
             else self.run_dir / "repos" / repo_id / "logs"
         )
-        if run.get("validation_policy_version") == 1:
+        if run.get("validation_policy_version") == 1 or run.get("external_repair_recoveries"):
             log_dir = log_dir / _slug(action_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         assignment: dict[str, Any] = {
@@ -1449,6 +1746,10 @@ class WorkflowEngine:
             ).resolve()
         )
         path = self.run_dir / "assignments" / f"{_slug(replacement['action_id'])}.json"
+        if self.load_run(validate=False).get("external_repair_recoveries"):
+            base = self.run_dir / "repos" / assignment["repo_id"] if assignment.get("repo_id") else self.run_dir
+            replacement["log_dir"] = str(base / "logs" / _slug(replacement["action_id"]))
+            Path(replacement["log_dir"]).mkdir(parents=True, exist_ok=True)
         if not path.exists():
             workflow_tools.atomic_write_json(path, replacement)
         artifact_guard.validate_assignment(_load_json(path))
@@ -3227,6 +3528,9 @@ class WorkflowEngine:
         approved = run.get("plan_review")
         if not isinstance(approved, dict) or approved.get("status") != "approved":
             raise WorkflowError("implementation requires the approved plan bundle")
+        recovery = self._verify_external_repairs(run)
+        if recovery is not None:
+            return recovery
         assignments: list[Path] = []
         all_complete = True
         completed_repositories: set[str] = set()
