@@ -20,8 +20,10 @@ class PacketBuildDependencyTests(unittest.TestCase):
     initialize = fixtures.WorkflowEngineTests.initialize
 
     def prepare(self, *, late_build_failure=False, extra_failure=False, independent_provider=False,
-                provider_without_build=False, extra_blocker=False, omit_check=False, extra_check=False, multi=False):
-        batch = fixtures.FakeSuccessfulBatch()
+                provider_without_build=False, extra_blocker=False, omit_check=False, extra_check=False, multi=False,
+                chain_failure=False, mixed_compile_failure=False, chain_migration=False, late_test_failure=False,
+                chain_command='go test -race ./internal/api/handlers/admin'):
+        batch = fixtures.FakeSuccessfulBatch(migration_capable=chain_migration)
 
         def dependency_batch(paths, **kwargs):
             code, manifest = batch(paths, **kwargs)
@@ -54,6 +56,15 @@ class PacketBuildDependencyTests(unittest.TestCase):
                         artifact['work_packets'][-1]['depends_on'] = []
                     if provider_without_build:
                         artifact['tasks'][-1]['validation_ids'] = ['API-VAL-001']
+                    if chain_failure:
+                        artifact['validations'][0]['command'] = chain_command
+                        artifact['validations'].append(dict(artifact['validations'][0], id='API-VAL-003',
+                                                             command='python -m unittest'))
+                        for task in artifact['tasks']:
+                            task['validation_ids'].append('API-VAL-003')
+                        # The handler task already requires the full build, but
+                        # not the premature admin-package test from task two.
+                        artifact['tasks'][-1]['validation_ids'] = ['API-VAL-002', 'API-VAL-003']
                 elif artifact['artifact_kind'] == 'result':
                     for index, record in enumerate(artifact['validations']):
                         log = Path(assignment['log_dir']) / f"{output.stem}-check-{index}.log"
@@ -66,6 +77,11 @@ class PacketBuildDependencyTests(unittest.TestCase):
                             record.update(result='fail', exit_code=2, summary='Generated interface needs later handlers.')
                             log.write_text('server.go:1: apiHandler does not implement api.StrictServerInterface '
                                            '(missing method CreateSurcharge)\nmake: build failed\n')
+                    if late_test_failure and (assignment.get('packet_id') == 'API-PACKET-003'
+                                              or assignment['stage'] == 'validate'):
+                        check = next(v for v in artifact['validations'] if v['id'] == 'API-VAL-001')
+                        check.update(result='fail', exit_code=1, summary='Handler tests still fail after provider.')
+                        Path(check['log_path']).write_text('--- FAIL: HandlerTest\nFAIL\n')
                     if assignment.get('packet_id') == 'API-PACKET-001':
                         build = next(v for v in artifact['validations'] if v['id'] == 'API-VAL-002')
                         artifact.update(status='blocked', blockers=[{
@@ -83,6 +99,21 @@ class PacketBuildDependencyTests(unittest.TestCase):
                             artifact['validations'] = [build]
                         if extra_check:
                             artifact['validations'].append(dict(artifact['validations'][0], id='API-VAL-003'))
+                    elif chain_failure and assignment.get('packet_id') == 'API-PACKET-002':
+                        check = next(v for v in artifact['validations'] if v['id'] == 'API-VAL-001')
+                        check.update(result='fail', exit_code=1, summary='Same missing generated handler during test compilation.')
+                        Path(check['log_path']).write_text(
+                            '# example/internal/api/server\nserver.go:1: apiHandler does not implement '
+                            'api.StrictServerInterface (missing method CreateSurcharge)\n'
+                            'FAIL\texample/internal/api/handlers/admin [build failed]\n'
+                            'ok  \texample/internal/service/allocation 1.01s\nFAIL\n'
+                            + ('other.go:3: undefined: unrelated\n' if mixed_compile_failure else ''))
+                        artifact.update(status='blocked', blockers=[{
+                            'id': 'BLOCK-CHECK', 'kind': 'dependency',
+                            'summary': 'API-VAL-001 test compilation also needs API-TASK-003 handlers.',
+                            'evidence_path': check['log_path'],
+                            'required_action': 'Preserve service progress and rerun checks after API-TASK-003.',
+                        }])
                 output.write_text(json.dumps(artifact) + '\n')
             return code, manifest
 
@@ -100,6 +131,9 @@ class PacketBuildDependencyTests(unittest.TestCase):
                 self.spec.write_text(json.dumps(spec))
         with mock.patch.object(self, 'write_spec', side_effect=write_multi_spec):
             engine = self.initialize(dependency_batch, profile='full')
+        if chain_migration:
+            engine.record_database_target(repo_id='api', classification='isolated-test',
+                                          description='Injected isolated fixture; fake worker executes no commands.')
         graph = fixtures.build_graph(engine, InMemorySaver())
         config = {'configurable': {'thread_id': 'packet-build'}, 'recursion_limit': 150}
         graph.invoke({'run_dir': str(self.run_dir)}, config)
@@ -208,6 +242,158 @@ class PacketBuildDependencyTests(unittest.TestCase):
         graph.invoke({'run_dir': str(self.run_dir)}, {'configurable': {'thread_id': 'lost'}, 'recursion_limit': 150})
         self.assertEqual('complete', engine.load_run()['status'])
         self.assertEqual(1, sum(a.get('packet_id') == 'API-PACKET-001' for a in batch.assignments))
+
+    def prepare_chain(self, **kwargs):
+        engine, graph, config, batch, arguments = self.prepare(chain_failure=True, **kwargs)
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        basis = engine.load_run()['packet_build_dependencies']['api']
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        run = engine.load_run()
+        self.assertEqual('blocked', run['status'])
+        arguments.update(validation_id='API-VAL-001', blocker_id=run['blockers'][0]['id'],
+                         evidence_sha256=hashlib.sha256(Path(run['blockers'][0]['evidence_path']).read_bytes()).hexdigest())
+        return engine, graph, config, batch, arguments, basis
+
+    def test_same_provider_chain_preserves_both_failures_and_requires_both_checks(self):
+        engine, graph, config, batch, arguments, basis = self.prepare_chain()
+        before = engine.load_run()
+        results = {Path(a['output_artifact']): Path(a['output_artifact']).read_bytes()
+                   for a in batch.assignments if a['stage'] == 'implement'}
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        run = engine.load_run()
+        self.assertEqual('complete', run['status'])
+        self.assertEqual(basis, run['packet_build_dependencies']['api'])
+        self.assertEqual(before['plan_review'], run['plan_review'])
+        self.assertEqual(before['retry_limits'], run['retry_limits'])
+        for path, raw in results.items():
+            self.assertEqual(raw, path.read_bytes())
+            self.assertEqual('blocked', json.loads(raw)['status'])
+        writers = [a for a in batch.assignments if a['stage'] == 'implement']
+        self.assertEqual(3, len(writers))
+        self.assertEqual(['API-VAL-001', 'API-VAL-002', 'API-VAL-003'], writers[-1]['validation_ids'])
+        progress = run['packet_build_progress']['api']
+        self.assertEqual(1, len(progress))
+        self.assertIn(progress[0], writers[-1]['input_artifacts'])
+        self.assertEqual(basis, json.loads(Path(progress[0]['path']).read_text())['basis'])
+
+    def test_chain_does_not_waive_failing_tests_after_provider(self):
+        engine, graph, config, batch, arguments, _ = self.prepare_chain(late_test_failure=True)
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        self.assertEqual('blocked', engine.load_run()['status'])
+        self.assertEqual(1, sum(a['stage'] == 'validation-fix' for a in batch.assignments))
+        self.assertFalse(any(a['stage'] in {'review-1', 'deliver'} for a in batch.assignments))
+        self.assertFalse(engine.continue_packet_build(**arguments))
+
+    def test_chain_retains_isolated_database_gate(self):
+        engine, graph, config, _, arguments, _ = self.prepare_chain(chain_migration=True)
+        target = engine.load_run()['repositories']['api']['database_target_evidence']
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        self.assertEqual('complete', engine.load_run()['status'])
+        self.assertEqual(target, engine.load_run()['repositories']['api']['database_target_evidence'])
+
+    def test_chain_requires_classification_for_migration_capable_check(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain(chain_migration=True)
+        run = engine.load_run()
+        del run['repositories']['api']['database_target_evidence']
+        engine._save_run(run)
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(fixtures.WorkflowError):
+            engine.continue_packet_build(**arguments)
+        self.assertEqual(before, engine.run_path.read_bytes())
+
+    def test_chain_rejects_different_receiver_and_runtime_failure(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain()
+        log = Path(engine.load_run()['blockers'][0]['evidence_path'])
+        original = log.read_text()
+        for text in (original.replace('apiHandler does', 'otherHandler does'), original + '--- FAIL: TestOther\n'):
+            log.write_text(text)
+            arguments['evidence_sha256'] = hashlib.sha256(log.read_bytes()).hexdigest()
+            with self.assertRaises(fixtures.WorkflowError):
+                engine.continue_packet_build(**arguments)
+
+    def test_chain_cannot_readmit_a_packet(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain()
+        before = engine.load_run()
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        # Simulate a stale blocker projection, not another source attempt.
+        run = engine.load_run()
+        run.update(status='blocked', blockers=before['blockers'])
+        engine._save_run(run)
+        raw = engine.run_path.read_bytes()
+        with self.assertRaises(fixtures.WorkflowError):
+            engine.continue_packet_build(**arguments)
+        self.assertEqual(raw, engine.run_path.read_bytes())
+
+    def assert_chain_command_rejected(self, command):
+        engine, _, _, _, arguments, _ = self.prepare_chain(chain_command=command)
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(fixtures.WorkflowError):
+            engine.continue_packet_build(**arguments)
+        self.assertEqual(before, engine.run_path.read_bytes())
+
+    def test_chain_rejects_attached_and_operator(self):
+        self.assert_chain_command_rejected('go test ./...&&printf chained')
+
+    def test_chain_rejects_attached_or_operator(self):
+        self.assert_chain_command_rejected('go test ./...||printf chained')
+
+    def test_chain_rejects_attached_pipe(self):
+        self.assert_chain_command_rejected('go test ./...|printf chained')
+
+    def test_chain_rejects_newline_separator(self):
+        self.assert_chain_command_rejected('go test ./...\nprintf chained')
+
+    def test_chain_accepts_quoted_regex_operators_and_dollar_anchor(self):
+        engine, graph, config, _, arguments, _ = self.prepare_chain(
+            chain_command="go test ./... -run '^Test(Handler|Other)$'")
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        self.assertEqual('complete', engine.load_run()['status'])
+
+    def test_chain_rejects_database_classification_hash_drift(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain(chain_migration=True)
+        target = Path(engine.load_run()['repositories']['api']['database_target_evidence']['path'])
+        target.write_text(target.read_text().replace('Injected isolated fixture', 'Changed classification description'))
+        before = engine.run_path.read_bytes()
+        with self.assertRaises((fixtures.WorkflowError, fixtures.artifact_guard.ValidationError)):
+            engine.continue_packet_build(**arguments)
+        self.assertEqual(before, engine.run_path.read_bytes())
+        self.assertFalse(list((self.run_dir / 'repos/api').glob('packet-build-progress-*.json')))
+
+    def test_chain_cannot_hide_an_unrelated_compiler_error(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain(mixed_compile_failure=True)
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(fixtures.WorkflowError):
+            engine.continue_packet_build(**arguments)
+        self.assertEqual(before, engine.run_path.read_bytes())
+
+    def test_chain_cannot_move_its_original_provider(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain()
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(fixtures.WorkflowError):
+            engine.continue_packet_build(**dict(arguments, until_task='API-TASK-999'))
+        self.assertEqual(before, engine.run_path.read_bytes())
+
+    def test_chain_recovery_survives_projection_crash_without_replay(self):
+        engine, _, _, batch, arguments, _ = self.prepare_chain()
+        with mock.patch.object(engine, '_append_event', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                engine.continue_packet_build(**arguments)
+        graph = fixtures.build_graph(engine, InMemorySaver())
+        graph.invoke({'run_dir': str(self.run_dir)}, {'configurable': {'thread_id': 'chain-crash'}, 'recursion_limit': 150})
+        self.assertEqual('complete', engine.load_run()['status'])
+        self.assertEqual(3, len([a for a in batch.assignments if a['stage'] == 'implement']))
+
+    def test_chain_evidence_is_immutable(self):
+        engine, _, _, _, arguments, _ = self.prepare_chain()
+        log = Path(engine.load_run()['blockers'][0]['evidence_path'])
+        self.assertTrue(engine.continue_packet_build(**arguments))
+        log.write_text('tampered\n')
+        with self.assertRaises(fixtures.artifact_guard.ValidationError):
+            engine.load_run()
 
     def test_omitted_assigned_check_is_not_treated_as_passing(self):
         self.assert_rejected(lambda *_: None, omit_check=True)

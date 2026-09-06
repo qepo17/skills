@@ -1016,8 +1016,16 @@ def validate_run(data: dict[str, Any]) -> None:
             fail(loc, "must pin decision feedback during contract revision")
 
     packet_dependencies = obj(data.get("packet_build_dependencies", {}), "$.packet_build_dependencies")
-    for repository_id, reference in packet_dependencies.items():
-        loc = f"$.packet_build_dependencies.{repository_id}"
+    packet_progress = obj(data.get("packet_build_progress", {}), "$.packet_build_progress")
+    packet_records = [(key, ref, f"$.packet_build_dependencies.{key}", False) for key, ref in packet_dependencies.items()]
+    for key, references in packet_progress.items():
+        loc = f"$.packet_build_progress.{key}"
+        if key not in packet_dependencies:
+            fail(loc, "progress requires the original hashed scheduling intent")
+        packet_records.extend((key, ref, f"{loc}[{index}]", True)
+                              for index, ref in enumerate(array(references, loc)))
+    admitted_packets: dict[str, set[str]] = {}
+    for repository_id, reference, loc, is_progress in packet_records:
         if repository_id not in repositories:
             fail(loc, "unknown repository")
         record = load_json_object(hashed_file_reference(reference, loc), loc)
@@ -1025,6 +1033,19 @@ def validate_run(data: dict[str, Any]) -> None:
             fail(loc, "packet continuation must belong to this run/repository")
         for key in ("plan", "review", "result", "assignment", "reviewed_evidence"):
             hashed_file_reference(field(record, key, loc), f"{loc}.{key}")
+        packet_id = string(field(record, "packet_id", loc), f"{loc}.packet_id")
+        admitted = admitted_packets.setdefault(repository_id, set())
+        if packet_id in admitted:
+            fail(loc, "a packet may be admitted only once")
+        admitted.add(packet_id)
+        if is_progress:
+            if field(record, "basis", loc) != packet_dependencies[repository_id]:
+                fail(loc, "progress must preserve its original scheduling intent")
+            basis = load_json_object(hashed_file_reference(record["basis"], f"{loc}.basis"), loc)
+            if any(record.get(key) != basis[key] for key in ("plan", "review", "until_task", "provider_packet_id")):
+                fail(loc, "progress cannot move the original plan/review or provider")
+            if "database_target" in record:
+                hashed_file_reference(record["database_target"], f"{loc}.database_target")
         if record["result"] not in repositories[repository_id]["accepted_artifacts"].values():
             fail(loc, "packet continuation must preserve an accepted result")
         for index, evidence in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -658,8 +659,9 @@ class WorkflowEngine:
     ) -> bool:
         """Admit preserved foundation progress, never convert a failed build to a pass.
 
-        One explicit scheduling correction per repository permits only a generated
-        Go strict-interface build whose handler task is already approved downstream.
+        One root correction pins a downstream handler. Further distinct ancestor
+        packets may encounter the same interface while compiling their tests; each
+        can add immutable progress once, never move that provider or reset retries.
         The unchanged full-plan validation/fix/review gates still govern delivery.
         """
         with RunLock(self.run_dir):
@@ -668,10 +670,14 @@ class WorkflowEngine:
             if (run["status"] != "blocked" or run["phase"] != "implement"
                     or run.get("profile") != "full" or run["next_actions"]
                     or len(run["blockers"]) != 1 or repo_id not in run["repositories"]
-                    or repo_id in run.get("packet_build_dependencies", {})
                     or review.get("status") != "approved" or review.get("approval_source") != "user"
                     or review.get("review_sha256") != review_sha256):
                 return False
+            basis = self._packet_build_dependency(run, repo_id)
+            if repo_id in run.get("packet_build_dependencies", {}) and not basis:
+                return False  # historical authorization cannot apply to a new bundle
+            if basis and until_task != basis["until_task"]:
+                raise WorkflowError("packet continuation cannot move its original approved handler provider")
             blocker = run["blockers"][0]
             if blocker["kind"] != "dependency" or blocker["id"] != blocker_id:
                 return False
@@ -689,9 +695,34 @@ class WorkflowEngine:
             plan_path, plan = self._current_plan(repo_id)
             checks = {item["id"]: item for item in plan["validations"]}
             check = checks.get(validation_id)
-            if (not check or check["migration_capable"] or check["scope"] != "broad"
+            if basis:
+                if not check:
+                    raise WorkflowError("unknown planned test check")
+                command = re.sub(r"^env(?: -u [A-Z_][A-Z0-9_]*)+ ", "", check["command"])
+                lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+                lexer.whitespace_split, lexer.commenters = True, ""
+                words = list(lexer)
+                if (any(char in command for char in "\r\n") or words[:2] != ["go", "test"]
+                        or any(re.fullmatch(r"[;&|<>]+", word) or "$(" in word or "`" in word for word in words)):
+                    raise WorkflowError("follow-on progress permits only the same interface during planned go test compilation")
+                diagnostic = r"(\*?[\w.]+) does not implement ([\w.]*StrictServerInterface) \(missing method ([A-Za-z]\w+)\)"
+                original_log = Path(basis["reviewed_evidence"]["path"]).read_text()
+                log = evidence.read_text()
+                if (set(re.findall(diagnostic, log)) != set(re.findall(diagnostic, original_log))
+                        or "[build failed]" not in log
+                        or any(not (re.search(diagnostic + r"$", line)
+                            or re.fullmatch(r"# \S+|FAIL(?:\s+\S+ \[build failed\])?", line)
+                            or re.fullmatch(r"(?:ok|\?)\s+\S+\s+(?:[0-9.]+s|\(cached\)|\[no test files\])(?: \[no tests to run\])?", line))
+                               for line in log.splitlines() if line.strip())):
+                    raise WorkflowError("test output must show only the original generated-interface compile failure and passing packages")
+                if check["migration_capable"]:
+                    target = repository.get("database_target_evidence")
+                    if (not target or _sha256(Path(target["path"])) != target["sha256"]
+                            or _load_json(Path(target["path"])).get("classification") not in {"isolated-local", "isolated-test"}):
+                        raise WorkflowError("migration-capable test evidence requires a current hash-pinned isolated database classification")
+            elif (not check or check["migration_capable"] or check["scope"] != "broad"
                     or not re.fullmatch(r"(?:env(?: -u [A-Z_][A-Z0-9_]*)+ )?make build", check["command"])):
-                raise WorkflowError("only the existing non-migration full build can be deferred")
+                raise WorkflowError("only the existing non-migration full build can start a correction")
             agents = self.load_agents()["agents"]
             if (any(repo.get("active_writer") for repo in run["repositories"].values())
                     or any(agent["status"] in {"starting", "working"}
@@ -742,8 +773,9 @@ class WorkflowEngine:
             packet = packets.get(result.get("packet_id"))
             provider = next((item for item in plan["tasks"] if item["id"] == until_task), None)
             if (not packet or set(result["task_ids"]) != set(packet["task_ids"])
-                    or not provider or validation_id not in provider["validation_ids"]
-                    or until_task in packet["task_ids"]):
+                    or not provider or (basis or {"validation_id": validation_id})["validation_id"] not in provider["validation_ids"]
+                    or until_task in packet["task_ids"]
+                    or (basis and packet["id"] in basis["packet_ids"])):
                 raise WorkflowError("provider must be a different approved task that requires this build")
             provider_packet = next(item for item in packets.values() if until_task in item["task_ids"])
             ancestors, pending = set(), list(provider_packet["depends_on"])
@@ -754,6 +786,9 @@ class WorkflowEngine:
                     pending.extend(packets[current]["depends_on"])
             if packet["id"] not in ancestors:
                 raise WorkflowError("handler provider must depend on the blocked packet")
+            if basis and (provider_packet["id"] != basis["provider_packet_id"]
+                          or any(item[1].get("packet_id") == provider_packet["id"] for item in writers)):
+                raise WorkflowError("cannot add progress after the original handler provider has executed")
             state = workflow_tools.repository_state(Path(repository["worktree"]))
             if (state["fingerprint"] != result["tree_fingerprint"] or state["head"] != result["git"]["head"]
                     or state["branch"] != repository["branch"]
@@ -761,7 +796,9 @@ class WorkflowEngine:
                     or _git(Path(repository["worktree"]), "status", "--short").strip()
                     != Path(result["git"]["status_short_path"]).read_text().strip()):
                 raise WorkflowError("stale repository/Git evidence for the blocked packet")
-            path = self.run_dir / "repos" / repo_id / "packet-build-dependency.json"
+            suffix = hashlib.sha256(packet["id"].encode()).hexdigest()[:8]
+            name = f"packet-build-progress-{_slug(packet['id'])}-{suffix}.json" if basis else "packet-build-dependency.json"
+            path = self.run_dir / "repos" / repo_id / name
             record = {
                 "schema_version": 1, "artifact_kind": "packet-build-dependency", "run_id": run["run_id"],
                 "created_at": self.now(), "repo_id": repo_id, "authorization_text": text,
@@ -772,6 +809,10 @@ class WorkflowEngine:
                 "evidence": [_reference(item) for item in sorted(workflow_tools.artifact_evidence_paths(result))],
                 "reviewed_evidence": {"path": str(evidence), "sha256": evidence_sha256},
             }
+            if basis:
+                record["basis"] = run["packet_build_dependencies"][repo_id]
+                if check["migration_capable"]:
+                    record["database_target"] = repository["database_target_evidence"]
             if path.exists():
                 prior = _load_json(path)
                 record["created_at"] = prior.get("created_at")
@@ -779,7 +820,10 @@ class WorkflowEngine:
                     raise WorkflowError("existing immutable packet continuation intent differs")
             else:
                 workflow_tools.atomic_write_json(path, record)
-            run.setdefault("packet_build_dependencies", {})[repo_id] = _reference(path)
+            if basis:
+                run.setdefault("packet_build_progress", {}).setdefault(repo_id, []).append(_reference(path))
+            else:
+                run.setdefault("packet_build_dependencies", {})[repo_id] = _reference(path)
             run["status"], run["blockers"], repository["status"] = "working", [], "pending"
             self._save_run(run)
         self._append_event("resumed", reason="continue-packet-build", artifact=str(path), next_action="implement")
@@ -792,6 +836,9 @@ class WorkflowEngine:
             repository, review = run["repositories"][repo_id], run.get("plan_review") or {}
             if (record["plan"] == {"path": repository.get("plan_path"), "sha256": repository.get("plan_sha256")}
                     and record["review"] == {"path": review.get("review_path"), "sha256": review.get("review_sha256")}):
+                progress = [_load_json(Path(item["path"])) for item in run.get("packet_build_progress", {}).get(repo_id, [])]
+                record["packet_ids"] = [item["packet_id"] for item in [record, *progress]]
+                record["validation_ids"] = sorted({item["validation_id"] for item in [record, *progress]})
                 return record
         return None
 
@@ -1080,6 +1127,8 @@ class WorkflowEngine:
         paths = [Path(run["request_path"]), Path(run["requirements_path"])]
         paths.extend(Path(reference["path"]) for key, reference in run.get("packet_build_dependencies", {}).items()
                      if repo_id is None or repo_id == key)
+        paths.extend(Path(reference["path"]) for key, references in run.get("packet_build_progress", {}).items()
+                     if repo_id is None or repo_id == key for reference in references)
         if run.get("contract_path"):
             paths.append(Path(run["contract_path"]))
 
@@ -2885,7 +2934,7 @@ class WorkflowEngine:
             if dependency:
                 # Scheduling progress only: the accepted foundation result stays
                 # blocked/failed and cannot satisfy the final validation gate.
-                completed.add(dependency["packet_id"])
+                completed.update(dependency["packet_ids"])
             completed_packets_by_repo[repo_id] = completed
             if len(completed) == len(plan["work_packets"]):
                 completed_repositories.add(repo_id)
@@ -2933,7 +2982,9 @@ class WorkflowEngine:
             if (dependency and dependency["provider_packet_id"] not in completed
                     and packet["id"] != dependency["provider_packet_id"]
                     and len(completed) + 1 != len(plan["work_packets"])):
-                validation_ids.discard(dependency["validation_id"])
+                validation_ids.difference_update(dependency["validation_ids"])
+            elif dependency:
+                validation_ids.update(dependency["validation_ids"])
             selected_validations = [
                 validation
                 for validation in plan["validations"]
@@ -2954,7 +3005,7 @@ class WorkflowEngine:
                         "Execute exactly the approved work packet and record any bounded plan deviation.",
                         "Stop rather than introduce an undeclared high-cost mechanism or material contract change.",
                         "Keep next_action at most 300 characters; metadata placeholders do not waive semantic limits.",
-                        *([f"The pinned packet-build-dependency admits foundation progress only. Preserve its failed evidence; do not replay it or add stubs. {dependency['validation_id']} is required from {dependency['until_task']} onward and in final validation."] if dependency else []),
+                        *([f"The pinned packet-build-dependency admits foundation progress only. Preserve its failed evidence; do not replay it or add stubs. {', '.join(dependency['validation_ids'])} are required from {dependency['until_task']} onward and in final validation."] if dependency else []),
                     ],
                     validation_commands=commands,
                     validation_ids=[

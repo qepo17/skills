@@ -124,7 +124,7 @@ The guarded transition rejects other dependency blockers, serializes remaining f
 
 ## Generated-interface build scheduling
 
-When a preserved foundation packet is blocked only because its generated Go strict interface needs handlers assigned to a later approved packet, an explicit user instruction may authorize the narrowly guarded `continue-packet-build` transition in [ORCHESTRATION.md](ORCHESTRATION.md). It preserves the blocked result and failed build, admits scheduling progress without replaying source, and keeps provider/final builds plus independent review mandatory. It is one-shot per repository, does not rewrite approval/plans or reset budgets, and cannot clear unrelated failures. Never add placeholder handlers or manually mark a blocked result complete to advance.
+When a preserved foundation packet is blocked only because its generated Go strict interface needs handlers assigned to a later approved packet, an explicit user instruction may authorize the narrowly guarded `continue-packet-build` transition in [ORCHESTRATION.md](ORCHESTRATION.md). It preserves the blocked result and failed build, admits scheduling progress without replaying source, and keeps provider/final builds plus independent review mandatory. The root intent is one-shot per repository and fixes its provider permanently. Further distinct approved ancestor packets with the exact same handler failure during test compilation may add separately pinned progress once each, never replay work, move the provider, rewrite approval/plans, reset budgets, or clear unrelated failures. All deferred checks remain mandatory from that provider onward. Never add placeholder handlers or manually mark a blocked result complete to advance.
 
 ## Implementation decision replanning
 
