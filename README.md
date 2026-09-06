@@ -3,10 +3,11 @@
 [![skills.sh](https://skills.sh/b/qepo17/skills)](https://skills.sh/qepo17/skills)
 [![CI](https://github.com/qepo17/skills/actions/workflows/ci.yml/badge.svg)](https://github.com/qepo17/skills/actions/workflows/ci.yml)
 
-Two Agent Skills for taking software changes from request to pull request:
+Agent Skills for simple code and taking software changes from request to pull request:
 
 | Skill | Use it for |
 | --- | --- |
+| `simple-code` | Minimal, readable code with YAGNI, readable one-liners, and WHY-only comments. |
 | `fast-end-to-end-development` | A low-risk single-repository change with one review/revision, scripted GitHub delivery, final-head CI evidence, and one separate compatible CI fix. |
 | `end-to-end-development` | Durable single- or multi-repository orchestration with one review/remediation pass, automatic low-risk plan decisions, and explicit approval only for high-risk work. |
 
@@ -38,7 +39,7 @@ npx skills add qepo17/skills \
   --yes
 ```
 
-Install both globally for Pi:
+Install all globally for Pi:
 
 ```bash
 npx skills add qepo17/skills \
@@ -57,10 +58,12 @@ npx skills add git@github.com:qepo17/skills.git
 Update installed global skills with:
 
 ```bash
-npx skills update --global end-to-end-development fast-end-to-end-development
+npx skills update --global end-to-end-development fast-end-to-end-development simple-code
 ```
 
 ## Requirements
+
+`simple-code` has no runtime dependencies.
 
 ### Fast workflow
 
@@ -81,7 +84,7 @@ The durable workflow automatically uses Paseo when invoked by a Paseo parent age
 
 New runs use `gpt-6-astra` with stage-specific reasoning: xhigh for full-profile planning/review/challenge/integration, high for ordinary planning/review and all source fixes, and medium for validation, artifact-only repair, and fallback delivery. GitHub.com delivery runs as deterministic commands rather than another agent. A narrow, bounded output-only repair handles missing blocker classifications without replaying implementation. Existing durable runs retain their pinned legacy policies.
 
-Both skills require verified final-head required checks, not merely a PR URL. Pending CI is not completion. An explicit absence of configured required checks is reported as `not-configured`, not "CI passed"; unknown policy blocks. The fast skill's coordinator normally delegates only independent review and requires a dedicated worktree plus browser evidence for UI changes. See its [delivery contract](skills/fast-end-to-end-development/DELIVERY.md).
+Both workflow skills require verified final-head required checks, not merely a PR URL. Pending CI is not completion. An explicit absence of configured required checks is reported as `not-configured`, not "CI passed"; unknown policy blocks. The fast skill's coordinator normally delegates only independent review and requires a dedicated worktree plus browser evidence for UI changes. See its [delivery contract](skills/fast-end-to-end-development/DELIVERY.md).
 
 The durable workflow finds `codebase-design` beside the installed skill and in common Pi/Codex global skill directories. Set `E2E_CODEBASE_DESIGN_DIR` when it lives elsewhere. The workflow installs its locked Python dependencies into the user cache through its bundled wrapper; it does not place a virtual environment in the installed skill directory.
 
@@ -95,10 +98,13 @@ skills/
 │   ├── schemas/
 │   ├── scripts/
 │   └── tests/
-└── fast-end-to-end-development/
+├── fast-end-to-end-development/
+│   ├── SKILL.md
+│   ├── agents/
+│   └── scripts/
+└── simple-code/
     ├── SKILL.md
-    ├── agents/
-    └── scripts/
+    └── agents/
 ```
 
 Each skill is self-contained so `npx skills` installs its supporting scripts, schemas, documentation, and metadata together with `SKILL.md`.
