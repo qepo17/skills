@@ -147,6 +147,14 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         elif args.command == "retry-corrected-handoff":
             if not engine.retry_corrected_handoff(args.original_artifact):
                 raise WorkflowError("run is not eligible for corrected next_action recovery")
+        elif args.command == "replan-decision":
+            if graph.get_state(config).next:
+                raise WorkflowError("decision replanning requires a settled graph cursor")
+            if not engine.replan_decision(
+                review_sha256=args.review_sha256, blocker_id=args.blocker_id,
+                blocker_evidence_sha256=args.blocker_evidence_sha256, text=args.text, context=args.context,
+            ):
+                raise WorkflowError("run is not eligible for implementation-decision replanning")
         elif args.command == "retry-dependent-fixes":
             if not engine.retry_dependent_fixes():
                 raise WorkflowError(
@@ -248,6 +256,18 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     handoff_retry.add_argument("--report-root", type=Path)
 
+    replan = subparsers.add_parser(
+        "replan-decision", help="return an accepted implementation decision to bounded planning"
+    )
+    replan.add_argument("run_dir", type=Path)
+    replan.add_argument("--review-sha256", required=True)
+    replan.add_argument("--blocker-id", required=True)
+    replan.add_argument("--blocker-evidence-sha256", required=True)
+    replan.add_argument("--text", required=True)
+    replan.add_argument("--context", default="")
+    replan.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    replan.add_argument("--report-root", type=Path)
+
     dependent_fix_retry = subparsers.add_parser(
         "retry-dependent-fixes",
         help="retry fixes after an accepted upstream contract fix",
@@ -323,7 +343,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command == "retry-corrected-handoff":
+        elif args.command in {"retry-corrected-handoff", "replan-decision"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},

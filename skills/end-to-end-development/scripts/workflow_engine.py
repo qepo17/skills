@@ -522,6 +522,136 @@ class WorkflowEngine:
                            next_action="implement")
         return True
 
+    def replan_decision(
+        self, *, review_sha256: str, blocker_id: str, blocker_evidence_sha256: str,
+        text: str, context: str = ""
+    ) -> bool:
+        """Invalidate one approved bundle for an accepted implementation decision.
+
+        This is a bounded planning transition, not permission to retry a writer.
+        Preserve old artifacts, approval and worktree facts as immutable feedback.
+        """
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            review = run.get("plan_review") or {}
+            if (run["status"] != "blocked" or run["phase"] != "implement"
+                    or run.get("profile") != "full" or run["next_actions"]
+                    or len(run["blockers"]) != 1 or review.get("status") != "approved"
+                    or review.get("approval_source") != "user"):
+                return False
+            blocker = run["blockers"][0]
+            if (blocker["kind"] != "decision" or blocker["id"] != blocker_id
+                    or review["review_sha256"] != review_sha256):
+                return False
+            if not text.strip() or len(text) > 4000 or len(context) > 8000:
+                raise WorkflowError("decision text must contain 1-4000 characters; context at most 8000")
+            if _sha256(Path(blocker["evidence_path"])) != blocker_evidence_sha256:
+                raise WorkflowError("blocker evidence changed since the decision was reviewed")
+            agents = self.load_agents()["agents"]
+            worker_order = {agent["output_artifact"]: index for index, agent in enumerate(agents)}
+            if (any(repo.get("active_writer") for repo in run["repositories"].values())
+                    or any(agent["status"] in {"starting", "working"}
+                           or agent.get("cleanup_status") != "complete" for agent in agents)):
+                raise WorkflowError("decision replanning requires closed, cleaned worker handles")
+            implementations = [item for repo_id in run["repositories"]
+                               for item in self._artifacts(repo_id=repo_id, stage="implement", kind="result")]
+            matches = [(path, result, assignment) for path, result, assignment in implementations
+                       if result.get("status") == "blocked" and len(result.get("blockers", [])) == 1
+                       and any(all(candidate.get(key) == blocker[key]
+                                   for key in ("kind", "summary", "evidence_path", "required_action"))
+                               for candidate in result.get("blockers", []))]
+            if len(matches) != 1:
+                raise WorkflowError("decision must match one accepted blocked implementation result")
+            _, _, assignment = matches[0]
+            repo = run["repositories"].get(assignment.get("repo_id"))
+            if (not repo or not self._assignment_pins(assignment, Path(repo["plan_path"]), repo["plan_sha256"])
+                    or assignment.get("plan_review") != {"path": review["review_path"], "sha256": review_sha256}):
+                raise WorkflowError("decision result must pin the current approved plan")
+            limit = run["retry_limits"]["plan_revision_cycles"]
+            if (len(run.get("decision_replans", [])) >= limit
+                    or any(self._current_plan(repo_id)[1]["revision"] - 1 >= limit
+                           for repo_id in run["repositories"])):
+                raise WorkflowError("plan revision limit exhausted")
+            contract_revision = None
+            if run["workflow_policy"]["contract_required"]:
+                contract_revision = _load_json(Path(run["contract_path"]))["revision"] + 1
+                if contract_revision - 1 > run["retry_limits"]["contract_revisions"]:
+                    raise WorkflowError("contract revision limit exhausted")
+            states = {}
+            evidence_paths = {Path(review["review_path"]), Path(blocker["evidence_path"])}
+            for repo_id, repository in run["repositories"].items():
+                worktree = Path(repository["worktree"])
+                state = workflow_tools.repository_state(worktree)
+                writers = self._artifacts(repo_id=repo_id, stage="implement", kind="result")
+                if writers:
+                    if any(str(path) not in worker_order for path, _, _ in writers):
+                        raise WorkflowError(f"missing implementation worker history for {repo_id}")
+                    latest_path, latest, _ = max(writers, key=lambda item: worker_order[str(item[0])])
+                    if latest.get("status") != "complete" and latest_path != matches[0][0]:
+                        raise WorkflowError(f"unresolved implementation outcome for {repo_id}")
+                    expected_head = latest["git"]["head"]
+                    expected_tree = latest["tree_fingerprint"]
+                    status_path = Path(latest["git"]["status_short_path"])
+                else:
+                    plan = self._current_plan(repo_id)[1]
+                    plan_assignment = _load_json(Path(plan["assignment_path"]))
+                    expected_head = repository["baseline"]
+                    expected_tree = plan_assignment["input_tree_fingerprint"]
+                    status_path = Path(repository["initial_status_path"])
+                if (state["branch"] != repository["branch"] or state["head"] != expected_head
+                        or state["fingerprint"] != expected_tree
+                        or _git(worktree, "diff", "--cached", "--name-only").strip()
+                        or _git(worktree, "status", "--short").strip() != status_path.read_text().strip()):
+                    raise WorkflowError(f"stale repository/Git evidence for {repo_id}")
+                states[repo_id] = state
+                evidence_paths.add(status_path)
+                for path, artifact, _ in self._artifacts(repo_id=repo_id):
+                    evidence_paths.update({path, Path(artifact["assignment_path"])})
+                    evidence_paths.update(workflow_tools.artifact_evidence_paths(artifact))
+            for path, artifact, _ in self._artifacts():
+                evidence_paths.update({path, Path(artifact["assignment_path"])})
+                evidence_paths.update(workflow_tools.artifact_evidence_paths(artifact))
+            version = len(run.get("decision_replans", [])) + 1
+            path = self.run_dir / f"decision-replan-v{version}.json"
+            feedback = {
+                "schema_version": 1, "artifact_kind": "plan-feedback", "run_id": run["run_id"],
+                "created_at": self.now(), "review_path": review["review_path"],
+                "review_sha256": review_sha256, "repository_ids": sorted(run["repositories"]),
+                "text": text, "context": context, "previous_plan_review": review,
+                "blocker": blocker, "blocker_evidence_sha256": blocker_evidence_sha256,
+                "repository_states": states,
+                "evidence": [_reference(p) for p in sorted(evidence_paths)],
+            }
+            if path.exists():
+                # A crash before the projection write may leave immutable intent.
+                prior = _load_json(path)
+                feedback["created_at"] = prior.get("created_at")
+                if prior != feedback:
+                    raise WorkflowError("existing decision replan intent differs; do not overwrite it")
+            else:
+                workflow_tools.atomic_write_json(path, feedback)
+            reference = _reference(path)
+            run.setdefault("decision_replans", []).append(reference)
+            run["plan_feedback"] = {**reference, "repository_ids": sorted(run["repositories"])}
+            run["pending_plan_revisions"] = {
+                repo_id: {"plan": {"path": repository["plan_path"], "sha256": repository["plan_sha256"]},
+                          "basis": {"kind": "user-feedback", "artifact": reference}}
+                for repo_id, repository in run["repositories"].items()
+            }
+            if contract_revision is not None:
+                run["pending_contract_revision"] = {"revision": contract_revision, "feedback": reference}
+            run["plan_review"] = None
+            run["status"], run["blockers"] = "working", []
+            run["phase"] = "contract" if contract_revision is not None else "plan"
+            for repository in run["repositories"].values():
+                repository["stage"], repository["status"] = run["phase"], "pending"
+                repository["design_challenge_path"] = None
+                repository["design_challenge_sha256"] = None
+            self._save_run(run)
+        self._append_event("plan-changes-requested", artifact=str(path), reason="implementation-decision",
+                           next_action=run["phase"])
+        return True
+
     def retry_dependent_fixes(self) -> bool:
         """Retry only a fix blocked by a concurrently changed upstream contract."""
         with RunLock(self.run_dir):
@@ -735,6 +865,7 @@ class WorkflowEngine:
             return
         stage = assignment["stage"]
         if stage == "contract":
+            run.pop("pending_contract_revision", None)
             run["contract_path"] = str(output_path.resolve())
             run["contract_sha256"] = _sha256(output_path)
             pending = run.setdefault("pending_plan_revisions", {})
@@ -1002,7 +1133,10 @@ class WorkflowEngine:
             "finding_ids": sorted(finding_ids),
             "validation_ids": sorted(validation_ids),
             "packet_id": packet_id,
-            "instructions": sorted(set(instructions)),
+            "instructions": sorted(set(instructions) | ({
+                "Preserve existing work and accepted evidence; use new assignment-specific log paths, never overwrite prior logs.",
+                "Use the hash-pinned decision feedback and preserved worktree as the revision basis; plan only the remaining delta, not a restart."
+            } if run.get("decision_replans") else set())),
             "validation_commands": list(dict.fromkeys(validation_commands)),
             "output_kind": output_kind,
             "output_artifact": str(output_path.resolve()),
@@ -1536,15 +1670,24 @@ class WorkflowEngine:
         replacement_limit = run["retry_limits"]["worker_replacements_per_stage"]
         repair_enabled = run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
         # Recovered repairs retain their accepted result, including real blockers.
+        # Replanning also recovers the acceptance-to-projection crash window:
+        # never relaunch a contract/planner/challenger with immutable accepted output.
         pending = []
         for path in current:
             assignment = _load_json(path)
-            refs = run["repositories"].get(assignment.get("repo_id"), {}).get("accepted_artifacts", {})
+            refs = (run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
+                    if assignment.get("repo_id") else run.get("accepted_artifacts", {}))
             reference = refs.get(assignment["action_id"])
-            if assignment.get("execution_mode") == "artifact-repair" and reference:
+            recover_planning = bool(run.get("decision_replans")) and assignment["stage"] in {
+                "contract", "plan", "design-challenge"
+            }
+            if reference and (assignment.get("execution_mode") == "artifact-repair" or recover_planning):
                 if _reference(Path(reference["path"])) != reference:
-                    raise WorkflowError("accepted artifact repair evidence changed")
-                accepted.append(_load_json(Path(reference["path"])))
+                    raise WorkflowError("accepted artifact evidence changed")
+                artifact = _load_json(Path(reference["path"]))
+                if artifact.get("assignment_sha256") != _sha256(path):
+                    raise WorkflowError("accepted artifact assignment changed")
+                accepted.append(artifact)
             else:
                 repair = next((item for item in run.get("artifact_repairs", {}).values()
                                if item["assignment"]["path"] == str(path.resolve())), {})
@@ -1691,6 +1834,7 @@ class WorkflowEngine:
             Path(self.load_run(validate=False)["repositories"][repo_id]["worktree"])
         )
         latest_writer = self._latest_writer_artifact(repo_id)
+        plan_path, _ = self._current_plan(repo_id)
         expected = {
             (
                 validation["id"],
@@ -1703,6 +1847,8 @@ class WorkflowEngine:
             if (
                 artifact.get("status") != "complete"
                 or artifact.get("tree_fingerprint") != fingerprint
+                or (self.load_run(validate=False).get("decision_replans")
+                    and not self._assignment_pins(assignment, plan_path, _sha256(plan_path)))
             ):
                 continue
             if latest_writer is not None and path.resolve() != latest_writer[0].resolve():
@@ -1896,17 +2042,19 @@ class WorkflowEngine:
     def phase_contract(self) -> str:
         run = self.load_run()
         revision, challenge_assignment = self._contract_revision_needed(run)
+        pending = run.get("pending_contract_revision")
+        if pending:
+            revision = pending["revision"]
         needs_contract = (
-            run.get("contract_path") is None or challenge_assignment is not None
+            run.get("contract_path") is None or challenge_assignment is not None or pending is not None
         )
         if (
-            challenge_assignment is not None
+            needs_contract
             and revision - 1 > run["retry_limits"]["contract_revisions"]
         ):
-            challenge = _load_json(challenge_assignment)
             self._block(
                 summary="Contract revision limit exhausted without an acceptable plan set.",
-                evidence_path=Path(challenge["output_artifact"]),
+                evidence_path=Path(_load_json(challenge_assignment)["output_artifact"]) if challenge_assignment else self.run_path,
                 required_action="Make a material contract/product decision before resuming.",
                 kind="dependency",
             )
@@ -1915,6 +2063,8 @@ class WorkflowEngine:
             inputs = [Path(run["request_path"]), Path(run["requirements_path"])]
             if run.get("contract_path"):
                 inputs.append(Path(run["contract_path"]))
+            if pending:
+                inputs.append(Path(pending["feedback"]["path"]))
             if challenge_assignment:
                 challenge = _load_json(challenge_assignment)
                 challenge_output = Path(challenge["output_artifact"])
@@ -1941,6 +2091,7 @@ class WorkflowEngine:
             output_path = Path(_load_json(output)["output_artifact"])
             with RunLock(self.run_dir):
                 run = self.load_run()
+                run.pop("pending_contract_revision", None)
                 run["contract_path"] = str(output_path.resolve())
                 run["contract_sha256"] = _sha256(output_path)
                 pending = run.setdefault("pending_plan_revisions", {})
@@ -2642,7 +2793,7 @@ class WorkflowEngine:
                 self.build_assignment(
                     stage="implement",
                     repo_id=repo_id,
-                    scope=packet["id"],
+                    scope=(f"plan-v{plan['revision']}-{packet['id']}" if run.get("decision_replans") else packet["id"]),
                     inputs=self._canonical_inputs(run, repo_id),
                     instructions=[
                         "Execute exactly the approved work packet and record any bounded plan deviation.",
