@@ -1,6 +1,6 @@
 # Worker blocker contract
 
-Use this contract when an assigned stage cannot finish. A finding discovered by a completed review is not itself a blocker: record it in `findings` with the review still complete.
+Use this contract when an assigned stage cannot finish. A finding discovered by a completed review is not itself a blocker: record it in `findings` with the review still complete. Likewise, on a validation-policy-version-1 assignment, a reported check failure does not make finished source/check-reporting work blocked; preserve the failed observation in a complete result and let the engine evaluate its gate.
 
 Every blocker has all five fields:
 
@@ -14,7 +14,11 @@ Every blocker has all five fields:
 }
 ```
 
-Kinds are `decision`, `environment`, `authentication`, `permission`, `infrastructure`, `dependency`, and `code`. Choose from actual evidence; never omit `kind` or guess a retryable category to bypass a real decision. Evidence must exist. A blocked artifact needs at least one blocker; a complete artifact has none.
+Kinds are `decision`, `environment`, `authentication`, `permission`, `infrastructure`, `dependency`, and `code`. Choose from actual evidence; never omit `kind` or guess a retryable category to bypass a real decision. Evidence must exist. A blocked artifact needs at least one blocker; a complete artifact has none. Blocker prose is descriptive evidence, never transition authority: do not copy, tune, or regex-match a message to imitate a supported recovery condition. Only typed gate fields, current hash-pinned evidence, and supported commands can authorize a transition.
+
+A local validation-gate blocker may expose exact candidate check IDs. It cannot waive missing/protected evidence or convert unfinished work to complete. An exclusion clears only its targeted eligible check; every untargeted or non-validation blocker remains. A required-CI blocker reports the latest observed identities/state and PR URL when known; it does not by itself authorize a source fix.
+
+For new runs the coordinator, not the worker, derives scoped `gate` metadata: `local-validation`, `required-ci`, or the narrowly recognized `delivery-state` body/readiness conflict. The latter permits only read-only re-observation after external resolution; it is not a generic decision/code-blocker bypass.
 
 After initializing and completing the other semantic fields, prefer the typed constructor:
 

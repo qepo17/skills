@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import validation_policy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NoReturn
@@ -31,6 +32,7 @@ MAX_BYTES = {
     "integration": 96 * 1024,
     "delivery": 64 * 1024,
     "report": 32 * 1024,
+    "run-amendment": 64 * 1024,
 }
 
 PHASES = {
@@ -681,6 +683,70 @@ def validate_plan_review(
     return review_status
 
 
+def validate_amendment_request(data: dict[str, Any]) -> None:
+    data = obj(data, '$')
+    if len(json.dumps(data).encode()) > MAX_BYTES['run-amendment']:
+        fail('$', 'amendment request exceeds its size limit')
+    allowed = {"kind", "decision", "repo_id", "target", "check_ids", "authority", "text", "rationale", "expected_context", "evidence"}
+    if set(data) != allowed:
+        fail("$", f"amendment request must have exactly {sorted(allowed)}")
+    kind = enum(data["kind"], {"validation-exception", "check-remediation"}, "$.kind")
+    enum(data["decision"], {"exclude", "restore"} if kind == "validation-exception" else {"fix-related"}, "$.decision")
+    repo_id(data["repo_id"], "$.repo_id")
+    enum(data["target"], {"local"} if kind == "validation-exception" else {"local", "ci"}, "$.target")
+    string_array(data["check_ids"], "$.check_ids", sorted_values=True, nonempty=True, unique=True)
+    expected_authority = "user" if kind == "validation-exception" else "coordinator"
+    if data["authority"] != expected_authority:
+        fail("$.authority", f"must be {expected_authority}")
+    if expected_authority == "user":
+        string(data["text"], "$.text", max_length=4000)
+    elif data["text"] is not None:
+        fail("$.text", "coordinator reasoning is not user approval; use rationale")
+    string(data["rationale"], "$.rationale", max_length=2000)
+    sha256(data["expected_context"], "$.expected_context")
+    evidence = array(data["evidence"], "$.evidence")
+    if kind == "check-remediation" and not evidence:
+        fail("$.evidence", "related remediation requires reviewed evidence")
+    for index, reference in enumerate(evidence):
+        hashed_file_reference(reference, f"$.evidence[{index}]")
+
+
+def validate_run_amendment(data: dict[str, Any]) -> None:
+    validate_common(data, "run-amendment")
+    if len((json.dumps(data, indent=2) + '\n').encode()) > MAX_BYTES['run-amendment']:
+        fail('$', 'amendment exceeds its size limit')
+    timestamp(field(data, "created_at", "$"), "$.created_at")
+    request = obj(field(data, "request", "$"), "$.request")
+    # Original evidence is preserved in immutable snapshots below; the original
+    # request remains authorization history even if its diagnostic path moved.
+    for key in ("kind", "decision", "repo_id", "target", "check_ids", "authority", "text", "rationale"):
+        if data.get(key) != request.get(key):
+            fail(f"$.{key}", "must match the original request")
+    validate_amendment_request(request | {"evidence": field(data, "evidence", "$")})
+    expected = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if sha256(field(data, "request_sha256", "$"), "$.request_sha256") != expected:
+        fail("$.request_sha256", "does not match original request")
+    basis = obj(field(data, 'basis', '$'), '$.basis')
+    if set(basis) != {'requirements_sha256', 'contract_sha256', 'plan_sha256', 'review_sha256'}:
+        fail('$.basis', 'requires exact canonical semantic hashes')
+    for key, value in basis.items():
+        if key != 'contract_sha256' or value is not None:
+            sha256(value, '$.basis.' + key)
+    state = obj(field(data, 'repository_state', '$'), '$.repository_state')
+    if set(state) != {'fingerprint', 'head', 'branch', 'index_sha256'}:
+        fail('$.repository_state', 'requires exact content/HEAD/branch/index identity')
+    for key in ('fingerprint', 'index_sha256'):
+        sha256(state[key], '$.repository_state.' + key)
+    sha(state['head'], '$.repository_state.head')
+    string(state['branch'], '$.repository_state.branch')
+    if not data.get('review') or data['review'].get('sha256') != basis['review_sha256']:
+        fail('$.review', 'must bind the approved semantic review hash')
+    for key in ("review", "source_artifact", "delivery_artifact"):
+        optional_hashed_file_reference(field(data, key, "$"), f"$.{key}")
+    for index, reference in enumerate(array(field(data, "evidence", "$"), "$.evidence")):
+        hashed_file_reference(reference, f"$.evidence[{index}]")
+
+
 def validate_run(data: dict[str, Any]) -> None:
     validate_common(data, "run")
     timestamp(field(data, "created_at", "$"), "$.created_at")
@@ -688,6 +754,27 @@ def validate_run(data: dict[str, Any]) -> None:
     status = enum(field(data, "status", "$"), RUN_STATUSES, "$.status")
     phase = enum(field(data, "phase", "$"), PHASES, "$.phase")
     enum(data.get("worker_reasoning_policy", "legacy-xhigh"), {"stage-v1", "legacy-xhigh"}, "$.worker_reasoning_policy")
+    for version in ("validation_policy_version", "delivery_policy_version"):
+        if version in data and (type(data[version]) is not int or data[version] != 1):
+            fail(f"$.{version}", "unsupported policy version")
+    if ('validation_policy_version' in data) != ('delivery_policy_version' in data):
+        fail('$', 'validation and delivery policy versions must be pinned together')
+    amendments = array(data.get("run_amendments", []), "$.run_amendments")
+    if amendments and data.get("validation_policy_version") != 1:
+        fail("$.run_amendments", "legacy runs cannot contain new amendments")
+    seen_decisions = set()
+    for index, reference in enumerate(amendments):
+        location = f"$.run_amendments[{index}]"
+        path = hashed_file_reference(reference, location)
+        amendment = load_json_object(path, location)
+        validate_run_amendment(amendment)
+        if amendment["run_id"] != data["run_id"] or amendment["request_sha256"] in seen_decisions:
+            fail(location, "amendment run identity or uniqueness is invalid")
+        seen_decisions.add(amendment["request_sha256"])
+    for pending_key in ("pending_check_remediations", "pending_validation_refresh"):
+        for repo, reference in obj(data.get(pending_key, {}), f"$.{pending_key}").items():
+            if repo not in data.get("repositories", {}) or reference not in amendments:
+                fail(f"$.{pending_key}", "must pin a recorded amendment for a known repository")
     profile_value = data.get("profile")
     profile: str | None = None
     workflow_policy: dict[str, Any] | None = None
@@ -1199,6 +1286,11 @@ def validate_agents(data: dict[str, Any]) -> None:
 
 def validate_assignment(data: dict[str, Any]) -> None:
     validate_common(data, "assignment")
+    for version in ("validation_policy_version", "delivery_policy_version"):
+        if version in data and (type(data[version]) is not int or data[version] != 1):
+            fail(f"$.{version}", "unsupported policy version")
+    if ('validation_policy_version' in data) != ('delivery_policy_version' in data):
+        fail('$', 'validation and delivery policy versions must be pinned together')
     string(field(data, "action_id", "$"), "$.action_id", max_length=200)
     timestamp(field(data, "created_at", "$"), "$.created_at")
     stage = enum(field(data, "stage", "$"), ASSIGNMENT_STAGES, "$.stage")
@@ -1206,8 +1298,9 @@ def validate_assignment(data: dict[str, Any]) -> None:
     if execution_mode == "command" and stage != "deliver":
         fail("$.execution_mode", "only delivery uses command assignments")
     verify_only = boolean(data.get("verify_only", False), "$.verify_only")
-    if verify_only and execution_mode != "command":
-        fail("$.verify_only", "read-only delivery verification requires a command assignment")
+    if verify_only and not (stage == "deliver" and (execution_mode == "command"
+            or (execution_mode == "worker" and data.get("delivery_policy_version") == 1))):
+        fail("$.verify_only", "read-only verification requires command delivery or a new-policy fallback delivery worker")
     if data.get("delivery_evidence_version", 1) not in {1, 2}:
         fail("$.delivery_evidence_version", "unsupported delivery evidence version")
     check_timeout = integer(data.get("check_timeout_seconds", 1800), "$.check_timeout_seconds", minimum=0)
@@ -1250,6 +1343,15 @@ def validate_assignment(data: dict[str, Any]) -> None:
         field(data, "forge_access", "$"), {"none", "write"}, "$.forge_access"
     )
     if stage == "deliver":
+        if data.get('delivery_policy_version') == 1:
+            ownership = obj(field(data, 'pr_ownership', '$'), '$.pr_ownership')
+            if set(ownership) != {'repository', 'branch', 'base_branch', 'intent_path'}:
+                fail('$.pr_ownership', 'requires the coordinator-pinned PR identity and intent path')
+            for key in ('repository', 'branch', 'base_branch'):
+                string(ownership[key], '$.pr_ownership.' + key)
+            intent = Path(absolute_path(ownership['intent_path'], '$.pr_ownership.intent_path'))
+            if intent.resolve().is_relative_to(Path(data['cwd']).resolve()) or intent.resolve().parent != intent.parent.resolve():
+                fail('$.pr_ownership.intent_path', 'must not escape its directory or enter the project')
         expected_access = "none" if verify_only else "write"
         if git_access != expected_access or forge_access != expected_access:
             fail("$", f"delivery assignment requires {expected_access} Git/forge write access")
@@ -1489,6 +1591,8 @@ def validate_assignment(data: dict[str, Any]) -> None:
         if stage == "validation-fix" and not assigned_validation_ids:
             fail("$.validation_ids", "validation fix batches require at least one validation ID")
         evidence_stages = {"implement", "validate", "fix-1", "fix-2", "pipeline-fix"}
+        if data.get("validation_policy_version") == 1:
+            evidence_stages.add("validation-fix")
         if stage in evidence_stages and len(assigned_validation_ids) != len(
             data["validation_commands"]
         ):
@@ -1496,6 +1600,63 @@ def validate_assignment(data: dict[str, Any]) -> None:
                 "$.validation_ids",
                 "must pair one planned validation ID with every assigned command",
             )
+    if data.get('validation_policy_version') == 1:
+        if stage in {'implement', 'validate', 'validation-fix', 'fix-1', 'fix-2', 'pipeline-fix'}:
+            pinned = [(ref, load_json_object(ref['path'], '$.input_artifacts'))
+                      for ref in input_artifacts if ref['path'].endswith('.json')]
+            plans = [(ref, item) for ref, item in pinned if item.get('artifact_kind') == 'plan' and item.get('repo_id') == assigned_repo]
+            if len(plans) != 1:
+                fail('$.input_artifacts', 'validation execution requires one canonical repository plan')
+            plan_ref, plan = plans[0]
+            basis = {'requirements_sha256': plan['requirements_sha256'], 'contract_sha256': plan['contract_sha256'],
+                     'plan_sha256': plan_ref['sha256'], 'review_sha256': next((ref['sha256'] for ref in input_artifacts
+                         if re.fullmatch(r'plan-review-v[1-9][0-9]*\.md', Path(ref['path']).name)), None)}
+            ordered_amendments = []
+            for ref, item in pinned:
+                if item.get('artifact_kind') != 'run-amendment':
+                    continue
+                match = re.fullmatch(r'run-amendment-v([1-9][0-9]*)\.json', Path(ref['path']).name)
+                if not match:
+                    fail('$.input_artifacts', 'amendments require canonical sequence names')
+                ordered_amendments.append((int(match[1]), item | {'reference': ref}))
+            amendments = [item for _, item in sorted(ordered_amendments, key=lambda entry: entry[0])]
+            excluded = validation_policy.exclusions(amendments, repo_id=assigned_repo, basis=basis)
+            effective = validation_policy.effective_checks(plan['validations'], excluded)
+            expected_ids = {check['id'] for check in effective}
+            if stage == 'implement':
+                packets = {packet['id']: packet for packet in plan['work_packets']}
+                if packet_id_value not in packets or assigned_task_ids != sorted(packets[packet_id_value]['task_ids']):
+                    fail('$.task_ids', 'must exactly match the canonical work packet')
+                completed = {item.get('packet_id') for _, item in pinned
+                    if item.get('artifact_kind') == 'result' and item.get('stage') == 'implement' and item.get('status') == 'complete'
+                    and item.get('repo_id') == assigned_repo and plan_ref in load_json_object(item['assignment_path'], '$.input_artifacts')['input_artifacts']}
+                if set(packets) - completed - {packet_id_value}:
+                    expected_ids &= {check_id for task in plan['tasks'] if task['id'] in assigned_task_ids for check_id in task['validation_ids']}
+            expected = [check for check in effective if check['id'] in expected_ids]
+            if assigned_validation_ids != [check['id'] for check in expected] or data['validation_commands'] != [check['command'] for check in expected]:
+                fail('$.validation_ids', 'must contain the canonical effective ID/command pairs')
+        for field_name, kind, decision, stages in (
+                ('remediation', 'check-remediation', 'fix-related', {'validation-fix', 'pipeline-fix'}),
+                ('validation_refresh', 'validation-exception', 'restore', {'validate'})):
+            if field_name not in data:
+                if field_name == 'remediation' and stage in stages:
+                    fail('$.remediation', 'new source remediation requires an authorized amendment')
+                continue
+            reference = data[field_name]
+            path = hashed_file_reference(reference, '$.' + field_name)
+            amendment = load_json_object(path, '$.' + field_name)
+            validate_run_amendment(amendment)
+            if (stage not in stages or amendment['kind'] != kind or amendment['decision'] != decision
+                    or amendment['repo_id'] != assigned_repo or amendment['run_id'] != data['run_id']
+                    or reference not in data['input_artifacts']):
+                fail('$.' + field_name, 'must pin the matching repository/stage amendment as an input')
+            if field_name == 'remediation':
+                if amendment['target'] != ('ci' if stage == 'pipeline-fix' else 'local'):
+                    fail('$.remediation', 'target must match the source-fix stage')
+                if field(data, 'failed_validation_ids', '$') != amendment['check_ids']:
+                    fail('$.failed_validation_ids', 'must exactly identify the authorized repair targets')
+        if 'failed_validation_ids' in data and 'remediation' not in data:
+            fail('$.failed_validation_ids', 'requires a remediation decision')
     if repair_mode:
         validate_repair_assignment(data)
     output_kind = enum(
@@ -1794,6 +1955,14 @@ def validate_plan(data: dict[str, Any]) -> None:
             field(validation, "migration_capable", loc), f"{loc}.migration_capable"
         )
         has_migration_capable_validation = has_migration_capable_validation or migration_capable
+        if assignment_data.get("validation_policy_version") == 1:
+            enum(field(validation, "purpose", loc), {"acceptance", "repository-required", "supplemental"}, f"{loc}.purpose")
+            gate = enum(field(validation, "gate", loc), {"blocking", "advisory"}, f"{loc}.gate")
+            string(field(validation, "rationale", loc), f"{loc}.rationale", max_length=1200)
+            if validation_policy.protected(validation) and gate != "blocking":
+                fail(f"{loc}.gate", "protected checks must be blocking")
+            if not Path(validation['cwd']).resolve().is_relative_to(Path(assignment_data['cwd']).resolve()):
+                fail(f'{loc}.cwd', 'must remain inside the assigned repository worktree')
     if validation_ids != sorted(validation_ids) or len(validation_ids) != len(set(validation_ids)):
         fail("$.validations", "validation IDs must be unique and sorted")
     if len(validation_commands) != len(set(validation_commands)):
@@ -1809,6 +1978,11 @@ def validate_plan(data: dict[str, Any]) -> None:
         )
 
     tasks = array(field(data, "tasks", "$"), "$.tasks")
+    if assignment_data.get("validation_policy_version") == 1:
+        acceptance_ids = {v["id"] for v in validations if v["purpose"] == "acceptance" and v["gate"] == "blocking"}
+        for task in tasks:
+            if not set(task.get("validation_ids", [])) & acceptance_ids:
+                fail("$.tasks", "each task requires a blocking acceptance validation")
     task_ids: list[str] = []
     task_requirements: dict[str, set[str]] = {}
     task_mechanisms: dict[str, set[str]] = {}
@@ -2433,7 +2607,10 @@ def validate_validation_records(
     *,
     tree_fingerprint: str | None = None,
     require_cache_metadata: bool = False,
+    artifact_path: Path | None = None,
+    enforce_log_identity: bool = False,
 ) -> None:
+    current_path = artifact_path or CURRENT_ARTIFACT_PATH
     records = array(value, location)
     ids: set[str] = set()
     for index, raw in enumerate(records):
@@ -2474,8 +2651,8 @@ def validate_validation_records(
                     source_artifact, f"{loc}.source_artifact"
                 )
                 if (
-                    CURRENT_ARTIFACT_PATH is not None
-                    and Path(source_path).resolve() == CURRENT_ARTIFACT_PATH.resolve()
+                    current_path is not None
+                    and Path(source_path).resolve() == current_path.resolve()
                 ):
                     fail(f"{loc}.source_artifact", "cannot reuse evidence from itself")
                 source = load_json_object(source_path, f"{loc}.source_artifact.path")
@@ -2497,6 +2674,12 @@ def validate_validation_records(
                         f"must contain exactly one validation record for {record_id}",
                     )
                 source_record = matching_source_records[0]
+                if enforce_log_identity and record.get("log_sha256"):
+                    if (source_record.get("cwd") != record.get("cwd") or not source_record.get("log_sha256")
+                            or record.get('result') != 'pass' or source_record.get('log_path') != record.get('log_path')
+                            or source_record['log_sha256'] != record['log_sha256']):
+                        fail(f"{loc}.source_artifact", "new-policy cached evidence requires the same cwd, passing outcome, and pinned source log")
+                    hashed_file_reference({"path": source_record["log_path"], "sha256": source_record["log_sha256"]}, f"{loc}.source_artifact.log")
                 if (
                     source_record.get("result") != "pass"
                     or source_record.get("command") != command
@@ -2524,6 +2707,22 @@ def validate_validation_records(
             absolute_path(log_path, f"{loc}.log_path", must_exist=True, file_only=True)
         elif result != "not-run":
             fail(f"{loc}.log_path", "is required when the command ran")
+        if enforce_log_identity and "log_sha256" in record and log_path:
+            hashed_file_reference({"path": log_path, "sha256": record["log_sha256"]}, f"{loc}.log_sha256")
+
+
+def validation_log_path(record: dict[str, Any], assignment: dict[str, Any], location: str) -> Path | None:
+    """Constrain worker-selected paths before the coordinator reads their bytes."""
+    raw = record.get('log_path')
+    if raw is None:
+        return None
+    root = Path(assignment['log_dir']).resolve()
+    if record.get('cache_status') == 'reused':
+        root = (Path(assignment['output_artifact']).parent / 'logs').resolve()
+    path = Path(absolute_path(raw, location, must_exist=True, file_only=True)).resolve()
+    if not path.is_relative_to(root):
+        fail(location, 'validation logs must stay inside the assigned run log directory')
+    return path
 
 
 def validate_result(data: dict[str, Any]) -> None:
@@ -2556,21 +2755,33 @@ def validate_result(data: dict[str, Any]) -> None:
     elif profiled:
         fail("$.tree_fingerprint", "is required for profiled result artifacts")
     validation_records = field(data, "validations", "$")
+    if assignment.get('validation_policy_version') == 1:
+        plans = [load_json_object(ref['path'], '$.assignment.input_artifacts') for ref in assignment['input_artifacts']
+                 if Path(ref['path']).suffix == '.json']
+        plans = [plan for plan in plans if plan.get('artifact_kind') == 'plan' and plan.get('repo_id') == data['repo_id']]
+        if len(plans) != 1:
+            fail('$.assignment.input_artifacts', 'new results require one canonical repository plan')
+        definitions = {check['id']: check for check in plans[0]['validations']}
+        for index, record in enumerate(array(validation_records, '$.validations')):
+            validation_log_path(obj(record, f'$.validations[{index}]'), assignment, f'$.validations[{index}].log_path')
+            check = definitions.get(record.get('id'))
+            if not check or record.get('command') != check['command'] or record.get('cwd') != check['cwd']:
+                fail(f'$.validations[{index}]', 'must match the canonical validation ID, command, and cwd')
+            if record.get('result') == 'fail' and record.get('exit_code') in {None, 0}:
+                fail(f'$.validations[{index}]', 'failed checks require a nonzero exit code')
     validate_validation_records(
         validation_records,
         "$.validations",
         tree_fingerprint=parsed_tree_fingerprint,
         require_cache_metadata=profiled,
+        enforce_log_identity=assignment.get('validation_policy_version') == 1,
     )
     if profiled and status == "complete" and data["stage"] == "validate" and not validation_records:
         fail("$.validations", "a complete validation result must contain evidence")
-    if profiled and status == "complete" and data["stage"] in {
-        "implement",
-        "validate",
-        "fix-1",
-        "fix-2",
-        "pipeline-fix",
-    }:
+    evidence_stages = {"implement", "validate", "fix-1", "fix-2", "pipeline-fix"}
+    if assignment.get("validation_policy_version") == 1:
+        evidence_stages.add("validation-fix")
+    if profiled and status == "complete" and data["stage"] in evidence_stages:
         expected_evidence = set(
             zip(
                 assignment.get("validation_ids", []),
@@ -2915,6 +3126,48 @@ def validate_integration(data: dict[str, Any]) -> None:
         fail("$", "complete integration artifacts may contain only passing entries")
 
 
+def validate_delivery_ownership(data: dict[str, Any], assignment: dict[str, Any]) -> None:
+    """Validate captured ownership evidence equally for commands and fallback workers."""
+    import delivery_tools
+    pinned = assignment['pr_ownership']
+    intent_ref = obj(field(data, 'creation_intent', '$'), '$.creation_intent')
+    intent_path = Path(pinned['intent_path']).resolve()
+    recorded_intent = Path(absolute_path(intent_ref.get('path'), '$.creation_intent.path', must_exist=True, file_only=True)).resolve()
+    if recorded_intent != intent_path or intent_path.stat().st_size > 4096:
+        fail('$.creation_intent', 'must match the small coordinator-pinned pre-creation intent')
+    hashed_file_reference(intent_ref, '$.creation_intent')
+    observation_ref = obj(field(data, 'ownership_observation', '$'), '$.ownership_observation')
+    observation_path = validation_log_path({'log_path': observation_ref.get('path')}, assignment, '$.ownership_observation')
+    if observation_path is None:
+        fail('$.ownership_observation', 'requires an existing captured observation')
+    if observation_path.stat().st_size > 1024 * 1024:
+        fail('$.ownership_observation', 'observation exceeds its size limit')
+    hashed_file_reference(observation_ref, '$.ownership_observation')
+    observation = load_json_object(str(observation_path), '$.ownership_observation')
+    expected = {'url': data['pr_url'], 'state': 'OPEN', 'headRefName': pinned['branch'],
+                'baseRefName': pinned['base_branch'], 'isDraft': data['pr_draft']}
+    if (not isinstance(observation.get('isDraft'), bool) or not isinstance(data['pr_draft'], bool)
+            or any(observation.get(key) != value for key, value in expected.items())
+            or data['branch'] != pinned['branch'] or data['base_branch'] != pinned['base_branch']):
+        fail('$.ownership_observation', 'must match the assigned PR identity and observed readiness')
+    helper = delivery_tools.Delivery({'worktree': assignment['cwd'], 'log_dir': assignment['log_dir'],
+        'pr_intent_path': str(intent_path), 'repository': pinned['repository'], 'branch': pinned['branch'],
+        'base_branch': pinned['base_branch'], 'run_id': assignment['run_id']})
+    try:
+        helper.load_creation_intent()
+    except (ValueError, delivery_tools.DeliveryError) as error:
+        fail('$.creation_intent', str(error))
+    body = string(field(observation, 'body', '$.ownership_observation'), '$.ownership_observation.body', max_length=1024 * 1024)
+    if not helper.owns_pr_body(body):
+        fail('$.ownership_observation', 'requires the nonce-bound ownership marker, not an assertion')
+    if helper.ready_path.exists() or data['pr_draft'] is False:
+        fact = {'creation_intent': intent_ref, 'pr_url': data['pr_url']}
+        if not helper.ready_path.exists() or helper.ready_path.stat().st_size > 4096 or load_json_object(str(helper.ready_path), '$.readiness') != fact:
+            fail('$.readiness', 'owned ready observations require the immutable readiness journal')
+        if data['reason_code'] == 'publication-required':
+            fail('$.reason_code', 'a recorded human redraft cannot authorize republication')
+
+
 def validate_delivery(data: dict[str, Any]) -> None:
     validate_common(data, "delivery")
     repo_id(field(data, "repo_id", "$"), "$.repo_id")
@@ -2962,6 +3215,31 @@ def validate_delivery(data: dict[str, Any]) -> None:
         if any(state != "passed" for state in required_states):
             fail("$.checks", "all required checks must pass for complete delivery")
     assignment = load_json_object(data["assignment_path"], "$.assignment_path")
+    publication = False
+    if assignment.get("delivery_policy_version") == 1:
+        draft = field(data, "pr_draft", "$")
+        owned = boolean(field(data, "pr_owned", "$"), "$.pr_owned")
+        reason = field(data, "reason_code", "$")
+        if draft is not None:
+            boolean(draft, "$.pr_draft")
+        if reason is not None:
+            string(reason, "$.reason_code", max_length=100)
+        publication = reason == "publication-required"
+        if status == "complete" and (reason is not None or draft is None or (owned and draft)):
+            fail("$.pr_draft", "complete delivery needs observed readiness and publication of an owned draft")
+        if status != "complete" and reason is None:
+            fail("$.reason_code", "blocked delivery requires a factual reason code")
+        if publication and not (owned and draft and assignment.get("verify_only")):
+            fail("$.reason_code", "publication-required is only a verified, owned draft read-only observation")
+        if owned:
+            validate_delivery_ownership(data, assignment)
+        if reason == "required-ci-failed" and not any(s in {"failed", "cancelled", "skipped"} for s in required_states):
+            fail("$.reason_code", "required-ci-failed requires a failed required check")
+        if reason == "required-ci-pending" and ("pending" not in required_states or any(s in {"failed", "cancelled", "skipped"} for s in required_states)):
+            fail("$.reason_code", "required-ci-pending requires pending, not failed, required checks")
+        for index, check in enumerate(checks):
+            validation_log_path({'log_path': check['evidence_path']}, assignment, f'$.checks[{index}].evidence_path')
+            hashed_file_reference({"path": check["evidence_path"], "sha256": field(check, "evidence_sha256", f"$.checks[{index}]")}, f"$.checks[{index}].evidence_sha256")
     if assignment.get("delivery_evidence_version", 1) == 2:
         policy = obj(field(data, "check_policy", "$"), "$.check_policy")
         policy_status = enum(field(policy, "status", "$.check_policy"), {"required", "not-configured", "unknown"}, "$.check_policy.status")
@@ -2975,7 +3253,7 @@ def validate_delivery(data: dict[str, Any]) -> None:
             value = field(data, key, "$")
             if value is not None:
                 sha(value, f"$.{key}")
-        if status == "complete":
+        if status == "complete" or publication:
             head = sha(data["head_sha"], "$.head_sha")
             if head != data["pushed_head_sha"] or head != data["checked_head_sha"] or head != commits[-1]:
                 fail("$.checked_head_sha", "local, pushed, checked, and delivered head must match")
@@ -3239,6 +3517,8 @@ def artifact_skeleton(assignment_path: Path, assignment: dict[str, Any]) -> dict
                 "blockers": [],
             }
         )
+        if assignment.get("delivery_policy_version") == 1:
+            common.update(pr_draft=None, pr_owned=False, reason_code=None)
         if assignment.get("delivery_evidence_version", 1) == 2:
             common.update(head_sha=None, pushed_head_sha=None, checked_head_sha=None,
                           check_policy={"status": "unknown", "required_checks": [], "evidence": []})
@@ -3418,6 +3698,7 @@ VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
     "integration": validate_integration,
     "delivery": validate_delivery,
     "report": validate_report,
+    "run-amendment": validate_run_amendment,
 }
 
 

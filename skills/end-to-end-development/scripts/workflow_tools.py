@@ -277,10 +277,18 @@ def normalize_worker_artifact(
                 continue
             command = record["command"]
             record["command_sha256"] = hashlib.sha256(command.encode()).hexdigest()
+            if assignment.get("validation_policy_version") == 1 and record.get("log_path"):
+                log = artifact_guard.validation_log_path(record, assignment, '$.validations.log_path')
+                record["log_sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
             if record.get("cache_status") != "reused":
                 record["tree_fingerprint"] = fingerprint
                 record.setdefault("cache_status", "fresh")
                 record.setdefault("source_artifact", None)
+    elif artifact.get("artifact_kind") == "delivery" and assignment.get("delivery_policy_version") == 1:
+        for check in artifact.get("checks", []):
+            if check.get("evidence_path"):
+                log = artifact_guard.validation_log_path({'log_path': check['evidence_path']}, assignment, '$.checks.evidence_path')
+                check["evidence_sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
     elif artifact.get("artifact_kind") == "review":
         artifact["baseline"] = assignment["baseline"]
         artifact["reviewed_status_path"] = str(status_path.resolve())
@@ -787,12 +795,53 @@ def _accepted_paths(run: dict[str, Any]) -> list[Path]:
     return sorted(paths)
 
 
+def _render_gate_status(status: dict[str, Any]) -> str:
+    """Format the engine's evaluated facts; do not reimplement gate policy."""
+    escape = lambda value: html.escape(str(value), quote=True)
+    sections = []
+    for repo_id, gate in status.get('local_gates', {}).items():
+        label = ('Local gate satisfied with warnings/exclusions' if gate['warnings'] else 'Local gate satisfied') if gate['satisfied'] else 'Local gate blocked'
+        rows, exceptions = [], []
+        for row in gate['checks']:
+            rows.append(f"<tr><td><code>{escape(row['id'])}</code><br>{escape(row['purpose'])}</td>"
+                        f"<td><code>{escape(row['command'])}</code></td><td>{escape(row['result'])}</td>"
+                        f"<td>{escape(row['disposition'])}</td><td>{escape(row['summary'])}</td></tr>")
+            if row['exception']:
+                authorization = row['authorization']
+                exceptions.append(f"<li><strong>{escape(row['id'])}: excluded</strong> — {escape(authorization['text'])} "
+                                  f"({escape(authorization['rationale'])}; decision {escape(Path(row['exception']['path']).name)})</li>")
+        history = ''.join(f"<li><code>{escape(item['id'])}</code>: {escape(item['summary'])} — "
+                          f"{escape(Path(item['artifact']['path']).name)}</li>" for item in gate.get('historical_failures', []))
+        review = status.get('review_provenance', {}).get(repo_id)
+        sections.append(f"<h3>{escape(repo_id)} — {escape(label)}</h3>"
+                        + (f"<p>Review evidence: {escape(review)}.</p>" if review else '')
+                        + (f"<h4>Active exclusions</h4><ul>{''.join(exceptions)}</ul>" if exceptions else '')
+                        + "<p class='table-hint'>Scroll the table horizontally to see all columns.</p>"
+                          "<div class='table-wrap' tabindex='0' role='region' aria-label='Validation check details'><table><thead><tr><th>Check / purpose</th><th>Command</th>"
+                          "<th>Observed result</th><th>Policy disposition</th><th>Evidence summary</th></tr></thead>"
+                        + f"<tbody>{''.join(rows)}</tbody></table></div>"
+                        + (f"<h4>Historical failures — not current observations</h4><ul>{history}</ul>" if history else ''))
+    deliveries = []
+    for item in status.get('deliveries', []):
+        raw_url = item.get('pr_url') or ''
+        url = escape(raw_url)
+        link = f'<a href="{url}">{url}</a>' if raw_url.startswith(('https://', 'http://')) else url
+        draft = {True: 'draft', False: 'ready', None: 'unknown'}.get(item.get('pr_draft'), 'unknown')
+        checks = ', '.join(f"{check['name']}: {check['state']}" for check in item.get('checks') or [] if check['required'])
+        deliveries.append(f"<li><strong>{escape(item['repo_id'])}: {escape(item.get('delivery_outcome') or item['status'])}</strong> "
+                          f"— PR state {draft}; {escape(item.get('reason_code') or 'verified delivery')}. {link}"
+                          f"<br>Required CI: {escape(checks or 'See recorded check-policy evidence.')}</li>")
+    return '<section><h2>Current validation gates and exceptions</h2>' + ''.join(sections) + '</section>' + (
+        '<section><h2>Latest delivery observations</h2><ul>' + ''.join(deliveries) + '</ul></section>')
+
+
 def render_report(
     *,
     run_dir: Path,
     assignment_path: Path,
     html_path: Path,
     output_path: Path,
+    evaluated_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     assignment = load_json(assignment_path)
     artifact_guard.validate_assignment(assignment)
@@ -806,6 +855,9 @@ def render_report(
         raise ValueError(f"refusing to overwrite existing HTML report: {html_path}")
 
     run = load_json(run_dir / "run.json")
+    if run.get('validation_policy_version') == 1 and (evaluated_status is None or evaluated_status.get('run_id') != run['run_id']):
+        raise ValueError('new-policy reports require an engine-supplied evaluated status for this run')
+    gate_section = _render_gate_status(evaluated_status) if evaluated_status is not None else ''
     requirements = load_json(Path(run["requirements_path"]))
     request_text = Path(run["request_path"]).read_text(encoding="utf-8", errors="replace")
     artifacts: list[dict[str, Any]] = []
@@ -823,12 +875,17 @@ def render_report(
 
     style = """
 :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
-body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem 4rem; line-height: 1.5; }
+body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem 4rem; line-height: 1.5; overflow-wrap: anywhere; }
 h1, h2, h3 { line-height: 1.2; }
 section { border-top: 1px solid #8886; padding-top: 1rem; margin-top: 1.5rem; }
 code, pre { font-family: ui-monospace, monospace; }
 pre { white-space: pre-wrap; background: #8881; padding: 1rem; border-radius: .5rem; }
 table { border-collapse: collapse; width: 100%; }
+.table-wrap { overflow-x: auto; }
+.table-wrap table { min-width: 850px; }
+.table-hint { display: none; }
+@media (max-width: 720px) { .table-hint { display: block; font-size: .875rem; } }
+td, code { overflow-wrap: anywhere; }
 th, td { border: 1px solid #8885; padding: .5rem; text-align: left; vertical-align: top; }
 .badge { display: inline-block; border: 1px solid #8886; border-radius: 999px; padding: .15rem .55rem; margin: .1rem; }
 """.strip()
@@ -879,13 +936,17 @@ th, td { border: 1px solid #8885; padding: .5rem; text-align: left; vertical-ali
             url = html.escape(value["pr_url"], quote=True)
             pr_links.append(f'<li><a href="{url}">{url}</a></li>')
 
+    lifecycle = ("<p><span class='badge'>Evidence snapshot</span> Captured " + html.escape(utc_now())
+                 + ". This immutable report is not live run status; use <code>orchestrator status</code> for final completion.</p>") if run.get('validation_policy_version') == 1 else (
+                 f"<span class='badge'>{html.escape(run.get('status', 'unknown'))}</span>"
+                 f"<span class='badge'>{html.escape(run.get('phase', 'unknown'))}</span>")
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{html.escape(run['run_id'])} report</title><style>{style}</style></head><body>
 <h1>End-to-end development report</h1>
-<p><span class="badge">{html.escape(run.get('profile', 'legacy-full'))}</span>
-<span class="badge">{html.escape(run.get('status', 'unknown'))}</span>
-<span class="badge">{html.escape(run.get('phase', 'unknown'))}</span></p>
+<p><span class="badge">{html.escape(run.get('profile', 'legacy-full'))}</span></p>
+{lifecycle}
+{gate_section}
 <section><h2>Request</h2><pre>{html.escape(request_text)}</pre></section>
 <section><h2>Requirement coverage</h2><table><thead><tr><th>ID</th><th>Source</th><th>Acceptance criteria</th><th>Repositories</th></tr></thead>
 <tbody>{''.join(requirement_rows)}</tbody></table></section>
@@ -964,6 +1025,7 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--assignment", type=Path, required=True)
     report.add_argument("--html", type=Path, required=True)
     report.add_argument("--output", type=Path, required=True)
+    report.add_argument("--evaluated-status", type=Path, help="coordinator-owned orchestrator status JSON; required for new policy runs")
     return parser
 
 
@@ -1010,6 +1072,7 @@ def main() -> int:
                 assignment_path=args.assignment,
                 html_path=args.html,
                 output_path=args.output,
+                evaluated_status=load_json(args.evaluated_status) if args.evaluated_status else None,
             )
             print(json.dumps(result, indent=2))
             return 0

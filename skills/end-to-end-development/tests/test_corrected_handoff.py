@@ -42,7 +42,7 @@ class CorrectedHandoffTests(unittest.TestCase):
                     code = 1
             return code, manifest
 
-        engine = self.initialize(overlong, profile='full')
+        engine = self.initialize(overlong, profile='full', legacy=True)
         graph = fixtures.build_graph(engine, InMemorySaver())
         config = {'configurable': {'thread_id': 'corrected-handoff'}, 'recursion_limit': 150}
         graph.invoke({'run_dir': str(self.run_dir)}, config)
