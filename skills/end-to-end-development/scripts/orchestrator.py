@@ -178,6 +178,16 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         elif args.command == "retry-corrected-handoff":
             if not engine.retry_corrected_handoff(args.original_artifact):
                 raise WorkflowError("run is not eligible for corrected next_action recovery")
+        elif args.command == "recover-external-repair":
+            request = json.loads(args.input.read_text(encoding="utf-8"))
+            applied = any(json.loads(Path(ref["path"]).read_text())["request_sha256"] == args.request_sha256
+                          for ref in engine.load_run().get("external_repair_recoveries", {}).values())
+            if not applied and graph.get_state(config).next:
+                raise WorkflowError("external recovery requires a settled graph cursor")
+            outcome = engine.recover_external_repair(request, request_sha256=args.request_sha256,
+                                                     text=args.text, context=args.context)
+            if outcome == "already-applied":
+                return {**_result(engine), "recovery": outcome}
         elif args.command == "replan-decision":
             if graph.get_state(config).next:
                 raise WorkflowError("decision replanning requires a settled graph cursor")
@@ -293,6 +303,17 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     handoff_retry.add_argument("--report-root", type=Path)
 
+    external = subparsers.add_parser(
+        "recover-external-repair", help="verify a rejected blocked packet after an explicitly authorized test repair/forward rebase"
+    )
+    external.add_argument("run_dir", type=Path)
+    external.add_argument("--input", type=Path, required=True, help="reviewed source-transition/evidence request JSON")
+    external.add_argument("--request-sha256", required=True, help="reviewed canonical JSON SHA-256; never refresh stale authorization")
+    external.add_argument("--text", required=True, help="exact explicit user authorization for this recovery")
+    external.add_argument("--context", default="", help="separate coordinator interpretation, not authorization")
+    external.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    external.add_argument("--report-root", type=Path)
+
     replan = subparsers.add_parser(
         "replan-decision", help="return an accepted implementation decision to bounded planning"
     )
@@ -380,7 +401,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "replan-decision", "amend"}:
+        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},

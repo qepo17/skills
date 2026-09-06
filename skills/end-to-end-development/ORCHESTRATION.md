@@ -193,6 +193,25 @@ For the exact implementation-result rejection `$.next_action: must be at most 30
 
 This opt-in transition accepts only an otherwise valid, complete implementation result whose only changed field is a 1–300-character `next_action`. It requires the exact rejection manifest, closed worker handles, unchanged current source/HEAD/branch/index-status evidence, matching assignment and current approved plan. It hash-pins both results and referenced evidence, atomically accepts the result once, and returns control to the graph. Failed validations remain failed. It does not reset retry limits, change approval, rewrite assignments or repair other blockers. Preserve the original file afterward; later reconciliation verifies its hash. Ordinary `resume` remains unchanged. Do not edit already accepted artifacts or coordinator state.
 
+### Rejected blocked packet after authorized external repair
+
+`recover-external-repair` is a separate explicit compatibility transition; it never changes the semantics of `resume`, `retry-corrected-handoff`, decision replanning, or any packet compiler-dependency continuation. Read [schemas/external-repair-recovery.md](schemas/external-repair-recovery.md) for the exact reviewed request, source proof, authorization, and crash contract.
+
+```bash
+"$ORCHESTRATOR" recover-external-repair "$RUN_DIR" \
+  --input "$REVIEWED_RECOVERY_REQUEST" \
+  --request-sha256 "$REVIEWED_REQUEST_SHA256" \
+  --text "$EXACT_USER_RECOVERY_AUTHORIZATION" \
+  --context "$COORDINATOR_INTERPRETATION" \
+  --worker-runtime auto
+```
+
+Admission requires the exact rejected code-blocked implementation with real failed checks and only the overlong hint schema error, current user-approved canonical plans, a settled graph cursor and cleaned handles, no active/pending actions or leases, and isolated database-target evidence where required. It pins exact external authorization separately from later explicit recovery authorization and coordinator interpretation. Reviewed hashes cannot be refreshed. A forward baseline update is proved from historical/current Git content trees, unchanged task content or deterministic clean merges, and an explicit test-file-only repair allowlist. Peer source changes, unrelated outcomes, rewritten commits and nontrivial resolutions are refused.
+
+The immutable recovery record is a scheduling obligation, **not accepted implementation or validation evidence**. Before ordinary packet scheduling, the existing implement node issues one new `packet-verification` worker with no source/Git/forge write permission. It independently inspects preserved packet completion and scope and runs the original assigned checks freshly. Only compatible, passing new evidence completes that packet. Factual new failures stay blocked without source replay or automatic fixes. Remaining packets, mandatory full-plan validation, fresh independent review, required integration and final delivery gates remain unchanged. Material changes use normal bounded replanning and renewed full-bundle approval; exhausted limits remain exhausted.
+
+Identical applied requests return `already-applied` without advancing, even after another blocker or completion. An identical pre-projection intent can be reused. A durable launch claim prevents duplicate verification; crash reconciliation may adopt a surviving worker and accept its output but never relaunch a claimed attempt without accepted evidence. Subsequent run loads validate original and fresh evidence hashes. Ordinary `run`/`resume` continues a committed transition; neither resets its allowance. Do not execute live recovery or install over an existing skill without separate authorization.
+
 A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 
 ```bash

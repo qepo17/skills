@@ -1081,6 +1081,25 @@ def validate_run(data: dict[str, Any]) -> None:
         for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
             hashed_file_reference(reference, f"{loc}.evidence[{index}]")
 
+    external_recoveries = obj(data.get("external_repair_recoveries", {}), "$.external_repair_recoveries")
+    for action_id, reference in external_recoveries.items():
+        loc = f"$.external_repair_recoveries.{action_id}"
+        record_path = hashed_file_reference(reference, loc)
+        record = load_json_object(record_path, loc)
+        validate_external_recovery(record, loc)
+        if record["action_id"] != action_id or record["run_id"] != data["run_id"]:
+            fail(loc, "recovery identity differs from run")
+    for action_id, reference in obj(data.get("external_repair_attempts", {}), "$.external_repair_attempts").items():
+        loc = f"$.external_repair_attempts.{action_id}"
+        path = hashed_file_reference(reference, loc)
+        assignment = load_json_object(path, loc)
+        if (assignment.get("action_id") != action_id or assignment.get("execution_mode") != "packet-verification"
+                or assignment.get("external_repair") not in external_recoveries.values()):
+            fail(loc, "must identify a one-shot packet-verification assignment")
+        accepted = repositories[assignment["repo_id"]]["accepted_artifacts"].get(action_id)
+        if accepted:
+            validate_recorded_packet_verification(Path(hashed_file_reference(accepted, loc + ".accepted")))
+
     replans = array(data.get("decision_replans", []), "$.decision_replans")
     for index, reference in enumerate(replans):
         loc = f"$.decision_replans[{index}]"
@@ -1284,6 +1303,30 @@ def validate_agents(data: dict[str, Any]) -> None:
         absolute_path(field(agent, "output_artifact", loc), f"{loc}.output_artifact")
 
 
+def validate_recorded_packet_verification(path: Path) -> None:
+    global CURRENT_ARTIFACT_PATH
+    previous = CURRENT_ARTIFACT_PATH
+    try:
+        CURRENT_ARTIFACT_PATH = path
+        validate_result(load_json_object(str(path), "$.packet_verification"))
+    finally:
+        CURRENT_ARTIFACT_PATH = previous
+
+
+def validate_external_recovery(record: dict[str, Any], loc: str) -> None:
+    if record.get("artifact_kind") != "external-repair-recovery" or record.get("schema_version") != 1:
+        fail(loc, "invalid external recovery record")
+    request = obj(field(record, "request", loc), loc + ".request")
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if digest != record.get("request_sha256"):
+        fail(loc, "reviewed recovery request changed")
+    for key in ("result", "assignment", "rejection", "database_target"):
+        if request.get(key) is not None:
+            hashed_file_reference(request[key], loc + ".request." + key)
+    for index, ref in enumerate(request["reviewed_evidence"] + request["external_authorization"]["evidence"]):
+        hashed_file_reference(ref, f"{loc}.evidence[{index}]")
+
+
 def validate_assignment(data: dict[str, Any]) -> None:
     validate_common(data, "assignment")
     for version in ("validation_policy_version", "delivery_policy_version"):
@@ -1294,7 +1337,7 @@ def validate_assignment(data: dict[str, Any]) -> None:
     string(field(data, "action_id", "$"), "$.action_id", max_length=200)
     timestamp(field(data, "created_at", "$"), "$.created_at")
     stage = enum(field(data, "stage", "$"), ASSIGNMENT_STAGES, "$.stage")
-    execution_mode = enum(data.get("execution_mode", "worker"), {"worker", "artifact-repair", "command"}, "$.execution_mode")
+    execution_mode = enum(data.get("execution_mode", "worker"), {"worker", "artifact-repair", "packet-verification", "command"}, "$.execution_mode")
     if execution_mode == "command" and stage != "deliver":
         fail("$.execution_mode", "only delivery uses command assignments")
     verify_only = boolean(data.get("verify_only", False), "$.verify_only")
@@ -1318,7 +1361,23 @@ def validate_assignment(data: dict[str, Any]) -> None:
     if stage == "design-challenge" and thinking == "medium":
         fail("$.thinking", "design-challenge assignments require high or xhigh")
     repair_mode = data.get("execution_mode") == "artifact-repair"
-    if stage == "implement" and thinking == "medium" and not repair_mode:
+    packet_verification = execution_mode == "packet-verification"
+    if packet_verification:
+        ref = field(data, "external_repair", "$")
+        record = load_json_object(hashed_file_reference(ref, "$.external_repair"), "$.external_repair")
+        validate_external_recovery(record, "$.external_repair")
+        original = load_json_object(record["request"]["assignment"]["path"], "$.external_repair.assignment")
+        if (stage != "implement" or data.get("project_file_access") != "none"
+                or data.get("git_access") != "none" or data.get("forge_access") != "none"
+                or any(repo.get("access") != "read" for repo in data.get("repositories", []))
+                or data.get("input_tree_fingerprint") != record["repository_states"][data["repo_id"]]["fingerprint"]
+                or ref not in data["input_artifacts"]
+                or any(data.get(key) != original.get(key) for key in
+                       ("run_id", "repo_id", "cwd", "baseline", "task_ids", "packet_id", "validation_ids", "validation_commands"))
+                or data.get("attempt") != 1 or data["output_artifact"] == original["output_artifact"]
+                or data["log_dir"] == original["log_dir"]):
+            fail("$.external_repair", "requires an isolated read-only verification of exactly the rejected packet/checks")
+    if stage == "implement" and thinking == "medium" and not (repair_mode or packet_verification):
         fail("$.thinking", "implementation assignments require high or xhigh")
     if (data.get("reasoning_policy") == "stage-v1" and not repair_mode and thinking == "medium"
             and stage in {"validation-fix", "pipeline-fix", "fix-1", "fix-2"}):
@@ -2884,6 +2943,35 @@ def validate_result(data: dict[str, Any]) -> None:
         string(next_action, "$.next_action", max_length=300)
     if assignment.get("execution_mode") == "artifact-repair":
         validate_repaired_payload(assignment, data)
+    if assignment.get("execution_mode") == "packet-verification":
+        record = load_json_object(assignment["external_repair"]["path"], "$.external_repair")
+        verification = obj(field(data, "packet_verification", "$"), "$.packet_verification")
+        outcome = enum(field(verification, "outcome", "$.packet_verification"),
+                       {"compatible", "material-change", "incomplete"}, "$.packet_verification.outcome")
+        string(field(verification, "summary", "$.packet_verification"), "$.packet_verification.summary", max_length=1200)
+        evidence = Path(absolute_path(field(verification, "evidence_path", "$.packet_verification"),
+                                     "$.packet_verification.evidence_path", must_exist=True, file_only=True))
+        if not evidence.resolve().is_relative_to(Path(assignment["log_dir"]).resolve()):
+            fail("$.packet_verification.evidence_path", "requires fresh assignment-local scope inspection")
+        hashed_file_reference({"path": str(evidence), "sha256": field(verification, "evidence_sha256", "$.packet_verification")},
+                              "$.packet_verification.evidence")
+        if (status == "complete") != (outcome == "compatible"):
+            fail("$.packet_verification", "material/unfinished work must remain blocked; only compatible verified work completes")
+        if outcome == "material-change" and any(b["kind"] != "decision" for b in blockers):
+            fail("$.blockers", "material change requires normal decision replanning and renewed plan approval")
+        if data["changed_files"] != record["changed_files"]:
+            fail("$.changed_files", "must inventory preserved packet work and the authorized repairs")
+        definitions = {v["id"]: v for v in load_json_object(record["request"]["result"]["path"], "$.external_repair.result")["validations"]}
+        if {v["id"] for v in validation_records} != set(assignment["validation_ids"]):
+            fail("$.validations", "verification requires every assigned check even when failed")
+        for index, validation in enumerate(validation_records):
+            loc = f"$.validations[{index}]"
+            if (validation["cache_status"] != "fresh" or validation["source_artifact"] is not None
+                    or any(validation[key] != definitions[validation["id"]][key] for key in ("command", "cwd"))):
+                fail(loc, "requires fresh canonical packet checks, never external or cached evidence")
+            validation_log_path(validation, assignment, loc + ".log_path")
+        validate_validation_records(validation_records, "$.validations", tree_fingerprint=parsed_tree_fingerprint,
+                                    require_cache_metadata=True, enforce_log_identity=True)
 
 
 def validate_review(data: dict[str, Any]) -> None:

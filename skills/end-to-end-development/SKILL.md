@@ -116,6 +116,19 @@ For an implementation result rejected only because `next_action` exceeds 300 cha
 
 It verifies the exact rejection, complete schema, unchanged semantic evidence/current Git state, approved plan and closed handles. It hash-pins original/corrected evidence and accepts once without a worker replay, approval change or retry reset. Failed tests remain failed and ordinary graph routing owns the remaining work. Keep the original backup; do not use this for accepted artifacts or other blockers.
 
+For a **blocked** implementation result rejected by that same hint-length error, followed by separately user-authorized external test-fixture repair/forward rebase, do not relabel it complete or freshen its old hashes. Read [the external-repair recovery contract](schemas/external-repair-recovery.md), review and pin the exact source-transition/evidence request, and obtain separate explicit recovery authorization:
+
+```bash
+"$ORCHESTRATOR" recover-external-repair "$RUN_DIR" \
+  --input "$REVIEWED_RECOVERY_REQUEST" \
+  --request-sha256 "$REVIEWED_REQUEST_SHA256" \
+  --text "$EXACT_USER_RECOVERY_AUTHORIZATION" \
+  --context "$COORDINATOR_INTERPRETATION" \
+  --worker-runtime auto
+```
+
+The guarded one-shot transition schedules a new **read-only packet verification** through LangGraph. It preserves the rejected result, original failed checks, approval, source baselines and budgets. External passing logs are never accepted checks. Only fresh compatible packet evidence with passing assigned checks admits progress; full-plan validation, independent review, integration and delivery remain mandatory. Material change requires normal replanning and renewed approval, within existing limits. This explicit compatibility path does not retrofit policy versions or weaken any other recovery command. Never execute it or install an engine update without authorization.
+
 If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
 
 ```bash

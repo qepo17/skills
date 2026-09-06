@@ -232,6 +232,16 @@ def normalize_worker_artifact(
             expected = assignment["repair_of"]["repository_states"][repository["repo_id"]]
             if repository_state(Path(repository["worktree"])) != expected:
                 raise artifact_guard.ValidationError("artifact-only repair changed pinned repository/Git state")
+    if assignment.get("execution_mode") == "packet-verification":
+        recovery = load_json(Path(assignment["external_repair"]["path"]))
+        for repository in assignment["repositories"]:
+            if repository_state(Path(repository["worktree"])) != recovery["repository_states"][repository["repo_id"]]:
+                raise artifact_guard.ValidationError("packet verification changed authorized repository/Git state")
+        verification = artifact.get("packet_verification", {})
+        if verification.get("evidence_path"):
+            evidence = artifact_guard.validation_log_path({"log_path": verification["evidence_path"]}, assignment,
+                                                          "$.packet_verification.evidence_path")
+            verification["evidence_sha256"] = hashlib.sha256(evidence.read_bytes()).hexdigest()
     resolved_assignment = assignment_path.resolve()
     artifact["assignment_path"] = str(resolved_assignment)
     artifact["assignment_sha256"] = hashlib.sha256(
@@ -277,7 +287,7 @@ def normalize_worker_artifact(
                 continue
             command = record["command"]
             record["command_sha256"] = hashlib.sha256(command.encode()).hexdigest()
-            if assignment.get("validation_policy_version") == 1 and record.get("log_path"):
+            if (assignment.get("validation_policy_version") == 1 or assignment.get("execution_mode") == "packet-verification") and record.get("log_path"):
                 log = artifact_guard.validation_log_path(record, assignment, '$.validations.log_path')
                 record["log_sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
             if record.get("cache_status") != "reused":
