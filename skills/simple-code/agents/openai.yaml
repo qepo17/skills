@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simple Code"
+  short_description: "Keep code minimal and easy to read"
+  default_prompt: "Use $simple-code to keep code simple and readable."

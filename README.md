@@ -3,10 +3,11 @@
 [![skills.sh](https://skills.sh/b/qepo17/skills)](https://skills.sh/qepo17/skills)
 [![CI](https://github.com/qepo17/skills/actions/workflows/ci.yml/badge.svg)](https://github.com/qepo17/skills/actions/workflows/ci.yml)
 
-Two Agent Skills for taking software changes from request to pull request:
+Agent Skills for simple code and taking software changes from request to pull request:
 
 | Skill | Use it for |
 | --- | --- |
+| `simple-code` | Minimal, readable code with YAGNI, readable one-liners, and WHY-only comments. |
 | `fast-end-to-end-development` | A low-risk single-repository change with one review/revision, scripted GitHub delivery, final-head CI evidence, and one separate compatible CI fix. |
 | `end-to-end-development` | Durable single- or multi-repository orchestration with one review/remediation pass, automatic low-risk plan decisions, and explicit approval only for high-risk work. |
 
@@ -38,7 +39,7 @@ npx skills add qepo17/skills \
   --yes
 ```
 
-Install both globally for Pi:
+Install all globally for Pi:
 
 ```bash
 npx skills add qepo17/skills \
@@ -57,10 +58,12 @@ npx skills add git@github.com:qepo17/skills.git
 Update installed global skills with:
 
 ```bash
-npx skills update --global end-to-end-development fast-end-to-end-development
+npx skills update --global end-to-end-development fast-end-to-end-development simple-code
 ```
 
 ## Requirements
+
+`simple-code` has no runtime dependencies.
 
 ### Fast workflow
 
@@ -95,10 +98,13 @@ skills/
 │   ├── schemas/
 │   ├── scripts/
 │   └── tests/
-└── fast-end-to-end-development/
+├── fast-end-to-end-development/
+│   ├── SKILL.md
+│   ├── agents/
+│   └── scripts/
+└── simple-code/
     ├── SKILL.md
-    ├── agents/
-    └── scripts/
+    └── agents/
 ```
 
 Each skill is self-contained so `npx skills` installs its supporting scripts, schemas, documentation, and metadata together with `SKILL.md`.
