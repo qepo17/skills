@@ -59,5 +59,6 @@ grep -Fq '&lt;script&gt;alert(1)&lt;/script&gt;' "$TMP_DIR/explainer.html"
 npx --yes skills@1.5.23 add . --list >"$TMP_DIR/skills-list.txt"
 grep -Fq 'end-to-end-development' "$TMP_DIR/skills-list.txt"
 grep -Fq 'fast-end-to-end-development' "$TMP_DIR/skills-list.txt"
+grep -Fq 'simple-code' "$TMP_DIR/skills-list.txt"
 
 printf 'All repository checks passed.\n'
