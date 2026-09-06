@@ -190,6 +190,25 @@ Accepted replanning contract/plan/challenge outputs are reused without relaunchi
 
 A crash after the projection write resumes through ordinary `run`/`resume`; repeating `replan-decision` cannot spend another revision or revive the old approval. A pre-projection crash may reuse only identical immutable feedback intent. A pending SQLite cursor is refused rather than redirected manually. Never edit coordinator state or accepted evidence to force eligibility.
 
+## Generated-interface packet build dependency
+
+A generated Go strict interface can make an early foundation packet's full build depend on handlers already assigned to a later approved packet. After explicit user authorization of that scheduling correction, inspect and hash the failed build evidence and use:
+
+```bash
+"$ORCHESTRATOR" continue-packet-build "$RUN_DIR" \
+  --repository core --blocker-id "$CURRENT_BLOCKER_ID" \
+  --review-sha256 "$APPROVED_BUNDLE_SHA256" \
+  --validation-id CORE-V009 --until-task CORE-T006 \
+  --evidence-sha256 "$REVIEWED_BUILD_LOG_SHA256" \
+  --text "$EXACT_USER_AUTHORIZATION" --worker-runtime auto
+```
+
+The command requires a settled, user-approved full-profile implementation run and the latest accepted blocked packet, with exactly one dependency blocker and one failed, non-migration `make build` check. The captured log must identify a missing generated `StrictServerInterface` method. Every other assigned check must pass. The blocker must name the build and its already-approved provider task; that task must require the build and belong to a transitively dependent later packet. Stale approval/source/HEAD/branch/index/evidence, active or uncleaned handles, unrelated blockers and non-build failures are refused.
+
+One immutable `repos/<repo>/packet-build-dependency.json` per repository preserves authorization, the unchanged approved plan/review, blocked result/assignment, Git state and hashed evidence. The original result stays **blocked** and its build stays **failed**. This is scheduling progress, not a passing check or permission to repeat foundation work. Subsequent packets receive this intent as a pinned input; only that build is omitted before its provider packet. The provider and final writer retain it, and the unchanged full-plan validation gate must pass before independent review/delivery. A remaining build failure follows the existing bounded validation-fix route; it is never relabelled as success. No plan/approval/assignment is rewritten, no product scope/placeholder handler is added, and no retry budget is reset. The final validation-fix assignment pairs the complete command suite with its complete planned ID suite.
+
+An accepted intent is one-shot. A crash before its projection write reuses only identical intent; after the projection write ordinary graph resume continues without replaying the blocked foundation. Ordinary `resume` still cannot clear arbitrary dependency blockers. The command refuses a pending graph cursor rather than manually redirecting it.
+
 ## Database-target gate
 
 The graph refuses to schedule any migration-capable validation until non-secret evidence identifies an isolated local/test database. Record only a classification and description—never a URL, credential, or secret:

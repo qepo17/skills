@@ -122,6 +122,10 @@ If a dependent fix was started concurrently with an upstream contract fix and st
 
 The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
 
+## Generated-interface build scheduling
+
+When a preserved foundation packet is blocked only because its generated Go strict interface needs handlers assigned to a later approved packet, an explicit user instruction may authorize the narrowly guarded `continue-packet-build` transition in [ORCHESTRATION.md](ORCHESTRATION.md). It preserves the blocked result and failed build, admits scheduling progress without replaying source, and keeps provider/final builds plus independent review mandatory. It is one-shot per repository, does not rewrite approval/plans or reset budgets, and cannot clear unrelated failures. Never add placeholder handlers or manually mark a blocked result complete to advance.
+
 ## Implementation decision replanning
 
 A material decision discovered during approved implementation remains blocked until explicitly resolved by the user. With that authorization, use the guarded `replan-decision` transition documented in [ORCHESTRATION.md](ORCHESTRATION.md), pinning the current approved bundle and blocker ID. Preserve exact user wording separately from coordinator context. The transition preserves completed work and evidence, consumes existing revision allowances, invalidates approval, and replans all repositories (shared contract first). It cannot bypass review or authorize numerical proposals. Present the new full bundle and obtain renewed explicit approval before any product writer. Do not substitute `resume`, edit state, or recreate the task.

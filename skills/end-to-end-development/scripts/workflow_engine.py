@@ -652,6 +652,149 @@ class WorkflowEngine:
                            next_action=run["phase"])
         return True
 
+    def continue_packet_build(
+        self, *, repo_id: str, blocker_id: str, review_sha256: str,
+        validation_id: str, until_task: str, evidence_sha256: str, text: str,
+    ) -> bool:
+        """Admit preserved foundation progress, never convert a failed build to a pass.
+
+        One explicit scheduling correction per repository permits only a generated
+        Go strict-interface build whose handler task is already approved downstream.
+        The unchanged full-plan validation/fix/review gates still govern delivery.
+        """
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            review = run.get("plan_review") or {}
+            if (run["status"] != "blocked" or run["phase"] != "implement"
+                    or run.get("profile") != "full" or run["next_actions"]
+                    or len(run["blockers"]) != 1 or repo_id not in run["repositories"]
+                    or repo_id in run.get("packet_build_dependencies", {})
+                    or review.get("status") != "approved" or review.get("approval_source") != "user"
+                    or review.get("review_sha256") != review_sha256):
+                return False
+            blocker = run["blockers"][0]
+            if blocker["kind"] != "dependency" or blocker["id"] != blocker_id:
+                return False
+            if not text.strip() or len(text) > 4000:
+                raise WorkflowError("packet continuation requires 1-4000 characters of user authorization")
+            evidence = Path(blocker["evidence_path"])
+            if _sha256(evidence) != evidence_sha256:
+                raise WorkflowError("reviewed build evidence changed")
+            if not re.search(r"does not implement [\w.]*StrictServerInterface \(missing method [A-Za-z]\w+\)", evidence.read_text()):
+                raise WorkflowError("build evidence is not a generated Go strict-interface dependency")
+            if any(not re.search(r"\b" + re.escape(identifier) + r"\b", blocker["summary"] + " " + blocker["required_action"])
+                   for identifier in (validation_id, until_task)):
+                raise WorkflowError("blocker must identify the build and its approved downstream task")
+            repository = run["repositories"][repo_id]
+            plan_path, plan = self._current_plan(repo_id)
+            checks = {item["id"]: item for item in plan["validations"]}
+            check = checks.get(validation_id)
+            if (not check or check["migration_capable"] or check["scope"] != "broad"
+                    or not re.fullmatch(r"(?:env(?: -u [A-Z_][A-Z0-9_]*)+ )?make build", check["command"])):
+                raise WorkflowError("only the existing non-migration full build can be deferred")
+            agents = self.load_agents()["agents"]
+            if (any(repo.get("active_writer") for repo in run["repositories"].values())
+                    or any(agent["status"] in {"starting", "working"}
+                           or agent.get("cleanup_status") != "complete" for agent in agents)):
+                raise WorkflowError("packet continuation requires closed, cleaned handles and no writer leases")
+            if any(key != repo_id and repo["status"] == "blocked" for key, repo in run["repositories"].items()):
+                raise WorkflowError("unrelated blocked repository must not be cleared by packet continuation")
+            order = {agent["output_artifact"]: index for index, agent in enumerate(agents)}
+            # A parallel batch accepts all outputs before projecting its first
+            # blocker; peer repository status can therefore still be pending.
+            for peer_id in run["repositories"]:
+                if peer_id == repo_id:
+                    continue
+                peer_plan, _ = self._current_plan(peer_id)
+                peers = [item for item in self._artifacts(repo_id=peer_id, stage="implement", kind="result")
+                         if self._assignment_pins(item[2], peer_plan, _sha256(peer_plan))]
+                if any(str(item[0]) not in order for item in peers):
+                    raise WorkflowError("missing peer implementation worker history")
+                if peers and max(peers, key=lambda item: order[str(item[0])])[1]["status"] != "complete":
+                    raise WorkflowError("unresolved accepted peer result must not be cleared or replayed")
+            writers = [item for item in self._artifacts(repo_id=repo_id, stage="implement", kind="result")
+                       if self._assignment_pins(item[2], plan_path, _sha256(plan_path))]
+            if not writers or any(str(item[0]) not in order for item in writers):
+                raise WorkflowError("missing current-plan implementation worker history")
+            output, result, assignment = max(writers, key=lambda item: order[str(item[0])])
+            if (result.get("status") != "blocked" or len(result.get("blockers", [])) != 1
+                    or any(result["blockers"][0].get(key) != blocker[key]
+                           for key in ("kind", "summary", "evidence_path", "required_action"))
+                    or assignment.get("plan_review") != {"path": review["review_path"], "sha256": review_sha256}):
+                raise WorkflowError("blocker must match the latest accepted approved packet result")
+            artifact_guard.validate_assignment(assignment)
+            previous_path = artifact_guard.CURRENT_ARTIFACT_PATH
+            try:
+                artifact_guard.CURRENT_ARTIFACT_PATH = output
+                artifact_guard.validate_result(result)
+            finally:
+                artifact_guard.CURRENT_ARTIFACT_PATH = previous_path
+            expected = sorted(zip(assignment["validation_ids"], assignment["validation_commands"], strict=True))
+            actual = sorted((item["id"], item["command"]) for item in result["validations"])
+            if actual != expected:
+                raise WorkflowError("blocked result must contain the exact assigned ID/command suite")
+            failed = [item for item in result["validations"] if item["result"] != "pass"]
+            if (len(failed) != 1 or failed[0]["id"] != validation_id or failed[0]["result"] != "fail"
+                    or failed[0]["command"] != check["command"] or failed[0]["log_path"] != str(evidence)
+                    or not failed[0]["exit_code"]):
+                raise WorkflowError("all other assigned checks must pass; only the identified build may fail")
+            packets = {packet["id"]: packet for packet in plan["work_packets"]}
+            packet = packets.get(result.get("packet_id"))
+            provider = next((item for item in plan["tasks"] if item["id"] == until_task), None)
+            if (not packet or set(result["task_ids"]) != set(packet["task_ids"])
+                    or not provider or validation_id not in provider["validation_ids"]
+                    or until_task in packet["task_ids"]):
+                raise WorkflowError("provider must be a different approved task that requires this build")
+            provider_packet = next(item for item in packets.values() if until_task in item["task_ids"])
+            ancestors, pending = set(), list(provider_packet["depends_on"])
+            while pending:
+                current = pending.pop()
+                if current not in ancestors:
+                    ancestors.add(current)
+                    pending.extend(packets[current]["depends_on"])
+            if packet["id"] not in ancestors:
+                raise WorkflowError("handler provider must depend on the blocked packet")
+            state = workflow_tools.repository_state(Path(repository["worktree"]))
+            if (state["fingerprint"] != result["tree_fingerprint"] or state["head"] != result["git"]["head"]
+                    or state["branch"] != repository["branch"]
+                    or _git(Path(repository["worktree"]), "diff", "--cached", "--name-only").strip()
+                    or _git(Path(repository["worktree"]), "status", "--short").strip()
+                    != Path(result["git"]["status_short_path"]).read_text().strip()):
+                raise WorkflowError("stale repository/Git evidence for the blocked packet")
+            path = self.run_dir / "repos" / repo_id / "packet-build-dependency.json"
+            record = {
+                "schema_version": 1, "artifact_kind": "packet-build-dependency", "run_id": run["run_id"],
+                "created_at": self.now(), "repo_id": repo_id, "authorization_text": text,
+                "plan": _reference(plan_path), "review": _reference(Path(review["review_path"])),
+                "result": _reference(output), "assignment": _reference(Path(result["assignment_path"])),
+                "blocker": blocker, "packet_id": packet["id"], "validation_id": validation_id,
+                "until_task": until_task, "provider_packet_id": provider_packet["id"], "repository_state": state,
+                "evidence": [_reference(item) for item in sorted(workflow_tools.artifact_evidence_paths(result))],
+                "reviewed_evidence": {"path": str(evidence), "sha256": evidence_sha256},
+            }
+            if path.exists():
+                prior = _load_json(path)
+                record["created_at"] = prior.get("created_at")
+                if prior != record:
+                    raise WorkflowError("existing immutable packet continuation intent differs")
+            else:
+                workflow_tools.atomic_write_json(path, record)
+            run.setdefault("packet_build_dependencies", {})[repo_id] = _reference(path)
+            run["status"], run["blockers"], repository["status"] = "working", [], "pending"
+            self._save_run(run)
+        self._append_event("resumed", reason="continue-packet-build", artifact=str(path), next_action="implement")
+        return True
+
+    def _packet_build_dependency(self, run: dict[str, Any], repo_id: str) -> dict[str, Any] | None:
+        reference = run.get("packet_build_dependencies", {}).get(repo_id)
+        if reference:
+            record = _load_json(Path(reference["path"]))
+            repository, review = run["repositories"][repo_id], run.get("plan_review") or {}
+            if (record["plan"] == {"path": repository.get("plan_path"), "sha256": repository.get("plan_sha256")}
+                    and record["review"] == {"path": review.get("review_path"), "sha256": review.get("review_sha256")}):
+                return record
+        return None
+
     def retry_dependent_fixes(self) -> bool:
         """Retry only a fix blocked by a concurrently changed upstream contract."""
         with RunLock(self.run_dir):
@@ -935,6 +1078,8 @@ class WorkflowEngine:
     def _canonical_inputs(self, run: dict[str, Any], repo_id: str | None) -> list[Path]:
         """Return current canonical inputs without stale plan/critic generations."""
         paths = [Path(run["request_path"]), Path(run["requirements_path"])]
+        paths.extend(Path(reference["path"]) for key, reference in run.get("packet_build_dependencies", {}).items()
+                     if repo_id is None or repo_id == key)
         if run.get("contract_path"):
             paths.append(Path(run["contract_path"]))
 
@@ -2736,6 +2881,11 @@ class WorkflowEngine:
                 and self._assignment_pins(assignment, plan_path, _sha256(plan_path))
                 and isinstance((packet_id := artifact.get("packet_id")), str)
             }
+            dependency = self._packet_build_dependency(run, repo_id)
+            if dependency:
+                # Scheduling progress only: the accepted foundation result stays
+                # blocked/failed and cannot satisfy the final validation gate.
+                completed.add(dependency["packet_id"])
             completed_packets_by_repo[repo_id] = completed
             if len(completed) == len(plan["work_packets"]):
                 completed_repositories.add(repo_id)
@@ -2779,6 +2929,11 @@ class WorkflowEngine:
                 validation_ids = {
                     validation["id"] for validation in plan["validations"]
                 }
+            dependency = self._packet_build_dependency(run, repo_id)
+            if (dependency and dependency["provider_packet_id"] not in completed
+                    and packet["id"] != dependency["provider_packet_id"]
+                    and len(completed) + 1 != len(plan["work_packets"])):
+                validation_ids.discard(dependency["validation_id"])
             selected_validations = [
                 validation
                 for validation in plan["validations"]
@@ -2798,6 +2953,8 @@ class WorkflowEngine:
                     instructions=[
                         "Execute exactly the approved work packet and record any bounded plan deviation.",
                         "Stop rather than introduce an undeclared high-cost mechanism or material contract change.",
+                        "Keep next_action at most 300 characters; metadata placeholders do not waive semantic limits.",
+                        *([f"The pinned packet-build-dependency admits foundation progress only. Preserve its failed evidence; do not replay it or add stubs. {dependency['validation_id']} is required from {dependency['until_task']} onward and in final validation."] if dependency else []),
                     ],
                     validation_commands=commands,
                     validation_ids=[
@@ -2931,7 +3088,7 @@ class WorkflowEngine:
                         "Do not broaden product scope or introduce a new mechanism.",
                     ],
                     validation_commands=self._plan_commands(repo_id),
-                    validation_ids=failed_ids,
+                    validation_ids=self._plan_validation_ids(repo_id),
                 )
             )
         if fix_assignments:

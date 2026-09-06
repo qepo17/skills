@@ -1015,6 +1015,21 @@ def validate_run(data: dict[str, Any]) -> None:
         if pending_contract["feedback"] not in replans or phase != "contract":
             fail(loc, "must pin decision feedback during contract revision")
 
+    packet_dependencies = obj(data.get("packet_build_dependencies", {}), "$.packet_build_dependencies")
+    for repository_id, reference in packet_dependencies.items():
+        loc = f"$.packet_build_dependencies.{repository_id}"
+        if repository_id not in repositories:
+            fail(loc, "unknown repository")
+        record = load_json_object(hashed_file_reference(reference, loc), loc)
+        if record.get("run_id") != data["run_id"] or record.get("repo_id") != repository_id:
+            fail(loc, "packet continuation must belong to this run/repository")
+        for key in ("plan", "review", "result", "assignment", "reviewed_evidence"):
+            hashed_file_reference(field(record, key, loc), f"{loc}.{key}")
+        if record["result"] not in repositories[repository_id]["accepted_artifacts"].values():
+            fail(loc, "packet continuation must preserve an accepted result")
+        for index, evidence in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
+            hashed_file_reference(evidence, f"{loc}.evidence[{index}]")
+
     pending_refresh = obj(data.get("pending_delivery_refresh", {}), "$.pending_delivery_refresh")
     for repository_id, reference in pending_refresh.items():
         location = f"$.pending_delivery_refresh.{repository_id}"
