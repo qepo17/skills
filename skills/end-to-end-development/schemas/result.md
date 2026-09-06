@@ -12,13 +12,16 @@ For `execution_mode: artifact-repair`, initialization copies the original result
 
 Required rules:
 
+- For an assignment with `validation_policy_version: 1`, return `status: complete` when the assigned source work and factual check reporting are finished, even when one or more checks failed. Return `blocked` only when the assigned work/reporting could not finish. Never omit a failed record, invent a passing result, or use a blocker solely because a command exited nonzero.
 - Implementation copies the assignment's `packet_id` and exact sorted `task_ids` (one to three for standard/full; up to four for fast).
 - A review-fix batch resolves every assigned `finding_id` in `resolutions`; one worker may resolve multiple compatible findings.
 - `changed_files` is the complete sorted repository-relative inventory.
 - The worker may leave assignment hash, `tree_fingerprint`, `git`, validation command hashes/fingerprints, and fresh-cache metadata at their skeleton values. The coordinator computes these mechanical fields at acceptance time.
-- Every validation records ID, exact command/cwd, exit code, result, summary, and log path. Implementation, review-fix, pipeline-fix, and `validate` results cover every exact ID/command pair in their assignment. The final repository writer receives the complete planned suite, allowing the graph to skip a duplicate validation worker.
-- `cache_status: reused` requires a hash-pinned `source_artifact`; use it only when command hash and tree fingerprint match passing evidence.
+- Every validation records ID, exact command/cwd, exit code, result, summary, and action-specific log path. Implementation, review-fix, validation-fix, pipeline-fix, and `validate` results cover every exact ID/command pair in a policy-version-1 assignment. A failed record has a nonzero exit code; `not-run` has a null exit code. The coordinator adds `log_sha256` at acceptance. Fresh logs must resolve beneath the assigned `log_dir`, not arbitrary files or symlinks outside it; paths are checked before hashing. Never overwrite an older action's log.
+- `cache_status: reused` requires a hash-pinned `source_artifact`; use it only when command hash, canonical cwd, tree fingerprint, passing outcome, and original log path/hash match. The earlier log must remain within this repository's run log directory.
 - Decisions have an ID, `kind`, summary, and evidence. Use `bounded-plan-deviation` only for a change that preserves requirements/contract, adds no mechanism, follows repository precedent, and stays within the packet concern.
 - Full output stays in log files. The coordinator adds an authoritative acceptance-time Git snapshot and runs final schema validation after the worker settles.
+
+The assignment already omits currently excluded checks, so do not execute them speculatively. Predeclared advisory checks that are assigned are still attempted and reported. Their failures remain `result: fail`; the engine turns them into warnings without a blocker or fix-budget charge. An exception is never a pass. If future current-tree evidence has no record because the command was excluded, the engine—not the worker—reports `not-run`/excluded and retains any historical failed artifact separately.
 
 Return after the semantic payload and logs are complete; do not spend a separate worker pass repairing coordinator-owned mechanical fields.

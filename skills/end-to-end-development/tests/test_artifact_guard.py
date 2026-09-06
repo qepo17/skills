@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "artifact_guard.py"
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("artifact_guard", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 artifact_guard = importlib.util.module_from_spec(SPEC)

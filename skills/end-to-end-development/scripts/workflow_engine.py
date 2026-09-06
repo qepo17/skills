@@ -32,6 +32,7 @@ import artifact_guard  # noqa: E402
 import delivery_tools  # noqa: E402
 import worker_supervisor  # noqa: E402
 import workflow_tools  # noqa: E402
+import validation_policy  # noqa: E402
 
 
 PROJECT_WRITE_STAGES = {"implement", "validation-fix", "fix-1", "fix-2", "pipeline-fix"}
@@ -302,6 +303,7 @@ class WorkflowEngine:
         required_action: str,
         kind: str = "code",
         repo_id: str | None = None,
+        gate: dict[str, Any] | None = None,
     ) -> None:
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         if not evidence_path.exists():
@@ -313,6 +315,8 @@ class WorkflowEngine:
             "evidence_path": str(evidence_path.resolve()),
             "required_action": required_action[:2000],
         }
+        if gate is not None:
+            blocker["gate"] = gate
         with RunLock(self.run_dir):
             run = self.load_run()
             run["status"] = "blocked"
@@ -335,6 +339,7 @@ class WorkflowEngine:
                 required_action=blocker["required_action"],
                 kind=blocker["kind"],
                 repo_id=artifact.get("repo_id"),
+                gate=self._delivery_gate(artifact),
             )
             return
         path = Path(artifact["assignment_path"])
@@ -344,6 +349,55 @@ class WorkflowEngine:
             required_action="Inspect the accepted worker artifact and resume with a concrete recovery.",
             repo_id=artifact.get("repo_id"),
         )
+
+    def _delivery_gate(self, artifact: dict[str, Any]) -> dict[str, Any] | None:
+        if (self.load_run(validate=False).get("delivery_policy_version") != 1
+                or artifact.get("artifact_kind") != "delivery"
+                or artifact.get("reason_code") not in {'required-ci-failed', 'required-ci-pending', 'managed-body-edited', 'pr-readiness-changed'}):
+            return None
+        assignment = _load_json(Path(artifact["assignment_path"]))
+        gate_type = 'required-ci' if artifact['reason_code'].startswith('required-ci-') else 'delivery-state'
+        return {"type": gate_type, "repo_id": artifact["repo_id"],
+                "artifact": _reference(Path(assignment["output_artifact"])),
+                "check_ids": sorted({self._ci_identity(check) for check in artifact["checks"]
+                                     if check["required"] and check["state"] != "passed"})}
+
+    def _routable_delivery(self, artifact: dict[str, Any]) -> bool:
+        if artifact.get("artifact_kind") != "delivery":
+            return False
+        if self.load_run(validate=False).get("delivery_policy_version") == 1:
+            return artifact.get("reason_code") == "publication-required"
+        return any(b["kind"] == "code" for b in artifact.get("blockers", []))
+
+    def resume_delivery_checks(self) -> bool:
+        """Queue read-only observations, not a waiver or implicit source-fix grant."""
+        run = self.load_run()
+        if run.get("delivery_policy_version") != 1 or run["status"] != "blocked" or not run["blockers"]:
+            return False
+        if run["next_actions"] or any(b.get('gate', {}).get('type') not in {'required-ci', 'delivery-state'} for b in run['blockers']):
+            return False
+        refresh = {}
+        for blocker in run["blockers"]:
+            repo_id = blocker["gate"]["repo_id"]
+            latest = self._artifacts(repo_id=repo_id, kind="delivery")[-1]
+            if blocker["gate"]["artifact"] != _reference(latest[0]):
+                raise WorkflowError("delivery blocker no longer identifies the latest observation")
+            validation = self._current_validation(repo_id, require_pass=True)
+            if validation is None or validation[1]['tree_fingerprint'] != latest[2].get('input_tree_fingerprint'):
+                raise WorkflowError('delivery re-observation requires unchanged delivered and validated content')
+            worktree = Path(run["repositories"][repo_id]["worktree"])
+            if latest[1].get("head_sha") != _git(worktree, "rev-parse", "HEAD"):
+                raise WorkflowError("delivery HEAD changed; refusing a stale re-observation")
+            refresh[repo_id] = _reference(latest[0])
+        with RunLock(self.run_dir):
+            current = self.load_run()
+            if current != run:
+                raise WorkflowError("delivery context changed during resume")
+            current.setdefault("pending_delivery_refresh", {}).update(refresh)
+            current["status"], current["phase"], current["blockers"] = "working", "deliver", []
+            self._save_run(current)
+        self._append_event("resumed", reason="reobserve-required-ci", next_action="deliver")
+        return True
 
     def _wait_for_crash_survivor(
         self, assignment_path: Path, assignment: dict[str, Any]
@@ -832,7 +886,7 @@ class WorkflowEngine:
                 next_action=None,
             )
             if artifact.get("status") in {"blocked", "failed"}:
-                if assignment["stage"] == "deliver" and any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+                if self._routable_delivery(artifact):
                     continue  # The delivery phase still owns its permitted CI-fix route.
                 self._block_from_artifact(artifact)
                 break
@@ -848,7 +902,7 @@ class WorkflowEngine:
                 ))
             self._set_phase("deliver")
             for artifact in self._run_with_replacements(refresh_paths):
-                if artifact.get("status") != "complete" and not any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+                if artifact.get("status") != "complete" and not self._routable_delivery(artifact):
                     self._block_from_artifact(artifact)
                     break
         return self.load_run()["phase"]
@@ -935,6 +989,7 @@ class WorkflowEngine:
     def _canonical_inputs(self, run: dict[str, Any], repo_id: str | None) -> list[Path]:
         """Return current canonical inputs without stale plan/critic generations."""
         paths = [Path(run["request_path"]), Path(run["requirements_path"])]
+        paths.extend(Path(ref["path"]) for ref in run.get("run_amendments", []))
         if run.get("contract_path"):
             paths.append(Path(run["contract_path"]))
 
@@ -1099,6 +1154,8 @@ class WorkflowEngine:
             if repo_id is None
             else self.run_dir / "repos" / repo_id / "logs"
         )
+        if run.get("validation_policy_version") == 1:
+            log_dir = log_dir / _slug(action_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         assignment: dict[str, Any] = {
             "schema_version": 1,
@@ -1148,6 +1205,21 @@ class WorkflowEngine:
                 (self.skill_dir / "scripts" / "artifact_guard.py").resolve()
             ),
         }
+        for version in ("validation_policy_version", "delivery_policy_version"):
+            if version in run:
+                assignment[version] = run[version]
+        if run.get("validation_policy_version") == 1:
+            assignment["instructions"].append(
+                "Classify checks by actual requirements/repository policy, not breadth or unchanged files. "
+                "Acceptance/security/repository-required/migration-capable obligations are protected. "
+                "Mixed commands containing mandatory checks cannot be supplemental. Audit this classification in planning and review. "
+                "Pinned advisory failures/exclusions do not themselves become must-fix findings or integration failures; "
+                "requirement and interface rows still need genuine passing acceptance evidence. "
+                "Report completed source/check-reporting work as complete even when checks fail; "
+                "the engine evaluates checks. Use blocked for unfinished work, never merely a nonzero check. "
+                "Run each assigned ID/command from its exact canonical plan cwd. "
+                "Honor pinned exclusions and disclose advisory failures; neither is evidence that a check passed."
+            )
         if stage not in {"implement"}:
             assignment.pop("packet_id")
         if stage not in {"implement"}:
@@ -1155,6 +1227,24 @@ class WorkflowEngine:
         if stage not in {"fix-1", "fix-2", "review-2"}:
             assignment["finding_ids"] = []
         if stage == "deliver" and repository:
+            if run.get("delivery_policy_version") == 1:
+                assignment['pr_ownership'] = {'repository': repository.get('delivery_repository') or repo_id,
+                    'branch': repository['branch'], 'base_branch': repository['base_branch'],
+                    'intent_path': str(self.run_dir / 'repos' / repo_id / 'pr-creation-intent.json')}
+                assignment["instructions"].append(
+                    "Create an owned draft PR only after the effective local gate, review, and integration pass. "
+                    "Preserve user-owned PR readiness and human edits. Report pr_draft, pr_owned, reason_code, "
+                    "and truthful advisory/exclusion/required-CI details even while blocked. An owned draft "
+                    "is not complete until published and final-head policy/checks are re-verified. "
+                    "verify_only forbids commit, push, PR creation, body edits, and publication; return "
+                    "publication-required for an otherwise verified owned draft. Do not repair unknown/unrelated "
+                    "CI automatically; report unsupported draft creation or draft-only CI constraints. "
+                    "Prove pr_owned with the pinned pr_ownership identity, immutable pre-creation nonce intent, "
+                    "and hashed ownership_observation JSON (url/state/headRefName/baseRefName/isDraft/body). "
+                    "Use delivery_tools.Delivery ownership helpers for the nonce marker and readiness journal; "
+                    "a boolean or public marker alone is insufficient. If proof cannot be obtained, block rather than adopt or publish."
+
+                )
             assignment["delivery_evidence_version"] = repository.get("delivery_evidence_version", 1)
             assignment["execution_mode"] = "command" if repository.get("delivery_executor") == "github-command" else "worker"
             assignment["check_timeout_seconds"] = repository.get("delivery_check_timeout_seconds", 1800)
@@ -1332,9 +1422,14 @@ class WorkflowEngine:
             else run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
         )
         target[assignment["action_id"]] = _reference(output_path)
-        pending = run.get("pending_delivery_refresh", {})
         repo_id = assignment.get("repo_id")
-        if (assignment.get("execution_mode") == "command" and repo_id in pending
+        for pending_key, assignment_key in (("pending_check_remediations", "remediation"),
+                                            ("pending_validation_refresh", "validation_refresh")):
+            pending_decisions = run.get(pending_key, {})
+            if repo_id in pending_decisions and pending_decisions[repo_id] == assignment.get(assignment_key):
+                del pending_decisions[repo_id]
+        pending = run.get("pending_delivery_refresh", {})
+        if (assignment.get("stage") == "deliver" and repo_id in pending
                 and self._assignment_pins(assignment, Path(pending[repo_id]["path"]), pending[repo_id]["sha256"])):
             del pending[repo_id]
 
@@ -1367,15 +1462,34 @@ class WorkflowEngine:
         if assignment["action_id"] in repository["accepted_artifacts"]:
             raise WorkflowError("refusing to overwrite accepted delivery evidence")
         if self._current_validation(repo_id, require_pass=True) is None:
-            raise WorkflowError("command delivery requires current passing local validation")
+            raise WorkflowError("command delivery requires a satisfied current local validation gate")
+        if run.get('validation_policy_version') == 1 and not (verify_only or assignment.get('verify_only')):
+            if not self._review_basis(repo_id) or (run['workflow_policy']['integration_required'] and not self._current_integration()):
+                raise WorkflowError('delivery requires valid review provenance and current integration evidence')
         files = sorted({name for _path, result, writer in self._artifacts(repo_id=repo_id, kind="result")
                         if writer.get("stage") in PROJECT_WRITE_STAGES for name in result.get("changed_files", [])})
         request = Path(run["request_path"]).read_text().strip()
         title = request.splitlines()[0][:100]
         validations = self._plan_commands(repo_id)
         body = "## Problem\n" + request[:2000] + "\n\n## Solution\n" + "\n".join(f"- `{name}`" for name in files)
-        body += "\n\n## Validation\n" + "\n".join(f"- `{command}`" for command in validations)
-        body += "\n\nOne independent review completed; compatible must-fix findings resolved. Required CI is monitored on the final head.\n"
+        local_summary = self.validation_summary(repo_id) if run.get("validation_policy_version") == 1 else None
+        if local_summary:
+            validation_text = "\n".join(
+                f"- `{row['id']}` `{row['command']}`: **{row['result']}** ({row['disposition']}) — {row['summary']}"
+                + (f" Exception: {Path(row['exception']['path']).name}; {row['authorization']['rationale']}" if row['exception'] else '')
+                for row in local_summary["checks"])
+            if local_summary['historical_failures']:
+                validation_text += "\n\nHistorical failures (not current observations):\n" + "\n".join(
+                    f"- `{record['id']}`: {record['summary']} ({Path(record['artifact']['path']).name})"
+                    for record in local_summary['historical_failures'])
+        else:
+            validation_text = "\n".join(f"- `{command}`" for command in validations)
+        body += "\n\n## Validation\n" + ("See the managed validation section below." if run.get("delivery_policy_version") == 1 else validation_text)
+        if run.get('validation_policy_version') == 1:
+            validation_text += f"\n\nReview evidence: {self._review_basis(repo_id)}; compatible must-fix findings resolved."
+            body += '\n\nOne independent review is recorded; see managed validation for current revision provenance.\n'
+        else:
+            body += "\n\nOne independent review completed; compatible must-fix findings resolved. Required CI is monitored on the final head.\n"
         log_dir = Path(assignment["log_dir"]) / _slug(assignment["action_id"])
         log_dir.mkdir(parents=True, exist_ok=True)
         spec = {"repository": repository["delivery_repository"], "worktree": repository["worktree"],
@@ -1383,6 +1497,9 @@ class WorkflowEngine:
                 "task_files": files, "expected_fingerprint": assignment["input_tree_fingerprint"],
                 "commit_message": f"feat: {title[:72]}", "pr_title": title, "pr_body": body,
                 "log_dir": str(log_dir), "check_timeout_seconds": assignment.get("check_timeout_seconds", assignment["timeout_seconds"])}
+        if run.get("delivery_policy_version") == 1:
+            spec.update(pr_lifecycle="draft-until-verified", run_id=run["run_id"], local_validation_summary=validation_text,
+                        pr_intent_path=str(self.run_dir / 'repos' / repo_id / 'pr-creation-intent.json'))
         input_path = log_dir / "input.json"
         if input_path.exists() and _load_json(input_path) != spec:
             raise WorkflowError("immutable command delivery input changed")
@@ -1396,6 +1513,8 @@ class WorkflowEngine:
         artifact = artifact_guard.artifact_skeleton(path, assignment)
         artifact.update({key: result[key] for key in ("branch", "base_branch", "commits", "pr_url", "checks",
                                                      "head_sha", "pushed_head_sha", "checked_head_sha", "check_policy")})
+        if run.get("delivery_policy_version") == 1:
+            artifact.update({key: result.get(key) for key in ("pr_draft", "pr_owned", "reason_code", "creation_intent", "ownership_observation")})
         artifact["command_evidence"] = _reference(evidence_path)
         artifact["delivery_outcome"] = result["status"]
         artifact["status"] = "complete" if result["status"] == "complete" else "blocked"
@@ -1781,6 +1900,8 @@ class WorkflowEngine:
             ):
                 continue
             results.append((path, artifact, assignment))
+        if run.get("validation_policy_version") == 1:
+            return results  # accepted-reference insertion order is the durable execution order
         return sorted(
             results,
             key=lambda item: (
@@ -1808,13 +1929,53 @@ class WorkflowEngine:
         path = Path(repository["plan_path"])
         return path, _load_json(path)
 
-    def _plan_commands(self, repo_id: str) -> list[str]:
+    def _validation_basis(self, repo_id: str) -> dict[str, Any]:
+        run = self.load_run(validate=False)
+        return {key: run.get(key) for key in ("requirements_sha256", "contract_sha256")} | {
+            "plan_sha256": run["repositories"][repo_id]["plan_sha256"],
+            "review_sha256": (run.get("plan_review") or {}).get("review_sha256")}
+
+    def _amendments(self) -> list[dict[str, Any]]:
+        return [_load_json(Path(ref["path"])) | {"reference": ref}
+                for ref in self.load_run().get("run_amendments", [])]
+
+    def _exclusions(self, repo_id: str) -> dict[str, dict[str, str]]:
+        return validation_policy.exclusions(self._amendments(), repo_id=repo_id,
+                                            basis=self._validation_basis(repo_id))
+
+    def _effective_checks(self, repo_id: str) -> list[dict[str, Any]]:
         _, plan = self._current_plan(repo_id)
-        return [validation["command"] for validation in plan["validations"]]
+        if self.load_run(validate=False).get("validation_policy_version") != 1:
+            return plan["validations"]
+        return validation_policy.effective_checks(plan["validations"], self._exclusions(repo_id))
+
+    def _plan_commands(self, repo_id: str) -> list[str]:
+        return [check["command"] for check in self._effective_checks(repo_id)]
 
     def _plan_validation_ids(self, repo_id: str) -> list[str]:
+        return [check["id"] for check in self._effective_checks(repo_id)]
+
+    def validation_summary(self, repo_id: str) -> dict[str, Any]:
+        current = self._current_observation(repo_id)
         _, plan = self._current_plan(repo_id)
-        return [validation["id"] for validation in plan["validations"]]
+        summary = validation_policy.evaluate(plan["validations"],
+                    current[1]["validations"] if current else [], self._exclusions(repo_id))
+        summary["source_artifact"] = _reference(current[0]) if current else None
+        summary['artifact_status'] = current[1]['status'] if current else None
+        if current and current[1]['status'] != 'complete':
+            summary['satisfied'] = False
+        decisions = {item['reference']['sha256']: item for item in self._amendments()}
+        for row in summary['checks']:
+            if row['exception']:
+                decision = decisions[row['exception']['sha256']]
+                row['authorization'] = {key: decision[key] for key in ('authority', 'text', 'rationale', 'check_ids')}
+        summary['historical_failures'] = [
+            {'artifact': _reference(path), 'id': record['id'], 'command': record['command'],
+             'summary': record['summary'], 'log_path': record['log_path'], 'log_sha256': record.get('log_sha256')}
+            for path, result, _ in self._artifacts(repo_id=repo_id, kind='result')
+            if not current or path != current[0]
+            for record in result.get('validations', []) if record['result'] == 'fail']
+        return summary
 
     def _latest_writer_artifact(
         self, repo_id: str
@@ -1828,8 +1989,11 @@ class WorkflowEngine:
         return writers[-1] if writers else None
 
     def _current_validation(
-        self, repo_id: str, *, require_pass: bool
+        self, repo_id: str, *, require_pass: bool, check_ids: set[str] | None = None
     ) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
+        modern = self.load_run(validate=False).get("validation_policy_version") == 1
+        if modern:
+            return self._policy_validation(repo_id, require_pass=require_pass, check_ids=check_ids)
         fingerprint = workflow_tools.worktree_fingerprint(
             Path(self.load_run(validate=False)["repositories"][repo_id]["worktree"])
         )
@@ -1871,6 +2035,314 @@ class WorkflowEngine:
                     continue
                 return item
         return None
+
+    @staticmethod
+    def _verify_validation_evidence(result: dict[str, Any]) -> None:
+        path = Path(result["assignment_path"])
+        if _sha256(path) != result["assignment_sha256"]:
+            raise artifact_guard.ValidationError("accepted assignment hash changed")
+        assignment = _load_json(path)
+        for record in result["validations"]:
+            artifact_guard.validation_log_path(record, assignment, '$.validations.log_path')
+            if record.get("log_path") and not record.get("log_sha256"):
+                raise artifact_guard.ValidationError("new-run validation requires acceptance-time log identity")
+        artifact_guard.validate_validation_records(result["validations"], "$.validations",
+            tree_fingerprint=result["tree_fingerprint"], require_cache_metadata=True,
+            artifact_path=Path(assignment["output_artifact"]), enforce_log_identity=True)
+
+    def _current_observation(self, repo_id: str):
+        run = self.load_run()
+        plan_path, _ = self._current_plan(repo_id)
+        fingerprint = workflow_tools.worktree_fingerprint(Path(run['repositories'][repo_id]['worktree']))
+        latest_writer = self._latest_writer_artifact(repo_id)
+        for item in reversed(self._artifacts(repo_id=repo_id, kind='result')):
+            path, result, assignment = item
+            if result.get('tree_fingerprint') != fingerprint or not self._pins_semantics(assignment, repo_id):
+                continue
+            if latest_writer and path != latest_writer[0] and not self._assignment_pins(assignment, latest_writer[0], _sha256(latest_writer[0])):
+                continue
+            try:
+                self._verify_validation_evidence(result)
+            except artifact_guard.ValidationError as error:
+                raise WorkflowError(f'Current validation evidence is invalid: {path}: {error}') from error
+            return item  # Include partial coverage/unfinished work in truthful status.
+        return None
+
+    def _policy_validation(self, repo_id: str, *, require_pass: bool, check_ids: set[str] | None = None):
+        item = self._current_observation(repo_id)
+        if item is None or item[1]['status'] != 'complete':
+            return None
+        _, plan = self._current_plan(repo_id)
+        checks = [check for check in plan['validations'] if check_ids is None or check['id'] in check_ids]
+        evaluation = validation_policy.evaluate(checks, item[1]['validations'], self._exclusions(repo_id))
+        # Never replace a newer failure/coverage gap with an older passing result.
+        return item if evaluation['coverage_complete'] and (not require_pass or evaluation['satisfied']) else None
+
+    def _block_validation_gate(self, repo_id: str, result_path: Path, evaluation: dict[str, Any]) -> None:
+        self._block(summary=f"Local validation gate for {repo_id}: {', '.join(evaluation['blocking_ids'] + evaluation['missing_ids'])}.",
+                    evidence_path=result_path, kind="decision", repo_id=repo_id,
+                    required_action="Inspect status for scoped validation-exception or task-related check-remediation decisions. Missing or protected evidence cannot be waived.",
+                    gate={"type": "local-validation", "repo_id": repo_id, "artifact": _reference(result_path),
+                          "check_ids": sorted(set(evaluation["blocking_ids"] + evaluation["missing_ids"]))})
+
+    def status_details(self) -> dict[str, Any]:
+        """Read-only projections; never prefer an old success over a new observation."""
+        run = self.load_run()
+        details: dict[str, Any] = {"run_id": run["run_id"], "local_gates": {}, "amendment_contexts": {}, "eligible_actions": [], "deliveries": [], "review_provenance": {}}
+        for repo_id, repo in sorted(run["repositories"].items()):
+            observations = self._artifacts(repo_id=repo_id, kind="delivery")
+            if observations:
+                path, latest, _ = observations[-1]
+                url = next((item[1]["pr_url"] for item in reversed(observations) if item[1].get("pr_url")), None)
+                details["deliveries"].append({"repo_id": repo_id, "artifact": _reference(path), "pr_url": url,
+                    **{key: latest.get(key) for key in ("status", "delivery_outcome", "pr_draft", "pr_owned", "reason_code", "checks", "head_sha", "checked_head_sha")}})
+            if not repo.get("plan_path"):
+                continue
+            summary = self.validation_summary(repo_id)
+            details["local_gates"][repo_id] = summary
+            details['review_provenance'][repo_id] = self._review_basis(repo_id)
+            evidence_context = self.amendment_context(repo_id)
+            context = evidence_context['sha256']
+            details["amendment_contexts"][repo_id] = context
+            if (run["status"] == "complete" or (run.get("plan_review") or {}).get("status") != "approved"
+                    or run['next_actions'] or summary['artifact_status'] in {'blocked', 'failed'}
+                    or any(repo.get('active_writer') for repo in run['repositories'].values())
+                    or (evidence_context['source_artifact'] and evidence_context['source_artifact'] != summary['source_artifact'])
+                    or not self._amendment_state_matches(evidence_context)):
+                continue
+            for decision, ids in (("exclude", [r["id"] for r in summary["checks"] if r["purpose"] == "supplemental" and not r["migration_capable"] and r["disposition"] != "excluded"]),
+                                  ("restore", [r["id"] for r in summary["checks"] if r["disposition"] == "excluded"])):
+                if ids:
+                    details["eligible_actions"].append({"kind": "validation-exception", "decision": decision, "authority": "user",
+                        "repo_id": repo_id, "target": "local", "check_ids": ids, "expected_context": context})
+            for blocker in run["blockers"]:
+                gate = blocker.get("gate", {})
+                if gate.get('type') in {'required-ci', 'delivery-state'} and not self._delivery_matches_context(evidence_context):
+                    continue
+                if gate.get('repo_id') == repo_id and gate.get('type') == 'delivery-state':
+                    details['eligible_actions'].append({'command': 'resume', 'repo_id': repo_id,
+                        'effect': 'read-only PR re-observation after resolving the recorded body/readiness conflict'})
+                    continue
+                if gate.get("repo_id") == repo_id and gate.get("check_ids"):
+                    local = gate['type'] == 'local-validation'
+                    failed = {r['id'] for r in summary['checks'] if r['result'] == 'fail' and r['disposition'] != 'excluded'} if local else {
+                        self._ci_identity(check) for check in observations[-1][1]['checks'] if check['required'] and check['state'] == 'failed'}
+                    targets = sorted(set(gate['check_ids']) & failed)
+                    stage = 'validation-fix' if local else 'pipeline-fix'
+                    limit = run['retry_limits']['validation_fix_cycles' if local else 'pipeline_fix_cycles']
+                    if targets and len(self._artifacts(repo_id=repo_id, stage=stage, kind='result')) < limit and repo_id not in run.get('pending_check_remediations', {}):
+                        details['eligible_actions'].append({'kind': 'check-remediation', 'decision': 'fix-related', 'authority': 'coordinator',
+                            'repo_id': repo_id, 'target': 'local' if local else 'ci', 'check_ids': targets, 'expected_context': context,
+                            'requires': 'Evidence of task-related, approved-scope remediation within the remaining fix budget.'})
+                    if gate["type"] == "required-ci":
+                        details["eligible_actions"].append({"command": "resume", "repo_id": repo_id, "effect": "read-only CI re-observation; no waiver or code-fix permission"})
+        return details
+
+    def amendment_context(self, repo_id: str) -> dict[str, Any]:
+        run = self.load_run()
+        if run.get("validation_policy_version") != 1:
+            raise WorkflowError("legacy runs do not support amendments")
+        if repo_id not in run["repositories"]:
+            raise WorkflowError("unknown amendment repository")
+        results = self._artifacts(repo_id=repo_id, kind="result")
+        deliveries = self._artifacts(repo_id=repo_id, kind="delivery")
+        review = run.get("plan_review") or {}
+        context = {"run_id": run["run_id"], "repo_id": repo_id, "phase": run["phase"],
+                   "basis": self._validation_basis(repo_id), "amendments": run.get("run_amendments", []),
+                   "review": {"path": review.get("review_path"), "sha256": review.get("review_sha256")},
+                   "repository_state": workflow_tools.repository_state(Path(run["repositories"][repo_id]["worktree"])),
+                   "source_artifact": _reference(results[-1][0]) if results else None,
+                   "delivery_artifact": _reference(deliveries[-1][0]) if deliveries else None,
+                   "blockers": run["blockers"]}
+        digest = hashlib.sha256(json.dumps(context, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return context | {"sha256": digest}
+
+    @staticmethod
+    def _delivery_matches_context(context: dict[str, Any]) -> bool:
+        if not context['delivery_artifact']:
+            return False
+        delivery = _load_json(Path(context['delivery_artifact']['path']))
+        assignment = _load_json(Path(delivery['assignment_path']))
+        state = context['repository_state']
+        return delivery.get('head_sha') == state['head'] and assignment.get('input_tree_fingerprint') == state['fingerprint']
+
+    def _amendment_state_matches(self, context: dict[str, Any]) -> bool:
+        repo_id = context['repo_id']
+        repo = self.load_run(validate=False)['repositories'][repo_id]
+        source = _load_json(Path(context['source_artifact']['path'])) if context['source_artifact'] else None
+        delivery = _load_json(Path(context['delivery_artifact']['path'])) if context['delivery_artifact'] else None
+        _, plan = self._current_plan(repo_id)
+        expected_tree = source['tree_fingerprint'] if source else _load_json(Path(plan['assignment_path']))['input_tree_fingerprint']
+        expected_head = (delivery.get('head_sha') if delivery else None) or (source['git']['head'] if source else repo['baseline'])
+        state = context['repository_state']
+        return (state['fingerprint'] == expected_tree and state['head'] == expected_head and state['branch'] == repo['branch']
+                and not _git(Path(repo['worktree']), 'diff', '--cached', '--name-only'))
+
+    def apply_amendment(self, request: dict[str, Any]) -> dict[str, str]:
+        """Apply a typed, quiescent decision. CLI holds the execution lock.
+
+        Never rewrite a worker conclusion. Only gate policy or permission for an
+        existing bounded remediation changes; the graph still schedules work.
+        """
+        run = self.load_run()
+        if run.get("validation_policy_version") != 1:
+            raise WorkflowError("legacy runs do not support amendments")
+        request_hash = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        for amendment in self._amendments():
+            if amendment["request_sha256"] == request_hash:
+                return {"status": "already-applied", "path": amendment["reference"]["path"]}
+        try:
+            artifact_guard.validate_amendment_request(request)
+        except artifact_guard.ValidationError as error:
+            raise WorkflowError(str(error)) from error
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            review = run.get("plan_review") or {}
+            if run["status"] == "complete" or review.get("status") != "approved":
+                raise WorkflowError("amendments require an active run with an approved bundle")
+            if (run["next_actions"] or any(repo.get("active_writer") for repo in run["repositories"].values())
+                    or any(a["status"] in {"starting", "working", "blocked", "idle"}
+                           or a.get("cleanup_status", "complete") != "complete" or a.get('pane_closed') is False
+                           for a in self.load_agents()["agents"])):
+                raise WorkflowError("amendments require settled actions and cleaned worker handles")
+            repo_id = request["repo_id"]
+            context = self.amendment_context(repo_id)
+            if context["sha256"] != request["expected_context"]:
+                raise WorkflowError("stale amendment context; review current status before deciding")
+            repo = run["repositories"][repo_id]
+            source = _load_json(Path(context["source_artifact"]["path"])) if context["source_artifact"] else None
+            delivery = _load_json(Path(context["delivery_artifact"]["path"])) if context["delivery_artifact"] else None
+            if source and source.get("status") != "complete":
+                raise WorkflowError("cannot use an amendment to complete unfinished worker work")
+            if source:
+                try:
+                    self._verify_validation_evidence(source)
+                except artifact_guard.ValidationError as error:
+                    raise WorkflowError(f"invalid accepted evidence: {error}") from error
+            state = context["repository_state"]
+            _, plan = self._current_plan(repo_id)
+            if not self._amendment_state_matches(context):
+                raise WorkflowError("repository content/HEAD/branch/index no longer matches accepted evidence")
+            selected = set(request["check_ids"])
+            if request["target"] == "local":
+                definitions = {check["id"]: check for check in plan["validations"]}
+                if not selected <= definitions.keys():
+                    raise WorkflowError("unknown validation IDs")
+                if request["kind"] == "validation-exception":
+                    if any(validation_policy.protected(definitions[key]) for key in selected):
+                        raise WorkflowError("protected checks cannot be excluded")
+                    active = self._exclusions(repo_id)
+                    if request["decision"] == "restore" and not selected <= active.keys():
+                        raise WorkflowError("restore requires an active exclusion for every check")
+                else:
+                    current = self._current_validation(repo_id, require_pass=False, check_ids=selected)
+                    if current is None or _reference(current[0]) != context["source_artifact"]:
+                        raise WorkflowError("remediation requires current canonical failure evidence")
+                    observations = {record["id"]: record for record in (source or {}).get("validations", [])}
+                    if not all(key in observations and observations[key]["result"] == "fail"
+                               and key not in self._exclusions(repo_id) for key in selected):
+                        raise WorkflowError("remediation requires current failed, non-excluded validation evidence")
+            else:
+                if not delivery or delivery.get("reason_code") != "required-ci-failed":
+                    raise WorkflowError("CI remediation requires an identified required-check failure")
+                if not self._delivery_matches_context(context):
+                    raise WorkflowError('CI remediation requires unchanged delivered content, not a stale failure')
+                identities = {self._ci_identity(check) for check in delivery["checks"]
+                              if check["required"] and check["state"] == "failed"}
+                if not selected <= identities:
+                    raise WorkflowError("CI remediation targets must be currently failed required checks")
+            if request["kind"] == "check-remediation":
+                stage = "pipeline-fix" if request["target"] == "ci" else "validation-fix"
+                budget = "pipeline_fix_cycles" if request["target"] == "ci" else "validation_fix_cycles"
+                if (repo_id in run.get("pending_check_remediations", {})
+                        or len(self._artifacts(repo_id=repo_id, stage=stage, kind="result")) >= run["retry_limits"][budget]):
+                    raise WorkflowError("existing remediation allowance exhausted or already assigned")
+            references = list(request['evidence'])
+            if source:
+                references.extend({'path': record['log_path'], 'sha256': record['log_sha256']}
+                                  for record in source.get('validations', []) if record['id'] in selected and record.get('log_path'))
+            if delivery and request['target'] == 'ci':
+                references.extend({'path': check['evidence_path'], 'sha256': check['evidence_sha256']}
+                                  for check in delivery['checks'] if self._ci_identity(check) in selected)
+            # Read each reviewed file once under the transaction, then snapshot
+            # these exact bytes, never a later unpinned re-read.
+            captured = {}
+            for reference in references:
+                evidence = Path(reference['path']).resolve()
+                if not evidence.is_relative_to(self.run_dir):
+                    raise WorkflowError('decision evidence must be captured inside this run, without secrets')
+                if evidence not in captured:
+                    captured[evidence] = evidence.read_bytes()
+                raw = captured[evidence]
+                if hashlib.sha256(raw).hexdigest() != reference['sha256']:
+                    raise WorkflowError('reviewed amendment evidence changed before its snapshot')
+            number = len(run.get("run_amendments", [])) + 1
+            path = self.run_dir / f"run-amendment-v{number}.json"
+            prior = _load_json(path) if path.exists() else None
+            if prior and prior["request_sha256"] != request_hash:
+                raise WorkflowError("conflicting orphan amendment intent; original evidence preserved")
+            snapshots, snapshot_bytes = [], {}
+            for evidence, raw in sorted(captured.items()):
+                digest = hashlib.sha256(raw).hexdigest()
+                snapshot = self.run_dir / 'amendment-evidence' / request_hash / f'{digest}.log'
+                if not snapshot.resolve().is_relative_to(self.run_dir):
+                    raise WorkflowError('amendment snapshot path escaped this run')
+                snapshots.append({'path': str(snapshot), 'sha256': digest})
+                snapshot_bytes[snapshot] = raw
+            amendment = {**{key: request[key] for key in ("kind", "decision", "repo_id", "target", "check_ids", "authority", "text", "rationale")},
+                         "schema_version": 1, "artifact_kind": "run-amendment", "run_id": run["run_id"],
+                         "created_at": prior["created_at"] if prior else self.now(),
+                         "request": request, "request_sha256": request_hash, "basis": context["basis"],
+                         "review": context["review"], "repository_state": state, "evidence": snapshots,
+                         "source_artifact": context["source_artifact"], "delivery_artifact": context["delivery_artifact"]}
+            if prior and prior != amendment:
+                raise WorkflowError("orphan amendment evidence changed; do not overwrite it")
+            if len((json.dumps(amendment, indent=2) + '\n').encode()) > artifact_guard.MAX_BYTES['run-amendment']:
+                raise WorkflowError('amendment exceeds its size limit; narrow the selected evidence')
+            for snapshot, raw in snapshot_bytes.items():
+                if snapshot.exists():
+                    if snapshot.read_bytes() != raw:
+                        raise WorkflowError('immutable amendment snapshot changed')
+                    continue
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                temporary = snapshot.with_name(f'.{snapshot.name}.{uuid4().hex}.tmp')
+                temporary.write_bytes(raw)
+                os.replace(temporary, snapshot)
+            if not prior:
+                workflow_tools.atomic_write_json(path, amendment)
+            reference = _reference(path)
+            run.setdefault("run_amendments", []).append(reference)
+            if request["kind"] == "check-remediation":
+                run.setdefault("pending_check_remediations", {})[repo_id] = reference
+            elif request["decision"] == "restore" and source:
+                run.setdefault("pending_validation_refresh", {})[repo_id] = reference
+            remaining = []
+            for blocker in run["blockers"]:
+                gate = blocker.get("gate", {})
+                expected_type = "required-ci" if request["target"] == "ci" else "local-validation"
+                if gate.get("repo_id") == repo_id and gate.get("type") == expected_type and request["decision"] != "restore":
+                    unresolved = set(gate["check_ids"]) - selected
+                    if unresolved:
+                        blocker = {**blocker, "gate": {**gate, "check_ids": sorted(unresolved)},
+                                   "summary": f"Unresolved {expected_type} gate: {', '.join(sorted(unresolved))}."}
+                    else:
+                        continue
+                remaining.append(blocker)
+            run["blockers"] = remaining
+            if not remaining:
+                run["status"] = "working"
+                repo["status"] = "pending"
+            if run['phase'] in {'report', 'complete'}:
+                # Record the earliest affected gate even while another blocker
+                # remains; do not let its later resolution skip revalidation.
+                run['phase'] = 'deliver'
+            self._save_run(run)
+        self._append_event("run-amended", artifact=str(path), request_sha256=request_hash, next_action=run["phase"])
+        return {"status": "applied", "path": str(path)}
+
+    @staticmethod
+    def _ci_identity(check: dict[str, Any]) -> str:
+        return f"{check['name']}@{check.get('app_id') or '*'}"
 
     def _latest_review(
         self, repo_id: str, round_number: int
@@ -1931,12 +2403,42 @@ class WorkflowEngine:
 
     # ---------- Phase implementations ----------
 
+    def _run_pending_check_work(self) -> str:
+        run = self.load_run()
+        assignments = []
+        for pending_key in ("pending_check_remediations", "pending_validation_refresh"):
+            for repo_id, reference in sorted(run.get(pending_key, {}).items()):
+                decision = _load_json(Path(reference["path"]))
+                if decision["basis"] != self._validation_basis(repo_id):
+                    raise WorkflowError("pending check decision no longer matches the approved context")
+                if workflow_tools.repository_state(Path(run["repositories"][repo_id]["worktree"])) != decision["repository_state"]:
+                    raise WorkflowError("pending check decision has stale repository evidence")
+                if pending_key == "pending_check_remediations":
+                    stage = "pipeline-fix" if decision["target"] == "ci" else "validation-fix"
+                    assignments.append(self.build_assignment(
+                        stage=stage, repo_id=repo_id, scope=f"amendment-{reference['sha256'][:16]}",
+                        inputs=self._canonical_inputs(run, repo_id),
+                        instructions=["Repair only the evidence-attributed, approved-scope failures in the pinned remediation decision.",
+                                      "Run the full effective suite once. Never repair unrelated code or introduce a new mechanism."],
+                        validation_ids=self._plan_validation_ids(repo_id), validation_commands=self._plan_commands(repo_id),
+                        extras={"remediation": reference, "failed_validation_ids": decision["check_ids"]},
+                    ))
+                else:
+                    assignments.append(self._validation_assignment(repo_id, "restored-checks", refresh=reference))
+        for result in self._run_with_replacements(assignments):
+            if result.get("status") != "complete":
+                self._block_from_artifact(result)
+                return "blocked"
+        return self.load_run()["phase"]
+
     def execute_phase(self, phase: str) -> str:
         run = self.load_run()
         if run["status"] in {"blocked", "failed", "complete"}:
             return run["status"]
         if run["phase"] != phase:
             return run["phase"]  # Reconciliation superseded the saved node's intent.
+        if run.get("pending_check_remediations") or run.get("pending_validation_refresh"):
+            return self._run_pending_check_work()
         handler = getattr(self, f"phase_{phase.replace('-', '_')}", None)
         if handler is None:
             raise WorkflowError(f"no phase handler for {phase}")
@@ -2531,7 +3033,11 @@ class WorkflowEngine:
                 migration = (
                     " (migration-capable)" if validation["migration_capable"] else ""
                 )
-                lines.append(f"  - `{validation['command']}`{migration}")
+                if run.get("validation_policy_version") == 1:
+                    lines.append(f"  - **{validation['id']} / {validation['purpose']} / {validation['gate']}**: "
+                                 f"`{validation['command']}`{migration} — {validation['rationale']}")
+                else:
+                    lines.append(f"  - `{validation['command']}`{migration}")
             lines.append("- Complexity mechanisms:")
             if plan["complexity_mechanisms"]:
                 for mechanism in plan["complexity_mechanisms"]:
@@ -2742,6 +3248,26 @@ class WorkflowEngine:
         contract_dependencies: dict[str, set[str]] = {
             repo: set() for repo in run["repositories"]
         }
+        if run.get("validation_policy_version") == 1:
+            for repo_id in sorted(run["repositories"]):
+                plan_path, plan = self._current_plan(repo_id)
+                writers = [item for item in self._artifacts(repo_id=repo_id, stage="implement", kind="result")
+                           if self._assignment_pins(item[2], plan_path, _sha256(plan_path))]
+                if not writers:
+                    continue
+                path, result, assignment = writers[-1]
+                if result.get("status") != "complete":
+                    # A working run can reach here only after an authorized
+                    # external-condition retry; let the existing scheduler retry.
+                    continue
+                ids = (set(check["id"] for check in plan["validations"]) if repo_id in completed_repositories
+                       else set(assignment["validation_ids"]))
+                current = self._current_validation(repo_id, require_pass=False, check_ids=ids)
+                evaluation = validation_policy.evaluate([c for c in plan["validations"] if c["id"] in ids],
+                                current[1]["validations"] if current else [], self._exclusions(repo_id))
+                if not evaluation["satisfied"]:
+                    self._block_validation_gate(repo_id, current[0] if current else path, evaluation)
+                    return "blocked"
         if run.get("contract_path"):
             contract = _load_json(Path(run["contract_path"]))
             for dependency in contract.get("dependencies", []):
@@ -2779,11 +3305,8 @@ class WorkflowEngine:
                 validation_ids = {
                     validation["id"] for validation in plan["validations"]
                 }
-            selected_validations = [
-                validation
-                for validation in plan["validations"]
-                if validation["id"] in validation_ids
-            ]
+            selected_validations = [validation for validation in self._effective_checks(repo_id)
+                                    if validation["id"] in validation_ids]
             if any(
                 validation["migration_capable"] for validation in selected_validations
             ) and not self._migration_guard(repo_id):
@@ -2825,7 +3348,7 @@ class WorkflowEngine:
         )
         return "blocked"
 
-    def _validation_assignment(self, repo_id: str, scope: str) -> Path:
+    def _validation_assignment(self, repo_id: str, scope: str, *, refresh: dict[str, str] | None = None) -> Path:
         run = self.load_run()
         if not self._migration_guard(repo_id):
             raise WorkflowError("migration target evidence is required")
@@ -2837,6 +3360,8 @@ class WorkflowEngine:
         context_material = (
             f"{fingerprint}:validation-ids-v1:{plan_path}:{_sha256(plan_path)}"
         )
+        if run.get("validation_policy_version") == 1:
+            context_material += json.dumps(run.get("run_amendments", []), sort_keys=True)
         if latest_writer is not None:
             context_material += f":{latest_writer[0]}:{_sha256(latest_writer[0])}"
         context_hash = hashlib.sha256(context_material.encode()).hexdigest()[:12]
@@ -2852,9 +3377,14 @@ class WorkflowEngine:
             ],
             validation_commands=self._plan_commands(repo_id),
             validation_ids=self._plan_validation_ids(repo_id),
+            extras={"validation_refresh": refresh} if refresh else None,
         )
 
     def _failed_validation_ids(self, artifact: dict[str, Any]) -> list[str]:
+        if self.load_run(validate=False).get("validation_policy_version") == 1:
+            _, plan = self._current_plan(artifact["repo_id"])
+            return validation_policy.evaluate(plan["validations"], artifact["validations"],
+                                              self._exclusions(artifact["repo_id"]))["blocking_ids"]
         return sorted(
             record["id"]
             for record in artifact.get("validations", [])
@@ -2898,6 +3428,9 @@ class WorkflowEngine:
             failed_ids = self._failed_validation_ids(validation)
             if not failed_ids:
                 continue
+            if self.load_run(validate=False).get("validation_policy_version") == 1:
+                self._block_validation_gate(repo_id, current_any[0], self.validation_summary(repo_id))
+                return "blocked"
             fixes = self._artifacts(
                 repo_id=repo_id, stage="validation-fix", kind="result"
             )
@@ -3188,18 +3721,84 @@ class WorkflowEngine:
         self._set_phase(next_phase)
         return next_phase
 
+    def _pins_semantics(self, assignment: dict[str, Any], repo_id: str) -> bool:
+        run = self.load_run(validate=False)
+        repo = run['repositories'][repo_id]
+        references = [(repo['plan_path'], repo['plan_sha256']), (run['requirements_path'], run['requirements_sha256'])]
+        if run.get('contract_path'):
+            references.append((run['contract_path'], run['contract_sha256']))
+        return all(self._assignment_pins(assignment, Path(path), digest) for path, digest in references)
+
+    def _review_basis(self, repo_id: str) -> str | None:
+        """One historical independent review plus its allowed hash-linked revisions."""
+        review = self._latest_review(repo_id, 1)
+        if review is None or not self._pins_semantics(review[2], repo_id):
+            return None
+        if self._must_fix(review[1]) and not self._fix_complete(repo_id, 'fix-1', [f['id'] for f in self._must_fix(review[1])]):
+            return None
+        artifacts = self._artifacts(repo_id=repo_id)
+        after_review = artifacts[next(i for i, item in enumerate(artifacts) if item[0] == review[0]) + 1:]
+        revisions = [item for item in after_review if item[2].get('stage') in PROJECT_WRITE_STAGES]
+        for _, result, assignment in revisions:
+            stage = assignment['stage']
+            if (result.get('status') != 'complete' or not self._pins_semantics(assignment, repo_id)
+                    or not self._assignment_pins(assignment, review[0], _sha256(review[0]))):
+                return None
+            if stage in {'validation-fix', 'pipeline-fix'}:
+                reference = assignment.get('remediation')
+                if not reference or reference not in self.load_run().get('run_amendments', []):
+                    return None
+                decision = _load_json(Path(reference['path']))
+                if decision['basis'] != self._validation_basis(repo_id):
+                    return None
+            elif stage not in {'fix-1', 'fix-2'}:
+                return None
+        latest = self._latest_writer_artifact(repo_id)
+        worktree = Path(self.load_run(validate=False)['repositories'][repo_id]['worktree'])
+        if (not latest or latest[1]['tree_fingerprint'] != workflow_tools.worktree_fingerprint(worktree)
+                or (not revisions and review[2].get('input_tree_fingerprint') != latest[1]['tree_fingerprint'])):
+            return None
+        unseen = [item for item in self._amendments() if item['repo_id'] == repo_id
+                  and not self._assignment_pins(review[2], Path(item['reference']['path']), item['reference']['sha256'])]
+        if any(item['basis'] != self._validation_basis(repo_id) for item in unseen):
+            return None
+        if revisions:
+            return 'historical review with accepted bounded revisions' + (' and authorized policy amendments' if any(
+                item['kind'] == 'validation-exception' for item in unseen) else '')
+        return 'historical review with authorized policy amendments' if unseen else 'reviewed current source'
+
+    def _current_integration(self):
+        values = self._artifacts(kind='integration')
+        if not values or values[-1][1].get('status') != 'complete':
+            return None
+        item = values[-1]
+        run = self.load_run()
+        for repo_id in run['repositories']:
+            writer = self._latest_writer_artifact(repo_id)
+            if not writer or not self._pins_semantics(item[2], repo_id) or not self._assignment_pins(item[2], writer[0], _sha256(writer[0])):
+                return None
+        if any(not self._assignment_pins(item[2], Path(ref['path']), ref['sha256']) for ref in run.get('run_amendments', [])):
+            return None
+        return item
+
     def phase_integrate(self) -> str:
+        run = self.load_run()
         existing = [
             item
             for item in self._artifacts(kind="integration")
             if item[1].get("status") == "complete"
         ]
+        if run.get('validation_policy_version') == 1:
+            current = self._current_integration()
+            existing = [current] if current else []
         if not existing:
-            run = self.load_run()
+            inputs = self._canonical_inputs(run, None)
+            material = ':'.join(_sha256(path) for path in inputs)
+            scope = 'final-' + hashlib.sha256(material.encode()).hexdigest()[:16] if run.get('validation_policy_version') == 1 else 'final'
             assignment = self.build_assignment(
                 stage="integrate",
                 repo_id=None,
-                scope="final",
+                scope=scope,
                 inputs=self._canonical_inputs(run, None),
                 instructions=[
                     "Verify every requirement, interface, repository, rollout constraint, and declared mechanism.",
@@ -3219,7 +3818,27 @@ class WorkflowEngine:
         self, repo_id: str
     ) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
         values = self._artifacts(repo_id=repo_id, stage="deliver", kind="delivery")
-        return values[-1] if values and values[-1][1].get("status") == "complete" else None
+        if not values or values[-1][1].get('status') != 'complete':
+            return None
+        latest = values[-1]
+        run = self.load_run(validate=False)
+        if run.get('delivery_policy_version') != 1:
+            return latest
+        worktree = Path(run['repositories'][repo_id]['worktree'])
+        fingerprint = workflow_tools.worktree_fingerprint(worktree)
+        amendments = [item['reference'] for item in self._amendments() if item['repo_id'] == repo_id]
+        def current(item):
+            return (item[2].get('input_tree_fingerprint') == fingerprint and self._pins_semantics(item[2], repo_id)
+                    and all(self._assignment_pins(item[2], Path(ref['path']), ref['sha256']) for ref in amendments))
+        if not current(latest) or latest[1].get('head_sha') != _git(worktree, 'rev-parse', 'HEAD'):
+            return None
+        # A read-only observation cannot publish a changed local-policy summary.
+        # For owned PRs require a normal completed delivery of this exact context.
+        if latest[1].get('pr_owned') and not any(
+                item[1].get('status') == 'complete' and item[1].get('pr_owned') and not item[2].get('verify_only') and current(item)
+                for item in reversed(values)):
+            return None
+        return latest
 
     def _pipeline_fix_count(self, repo_id: str) -> int:
         return len(
@@ -3227,6 +3846,12 @@ class WorkflowEngine:
         )
 
     def _handle_delivery_outcomes(self, artifacts: Iterable[dict[str, Any]]) -> str:
+        if self.load_run(validate=False).get("delivery_policy_version") == 1:
+            for artifact in artifacts:
+                if artifact.get("status") != "complete" and artifact.get("reason_code") != "publication-required":
+                    self._block_from_artifact(artifact)
+                    return "blocked"
+            return "deliver"
         pipeline_fix_assignments: list[Path] = []
         for artifact in artifacts:
             if artifact.get("status") == "complete":
@@ -3264,13 +3889,26 @@ class WorkflowEngine:
             if not deliveries:
                 continue
             path, artifact, _assignment = deliveries[-1]
-            if artifact.get("status") == "complete" or not any(b["kind"] == "code" for b in artifact.get("blockers", [])):
+            gate_failure = artifact.get("reason_code") in {"required-ci-failed", "required-ci-pending"}
+            if artifact.get("status") == "complete" or not (gate_failure or any(b["kind"] == "code" for b in artifact.get("blockers", []))):
                 continue
             fixes = self._artifacts(repo_id=repo_id, stage="pipeline-fix", kind="result")
             if not any(self._assignment_pins(writer, path, _sha256(path)) for _p, _a, writer in fixes):
                 recovered_failures.append(artifact)
         if recovered_failures:
             return self._handle_delivery_outcomes(recovered_failures)
+        if run.get('validation_policy_version') == 1:
+            if self._run_validation_wave(run['repositories'], 'pre-delivery') != 'pass':
+                return 'blocked'
+            for repo_id in run['repositories']:
+                if not self._review_basis(repo_id):
+                    self._block(summary=f'Review provenance is not valid for {repo_id}.', evidence_path=self.run_path,
+                        required_action='Reconcile approved review and bounded revision evidence; do not reset review budgets.',
+                        kind='decision', repo_id=repo_id)
+                    return 'blocked'
+            if run['workflow_policy']['integration_required'] and self._current_integration() is None:
+                self._set_phase('integrate')
+                return 'integrate'
         assignments: list[Path] = []
         for repo_id in sorted(run["repositories"]):
             pending = next((Path(action["assignment_path"]) for action in run["next_actions"]
@@ -3314,25 +3952,44 @@ class WorkflowEngine:
         self._set_phase(next_phase)
         return next_phase
 
+    def _report_inputs(self) -> list[Path]:
+        return [path for path in self._canonical_inputs(self.load_run(), None)
+                if path.suffix != '.json' or _load_json(path).get('artifact_kind') != 'report']
+
+    def _current_report(self):
+        reports = self._artifacts(kind='report')
+        if not reports or reports[-1][1].get('status') != 'complete':
+            return None
+        item = reports[-1]
+        return item if all(self._assignment_pins(item[2], path, _sha256(path)) for path in self._report_inputs()) else None
+
     def phase_report(self) -> str:
         run = self.load_run()
         reports = self._artifacts(kind="report")
+        inputs, scope = self._canonical_inputs(run, None), 'final'
+        if run.get('validation_policy_version') == 1:
+            inputs = self._report_inputs()
+            scope = 'final-' + hashlib.sha256(':'.join(_sha256(path) for path in inputs).encode()).hexdigest()[:16]
+            current = self._current_report()
+            reports = [current] if current else []
         if not reports:
             assignment = self.build_assignment(
                 stage="report",
                 repo_id=None,
-                scope="final",
-                inputs=self._canonical_inputs(run, None),
+                scope=scope,
+                inputs=inputs,
                 instructions=["Render accepted artifacts deterministically."],
             )
             assignment_data = _load_json(assignment)
             stamp = self.now().replace(":", "").replace("-", "")
-            html_path = self.report_root / f"{_slug(run['run_id'])}-{stamp}.html"
+            suffix = '-' + scope if run.get('validation_policy_version') == 1 else ''
+            html_path = self.report_root / f"{_slug(run['run_id'])}-{stamp}{suffix}.html"
             report = workflow_tools.render_report(
                 run_dir=self.run_dir,
                 assignment_path=assignment,
                 html_path=html_path,
                 output_path=Path(assignment_data["output_artifact"]),
+                evaluated_status=self.status_details() if run.get("validation_policy_version") == 1 else None,
             )
             with RunLock(self.run_dir):
                 current = self.load_run()
@@ -3381,6 +4038,12 @@ class WorkflowEngine:
                 raise WorkflowError(
                     f"completion audit found stale validation for {repo_id}"
                 )
+            if run.get('validation_policy_version') == 1 and not self._review_basis(repo_id):
+                raise WorkflowError(f'completion audit found invalid review provenance for {repo_id}')
+        if run.get('validation_policy_version') == 1 and run['workflow_policy']['integration_required'] and not self._current_integration():
+            raise WorkflowError('completion audit found stale integration evidence')
+        if run.get('validation_policy_version') == 1 and run['workflow_policy']['report_required'] and not self._current_report():
+            raise WorkflowError('completion audit found a stale report')
         metrics = workflow_tools.run_metrics(self.run_dir)
         workflow_tools.atomic_write_json(self.run_dir / "metrics.json", metrics)
         with RunLock(self.run_dir):
@@ -3560,6 +4223,8 @@ class WorkflowEngine:
             "status": "working",
             "phase": "bootstrap",
             "worker_reasoning_policy": "stage-v1",
+            "validation_policy_version": 1,
+            "delivery_policy_version": 1,
             **policy,
             "request_path": str(request_path.resolve()),
             "request_sha256": _sha256(request_path),

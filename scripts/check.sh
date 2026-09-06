@@ -24,6 +24,10 @@ git -C "$TMP_DIR/standalone-repo" status --porcelain >"$TMP_DIR/before-status.tx
 grep -Eq '^[0-9a-f]{64}$' "$TMP_DIR/fingerprint.txt"
 git -C "$TMP_DIR/standalone-repo" status --porcelain >"$TMP_DIR/after-status.txt"
 cmp "$TMP_DIR/before-status.txt" "$TMP_DIR/after-status.txt"
+# Exercise default and opt-in lifecycles with no canonical skill/dependencies present.
+mkdir -p "$TMP_DIR/fast-only/tests"
+cp skills/end-to-end-development/tests/test_delivery_tools.py "$TMP_DIR/fast-only/tests/"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$TMP_DIR/fast-only/tests" -q
 
 PYTHONDONTWRITEBYTECODE=1 UV_PROJECT_ENVIRONMENT="$TMP_DIR/e2e-venv" \
   uv run --project skills/end-to-end-development --locked \

@@ -90,6 +90,8 @@ class FakePlanningBatch:
                             "cwd": assignment["cwd"],
                             "scope": "broad",
                             "migration_capable": self.migration_capable,
+                            **({"purpose": "acceptance", "gate": "blocking", "rationale": "Verifies REQ-001."}
+                               if assignment.get("validation_policy_version") == 1 else {}),
                         }
                     ],
                     "complexity_mechanisms": [],
@@ -585,52 +587,31 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                     Path(reference["path"])
                     for reference in assignment["input_artifacts"]
                 ]
-                plan_path = next(
-                    path
-                    for path in inputs
-                    if path.suffix == ".json"
-                    and json.loads(path.read_text(encoding="utf-8")).get(
-                        "artifact_kind"
-                    )
-                    == "plan"
-                )
-                challenge_path = next(
-                    path
-                    for path in inputs
-                    if path.suffix == ".json"
-                    and json.loads(path.read_text(encoding="utf-8")).get(
-                        "artifact_kind"
-                    )
-                    == "design-challenge"
-                )
-                evidence_path = next(
-                    path
-                    for path in reversed(inputs)
-                    if path.suffix == ".json"
-                    and json.loads(path.read_text(encoding="utf-8")).get("stage")
-                    == "validate"
-                )
+                facts = [(path, json.loads(path.read_text())) for path in inputs if path.suffix == '.json']
+                plans = {value['repo_id']: str(path) for path, value in facts if value.get('artifact_kind') == 'plan'}
+                challenges = {value['repo_id']: str(path) for path, value in facts if value.get('artifact_kind') == 'design-challenge'}
+                evidence = {value['repo_id']: str(path) for path, value in facts if value.get('artifact_kind') == 'result'}
                 artifact.update(
                     {
                         "requirement_matrix": [
                             {
                                 "requirement_id": "REQ-001",
-                                "repository_ids": ["api"],
-                                "validation_evidence": [str(evidence_path)],
+                                "repository_ids": sorted(plans),
+                                "validation_evidence": sorted(evidence.values()),
                                 "status": "pass",
                             }
                         ],
                         "interfaces": [],
                         "mechanism_conformance": [
                             {
-                                "repo_id": "api",
-                                "plan_path": str(plan_path),
-                                "design_challenge_path": str(challenge_path),
+                                "repo_id": key,
+                                "plan_path": plans[key],
+                                "design_challenge_path": challenges.get(key),
                                 "status": "pass",
-                                "evidence_paths": [str(evidence_path)],
-                            }
+                                "evidence_paths": [evidence[key]],
+                            } for key in sorted(plans)
                         ],
-                        "changed_files_by_repo": {"api": ["feature.txt"]},
+                        "changed_files_by_repo": {key: ["feature.txt"] for key in sorted(plans)},
                         "rollout": ["Deliver api."],
                         "risks": [],
                         "blockers": [],
@@ -638,11 +619,10 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                 )
             elif assignment["stage"] == "deliver":
                 self.delivery_attempts += 1
-                self._git(worktree, "add", "feature.txt")
-                if self._git(worktree, "status", "--short"):
-                    self._git(
-                        worktree, "commit", "-m", "feat: implement requested behavior"
-                    )
+                if not assignment.get('verify_only'):
+                    self._git(worktree, "add", "feature.txt")
+                    if self._git(worktree, "status", "--short"):
+                        self._git(worktree, "commit", "-m", "feat: implement requested behavior")
                 commit = self._git(worktree, "rev-parse", "HEAD")
                 check_log = log_dir / f"required-check-{self.delivery_attempts}.log"
                 check_failed = self.delivery_attempts <= self.delivery_code_failures
@@ -680,6 +660,12 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                         ),
                     }
                 )
+                if assignment.get("delivery_policy_version") == 1:
+                    artifact.update(pr_draft=check_failed, pr_owned=False,
+                                    reason_code='required-ci-failed' if check_failed else None,
+                                    delivery_outcome='blocked' if check_failed else 'complete')
+                    for check in artifact['checks']:
+                        check['evidence_sha256'] = hashlib.sha256(check_log.read_bytes()).hexdigest()
                 if assignment.get("delivery_evidence_version") == 2:
                     artifact.update(
                         head_sha=commit, pushed_head_sha=commit, checked_head_sha=commit if not check_failed else None,
@@ -691,6 +677,17 @@ class FakeSuccessfulBatch(FakePlanningBatch):
                     f"unexpected fake assignment: {assignment['stage']}"
                 )
 
+            if assignment.get("validation_policy_version") == 1 and assignment['stage'] == 'validation-fix':
+                artifact['validations'] = []
+                for index, (check_id, command) in enumerate(zip(assignment['validation_ids'], assignment['validation_commands'], strict=True)):
+                    log = log_dir / f'fix-check-{index}.log'
+                    log.write_text('pass\n')
+                    artifact['validations'].append({
+                        'id': check_id, 'command': command, 'command_sha256': hashlib.sha256(command.encode()).hexdigest(),
+                        'cwd': str(worktree), 'tree_fingerprint': artifact['tree_fingerprint'],
+                        'cache_status': 'fresh', 'source_artifact': None, 'result': 'pass', 'exit_code': 0,
+                        'summary': 'Verified fixed behavior.', 'log_path': str(log),
+                    })
             output.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
             artifact_guard.CURRENT_ARTIFACT_PATH = output
             artifact_guard.VALIDATORS[assignment["output_kind"]](artifact)
@@ -892,13 +889,14 @@ class WorkflowEngineTests(unittest.TestCase):
         profile: str = "standard",
         risks: list[str] | None = None,
         report_requested: bool = False,
+        legacy: bool = False,
     ) -> WorkflowEngine:
         self.write_spec(
             profile=profile,
             risks=risks,
             report_requested=report_requested,
         )
-        return WorkflowEngine.initialize(
+        engine = WorkflowEngine.initialize(
             spec_path=self.spec,
             run_dir=self.run_dir,
             skill_dir=SCRIPTS_DIR.parent,
@@ -907,6 +905,13 @@ class WorkflowEngineTests(unittest.TestCase):
             report_root=self.root / "reports",
             now=self.now,
         )
+        if legacy:
+            # Construct a historical input fixture, not a supported production transition.
+            run = engine.load_run()
+            run.pop('validation_policy_version')
+            run.pop('delivery_policy_version')
+            engine._save_run(run)
+        return engine
 
     def test_engine_normalizes_assignment_metadata_from_its_own_intent(self) -> None:
         batch = FakeSuccessfulBatch()
@@ -1066,6 +1071,14 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(0, batch.repairs)
         self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
 
+    @staticmethod
+    def authorize_related(engine: WorkflowEngine, target: str) -> None:
+        gate = next(b['gate'] for b in engine.load_run()['blockers'] if b.get('gate', {}).get('type') == ('local-validation' if target == 'local' else 'required-ci'))
+        engine.apply_amendment({'kind': 'check-remediation', 'decision': 'fix-related', 'authority': 'coordinator',
+            'repo_id': gate['repo_id'], 'target': target, 'check_ids': gate['check_ids'], 'text': None,
+            'rationale': 'This fixture deliberately links the failed check to the approved feature implementation; repair is confined to feature.txt.',
+            'expected_context': engine.amendment_context(gate['repo_id'])['sha256'], 'evidence': [gate['artifact']]})
+
     def test_new_runs_pin_reasoning_and_source_fixes_never_use_medium(self) -> None:
         import workflow_tools
         batch = FakeSuccessfulBatch(round_one_finding=True, fail_first_validation=True, delivery_code_failures=1)
@@ -1074,6 +1087,12 @@ class WorkflowEngineTests(unittest.TestCase):
             {"run_dir": str(self.run_dir)},
             {"configurable": {"thread_id": "reasoning-policy"}, "recursion_limit": 150},
         )
+        for target in ('local', 'ci'):
+            self.authorize_related(engine, target)
+            build_graph(engine, InMemorySaver()).invoke(
+                {'run_dir': str(self.run_dir)},
+                {'configurable': {'thread_id': 'reasoning-policy-' + target}, 'recursion_limit': 150})
+        self.assertEqual('complete', engine.load_run()['status'])
         self.assertEqual("stage-v1", engine.load_run()["worker_reasoning_policy"])
         for stage in ("validation-fix", "pipeline-fix", "fix-1"):
             assignment = next(a for a in batch.assignments if a["stage"] == stage)
@@ -1122,6 +1141,10 @@ class WorkflowEngineTests(unittest.TestCase):
             {"run_dir": str(self.run_dir)},
             {"configurable": {"thread_id": "command-fix"}, "recursion_limit": 150},
         )
+        self.assertEqual('blocked', engine.load_run()['status'])
+        self.authorize_related(engine, 'ci')
+        build_graph(engine, InMemorySaver()).invoke({'run_dir': str(self.run_dir)},
+            {'configurable': {'thread_id': 'authorized-command-fix'}, 'recursion_limit': 150})
         self.assertEqual("complete", engine.load_run()["status"])
         self.assertEqual(1, sum(a["stage"] == "pipeline-fix" for a in batch.assignments))
         self.assertEqual(1, forge.create_count)
@@ -1250,7 +1273,7 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual("infrastructure", engine.load_run()["blockers"][0]["kind"])
         self.assertEqual(1, forge.create_count)
 
-    def test_delivery_recovered_code_failure_keeps_its_pipeline_fix(self) -> None:
+    def test_delivery_recovered_code_failure_requires_related_fix_authorization(self) -> None:
         batch = FakeSuccessfulBatch()
         engine, forge = self.github_engine(batch, failures=1)
         execute = engine._execute_delivery_command
@@ -1262,6 +1285,10 @@ class WorkflowEngineTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
         build_graph(engine, InMemorySaver()).invoke({"run_dir": str(self.run_dir)}, config)
+        self.assertEqual('blocked', engine.load_run()['status'])
+        self.assertEqual(0, sum(a['stage'] == 'pipeline-fix' for a in batch.assignments))
+        self.authorize_related(engine, 'ci')
+        build_graph(engine, InMemorySaver()).invoke({'run_dir': str(self.run_dir)}, config)
         self.assertEqual("complete", engine.load_run()["status"])
         self.assertEqual(1, sum(a["stage"] == "pipeline-fix" for a in batch.assignments))
         self.assertEqual(1, forge.create_count)
@@ -1789,9 +1816,9 @@ class WorkflowEngineTests(unittest.TestCase):
             assignment["instructions"],
         )
 
-    def test_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
+    def test_legacy_failed_validation_runs_one_batched_fix_then_revalidates(self) -> None:
         fake = FakeSuccessfulBatch(fail_first_validation=True)
-        engine = self.initialize(fake)
+        engine = self.initialize(fake, legacy=True)
         graph = build_graph(engine, InMemorySaver())
         config = {
             "configurable": {"thread_id": "20260822T100000Z-langgraph-test"},
@@ -1806,9 +1833,9 @@ class WorkflowEngineTests(unittest.TestCase):
         fixes = engine._artifacts(repo_id="api", stage="validation-fix", kind="result")
         self.assertEqual(["API-VAL-001"], fixes[-1][2]["validation_ids"])
 
-    def test_repeated_validation_failure_blocks_after_one_fix_batch(self) -> None:
+    def test_legacy_repeated_validation_failure_blocks_after_one_fix_batch(self) -> None:
         fake = FakeSuccessfulBatch(always_fail_validation=True)
-        engine = self.initialize(fake)
+        engine = self.initialize(fake, legacy=True)
         graph = build_graph(engine, InMemorySaver())
         config = {
             "configurable": {"thread_id": "20260822T100000Z-validation-limit"},
@@ -1847,9 +1874,9 @@ class WorkflowEngineTests(unittest.TestCase):
         fix_artifacts = engine._artifacts(repo_id="api", stage="fix-1", kind="result")
         self.assertEqual(["API-R1-001"], fix_artifacts[-1][2]["finding_ids"])
 
-    def test_repeated_pipeline_failure_blocks_after_one_fix_batch(self) -> None:
+    def test_legacy_repeated_pipeline_failure_blocks_after_one_fix_batch(self) -> None:
         fake = FakeSuccessfulBatch(delivery_code_failures=2)
-        engine = self.initialize(fake)
+        engine = self.initialize(fake, legacy=True)
         graph = build_graph(engine, InMemorySaver())
         config = {
             "configurable": {"thread_id": "20260822T100000Z-pipeline-limit"},

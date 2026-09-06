@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import sqlite3
 import sys
@@ -111,6 +112,14 @@ def _result(engine: WorkflowEngine, graph_output: Any | None = None) -> dict[str
             ):
                 deliveries.append(value.get("pr_url"))
     result["pr_urls"] = sorted(url for url in deliveries if url)
+    if run.get("validation_policy_version") == 1:
+        result.update(engine.status_details())
+        result["pr_urls"] = sorted({item["pr_url"] for item in result["deliveries"] if item["pr_url"]})
+        if run['status'] == 'complete':
+            gates = result['local_gates'].values()
+            result['summary'] = ('Recorded completion; current local evidence is stale.' if not all(g['satisfied'] for g in gates)
+                else 'Completed with local validation warnings/exclusions.' if any(g['warnings'] for g in gates)
+                else 'Completed; mandatory local and delivery obligations verified.')
     reports = []
     for reference in run.get("accepted_artifacts", {}).values():
         path = Path(reference["path"])
@@ -123,10 +132,27 @@ def _result(engine: WorkflowEngine, graph_output: Any | None = None) -> dict[str
         if value.get("artifact_kind") == "report" and value.get("status") == "complete":
             reports.append(value.get("html_path"))
     result["report_paths"] = sorted(path for path in reports if path)
+    if run.get('validation_policy_version') == 1:
+        current = engine._current_report()
+        result['report_paths'] = [current[1]['html_path']] if current else []
+        result['historical_report_paths'] = sorted(path for path in reports if path and path not in result['report_paths'])
     return result
 
 
 def _invoke(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]:
+    if args.command == "amend":
+        # Refuse historical runs before even creating a lock/checkpoint file.
+        run = WorkflowEngine(args.run_dir).load_run()
+        if run.get("validation_policy_version") != 1:
+            raise WorkflowError("amendments are unavailable for legacy runs")
+        request = json.loads(args.input.read_text(encoding="utf-8"))
+        digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        for reference in run.get("run_amendments", []):
+            if json.loads(Path(reference["path"]).read_text())["request_sha256"] == digest:
+                return {"run_id": run["run_id"], "status": run["status"],
+                        "amendment": {"status": "already-applied", "path": reference["path"]}}
+        if run["status"] == "complete" or (run.get("plan_review") or {}).get("status") != "approved":
+            raise WorkflowError("new amendments require an active run with an approved bundle")
     with _execution_lock(args.run_dir.resolve()):
         return _invoke_locked(args, graph_input)
 
@@ -138,7 +164,12 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         report_root=args.report_root,
     ) as (engine, graph, config):
         if args.command == "resume":
-            engine.resume_external_blockers()
+            if not engine.resume_delivery_checks():
+                engine.resume_external_blockers()
+        elif args.command == "amend":
+            if graph.get_state(config).next:
+                raise WorkflowError("amendment requires a settled graph cursor")
+            engine.apply_amendment(json.loads(args.input.read_text(encoding="utf-8")))
         elif args.command == "retry-validation-evidence":
             if not engine.retry_validation_evidence():
                 raise WorkflowError(
@@ -236,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
                 default="auto",
             )
             command.add_argument("--report-root", type=Path)
+
+    amend = subparsers.add_parser("amend", help="record a scoped, authorized new-run validation/check decision")
+    amend.add_argument("run_dir", type=Path)
+    amend.add_argument("--input", type=Path, required=True)
+    amend.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    amend.add_argument("--report-root", type=Path)
 
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",
@@ -343,7 +380,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "replan-decision"}:
+        elif args.command in {"retry-corrected-handoff", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},
