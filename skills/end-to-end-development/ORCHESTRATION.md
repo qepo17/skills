@@ -139,6 +139,16 @@ After updating an engine that ran a dependent fix concurrently with an upstream 
 
 This guarded transition accepts only that fix-phase blocker. Remaining fixes follow the shared contract's dependency order, receive accepted upstream fix artifacts as hash-pinned inputs, and get read-only access to upstream worktrees.
 
+For the exact implementation-result rejection `$.next_action: must be at most 300 characters`, an explicitly user-authorized correction can be recovered without replaying the source writer. Preserve the rejected JSON before changing only `next_action`, then use:
+
+```bash
+"$ORCHESTRATOR" retry-corrected-handoff "$RUN_DIR" \
+  --original-artifact /absolute/preserved-rejected-result.json \
+  --worker-runtime auto
+```
+
+This opt-in transition accepts only an otherwise valid, complete implementation result whose only changed field is a 1–300-character `next_action`. It requires the exact rejection manifest, closed worker handles, unchanged current source/HEAD/branch/index-status evidence, matching assignment and current approved plan. It hash-pins both results and referenced evidence, atomically accepts the result once, and returns control to the graph. Failed validations remain failed. It does not reset retry limits, change approval, rewrite assignments or repair other blockers. Preserve the original file afterward; later reconciliation verifies its hash. Ordinary `resume` remains unchanged. Do not edit already accepted artifacts or coordinator state.
+
 A pending full-profile plan review is a dynamic LangGraph interrupt. Approval must include the exact current hash and the user's exact explicit wording. Fast/standard bundles are already `approved` with `approval_source: workflow-policy` evidence and never use this command:
 
 ```bash
