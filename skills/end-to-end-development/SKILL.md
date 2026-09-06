@@ -104,6 +104,16 @@ Never edit `run.json`, `agents.json`, `events.jsonl`, assignments, or LangGraph 
 
 This command rejects every other blocker and reruns validation with a new plan-hash-bound assignment; it does not weaken ordinary code-blocker handling.
 
+For an implementation result rejected only because `next_action` exceeds 300 characters, a later explicit user instruction may authorize shortening that field. Preserve the original rejected JSON first and change no other field. Recover through the guarded transition, not by editing run state:
+
+```bash
+"$ORCHESTRATOR" retry-corrected-handoff "$RUN_DIR" \
+  --original-artifact /absolute/preserved-rejected-result.json \
+  --worker-runtime auto
+```
+
+It verifies the exact rejection, complete schema, unchanged semantic evidence/current Git state, approved plan and closed handles. It hash-pins original/corrected evidence and accepts once without a worker replay, approval change or retry reset. Failed tests remain failed and ordinary graph routing owns the remaining work. Keep the original backup; do not use this for accepted artifacts or other blockers.
+
 If a dependent fix was started concurrently with an upstream contract fix and stopped on the exact hash-pinned bundle-drift blocker, update the engine and use:
 
 ```bash

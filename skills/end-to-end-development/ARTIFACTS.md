@@ -201,6 +201,7 @@ The graph may add these coordinator fields when applicable:
 - `plan_feedback`: path/hash plus sorted affected repository IDs;
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
+- `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
 - repository `database_target_evidence`: path/hash of a non-secret `isolated-local` or `isolated-test` classification.
 
 Validators ignore unknown schema-v1 extension fields for compatibility, but the graph treats these references as immutable inputs. They never contain credentials, database URLs, or full user/session transcripts.

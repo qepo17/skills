@@ -983,6 +983,17 @@ def validate_run(data: dict[str, Any]) -> None:
             contract_hash=contract_hash,
         )
 
+    # A corrected handoff is accepted once, with the rejected original and all
+    # existing evidence hash-pinned. Later resume/completion must detect drift.
+    recoveries = obj(data.get("corrected_handoff_recoveries", {}), "$.corrected_handoff_recoveries")
+    for action_id, raw in recoveries.items():
+        loc = f"$.corrected_handoff_recoveries.{action_id}"
+        record = obj(raw, loc)
+        for key in ("original", "corrected", "assignment", "rejection"):
+            hashed_file_reference(field(record, key, loc), f"{loc}.{key}")
+        for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
+            hashed_file_reference(reference, f"{loc}.evidence[{index}]")
+
     pending_refresh = obj(data.get("pending_delivery_refresh", {}), "$.pending_delivery_refresh")
     for repository_id, reference in pending_refresh.items():
         location = f"$.pending_delivery_refresh.{repository_id}"

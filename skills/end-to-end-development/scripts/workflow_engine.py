@@ -414,6 +414,114 @@ class WorkflowEngine:
         )
         return True
 
+    def retry_corrected_handoff(self, original_artifact: Path) -> bool:
+        """Accept one explicitly corrected implementation hint, never replay its writer.
+
+        The caller supplies the preserved rejected result. Only next_action may
+        differ; all semantic evidence and current canonical/Git bindings must pass
+        before the rejection and accepted reference change in one projection write.
+        """
+        with RunLock(self.run_dir):
+            run = self.load_run()
+            if (run["status"] != "blocked" or run["phase"] != "implement"
+                    or len(run["blockers"]) != 1 or run["next_actions"]
+                    or run["retry_limits"].get("artifact_repairs_per_action", 0) != 1):
+                return False
+            blocker = run["blockers"][0]
+            reason = "$.next_action: must be at most 300 characters"
+            manifest_path = Path(blocker["evidence_path"]).resolve()
+            if (blocker["kind"] != "decision"
+                    or manifest_path.parent != self.run_dir / "supervisor"):
+                return False
+            matches = [worker for worker in _load_json(manifest_path).get("workers", [])
+                       if worker.get("status") == "rejected"
+                       and worker.get("error_code") == "invalid-evidence"
+                       and worker.get("error_path") == "$.next_action"
+                       and worker.get("reason") == reason
+                       and worker.get("cleanup_status") == "complete"
+                       and blocker["summary"] == f"Artifact evidence rejected for {worker['action_id']}: {reason}"]
+            if len(matches) != 1:
+                return False
+            worker = matches[0]
+            action_id = worker["action_id"]
+            assignment_path = Path(worker["assignment_path"]).resolve()
+            if assignment_path != self.run_dir / "assignments" / f"{_slug(action_id)}.json":
+                return False
+            assignment = _load_json(assignment_path)
+            artifact_guard.validate_assignment(assignment)
+            repo = run["repositories"].get(assignment.get("repo_id"))
+            review = run.get("plan_review") or {}
+            if (not repo or assignment["run_id"] != run["run_id"]
+                    or assignment["action_id"] != action_id or assignment["stage"] != "implement"
+                    or assignment["output_kind"] != "result"
+                    or assignment.get("execution_mode", "worker") != "worker"
+                    or assignment["cwd"] != repo["worktree"]
+                    or assignment["baseline"] != repo["baseline"]
+                    or action_id in repo["accepted_artifacts"]
+                    or action_id in run.get("artifact_repairs", {})
+                    or action_id in run.get("corrected_handoff_recoveries", {})
+                    or review.get("status") != "approved"
+                    or assignment.get("plan_review") != {
+                        "path": review.get("review_path"), "sha256": review.get("review_sha256")}
+                    or not self._assignment_pins(assignment, Path(repo["plan_path"]), repo["plan_sha256"])):
+                return False
+            agents = self.load_agents()["agents"]
+            if (any(item.get("active_writer") for item in run["repositories"].values())
+                    or not any(agent["output_artifact"] == assignment["output_artifact"] for agent in agents)
+                    or any(agent["status"] in {"starting", "working"}
+                           or agent.get("cleanup_status") != "complete" for agent in agents)):
+                return False
+            output = Path(assignment["output_artifact"]).resolve()
+            original_path = original_artifact.resolve()
+            if (not output.is_relative_to(self.run_dir / "repos" / assignment["repo_id"])
+                    or worker.get("output_artifact") != str(output) or original_path == output):
+                raise WorkflowError("rejected result paths do not match the original assignment")
+            if any(Path(ref["path"]).resolve() == output for ref in repo["accepted_artifacts"].values()):
+                return False
+            for path in (original_path, output):
+                if path.stat().st_size > artifact_guard.MAX_BYTES["result"]:
+                    raise WorkflowError("rejected result exceeds its size limit")
+            original, corrected = _load_json(original_path), _load_json(output)
+            hint = original.get("next_action")
+            if (not isinstance(hint, str) or len(hint) <= 300
+                    or not isinstance(corrected.get("next_action"), str)
+                    or not 0 < len(corrected["next_action"]) <= 300):
+                raise WorkflowError("only an overlong next_action corrected to 1-300 characters is eligible")
+            comparison = dict(original, next_action=corrected["next_action"])
+            if comparison != corrected or corrected.get("status") != "complete":
+                raise WorkflowError("corrected handoff changed semantic evidence beyond next_action")
+            if corrected.get("assignment_path") != str(assignment_path):
+                raise WorkflowError("corrected handoff does not bind the rejected assignment")
+            previous_path = artifact_guard.CURRENT_ARTIFACT_PATH
+            try:
+                artifact_guard.CURRENT_ARTIFACT_PATH = output
+                artifact_guard.validate_result(corrected)
+            finally:
+                artifact_guard.CURRENT_ARTIFACT_PATH = previous_path
+            # Do not use normal seam metadata normalization here: it can freshen
+            # stale evidence. Compare the preserved writer facts before acceptance.
+            state = workflow_tools.repository_state(Path(repo["worktree"]))
+            if (corrected["tree_fingerprint"] != state["fingerprint"]
+                    or corrected["git"]["head"] != state["head"] or repo["branch"] != state["branch"]
+                    or Path(corrected["git"]["status_short_path"]).read_text().strip()
+                    != _git(Path(repo["worktree"]), "status", "--short").strip()):
+                raise WorkflowError("corrected handoff has stale repository/Git evidence")
+            record = {
+                "original": _reference(original_path), "corrected": _reference(output),
+                "assignment": _reference(assignment_path), "rejection": _reference(manifest_path),
+                "repository_state": state,
+                "evidence": [_reference(path) for path in sorted(workflow_tools.artifact_evidence_paths(corrected))],
+            }
+            run.setdefault("corrected_handoff_recoveries", {})[action_id] = record
+            self._record_accepted_reference(run, assignment, output)
+            run["status"], run["blockers"], repo["status"] = "working", [], "pending"
+            self._save_run(run)
+        self._append_event("artifact-accepted", action_id=action_id, artifact=str(output),
+                           recovery=True, next_action=None)
+        self._append_event("resumed", reason="retry-corrected-handoff", artifact=str(original_path),
+                           next_action="implement")
+        return True
+
     def retry_dependent_fixes(self) -> bool:
         """Retry only a fix blocked by a concurrently changed upstream contract."""
         with RunLock(self.run_dir):
