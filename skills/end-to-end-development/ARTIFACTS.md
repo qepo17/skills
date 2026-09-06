@@ -58,6 +58,8 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 └── repos/<repo-id>/
     ├── initial-status.txt
     ├── database-target.json             # migration-capable checks only; no secrets
+    ├── packet-build-dependency.json     # one-shot approved scheduling correction; failed evidence retained
+    ├── packet-build-progress-*.json     # distinct ancestor progress, pinned to the same original provider
     ├── plan-vN*.json
     ├── design-challenge-vN.json         # only when plan requires it
     ├── implementation-<packet-id>-N.json
@@ -205,6 +207,8 @@ The graph may add these coordinator fields when applicable:
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
 - `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
+- `packet_build_dependencies`: per-repository hashed immutable intent for an explicitly authorized generated-interface build scheduling correction. It pins `plan`, `review`, the still-blocked `result`, `assignment`, `reviewed_evidence` and all `evidence` references; stores `packet_id`, deferred `validation_id`, `until_task`, `provider_packet_id`, `authorization_text` and capture-time `repository_state`. References are checked on every run validation. It applies only to that same plan/review, supplies scheduling progress rather than validation success, and never removes the full build from provider/final validation. One intent per repository; no retries or failed outcomes are reset;
+- `packet_build_progress`: per-repository arrays of immutable follow-on progress references, each with `basis` equal to the original `packet_build_dependencies` reference. Records preserve the same plan/review/handler provider, newly reviewed failed test-compilation evidence, and a hashed `database_target` for migration-capable checks; they admit each distinct approved ancestor packet at most once before that provider executes. No root intent, failed artifact, retry allowance or task is rewritten. All deferred checks are mandatory from the fixed provider onward, including full-plan validation. Nested evidence hashes and duplicate-packet/provider invariants are validated on every run read;
 - repository `database_target_evidence`: path/hash of a non-secret `isolated-local` or `isolated-test` classification.
 
 Validators ignore unknown schema-v1 extension fields for compatibility, but the graph treats these references as immutable inputs. They never contain credentials, database URLs, or full user/session transcripts.

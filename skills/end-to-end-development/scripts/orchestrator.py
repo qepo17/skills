@@ -155,6 +155,15 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                 blocker_evidence_sha256=args.blocker_evidence_sha256, text=args.text, context=args.context,
             ):
                 raise WorkflowError("run is not eligible for implementation-decision replanning")
+        elif args.command == "continue-packet-build":
+            if graph.get_state(config).next:
+                raise WorkflowError("packet continuation requires a settled graph cursor")
+            if not engine.continue_packet_build(
+                repo_id=args.repository, blocker_id=args.blocker_id, review_sha256=args.review_sha256,
+                validation_id=args.validation_id, until_task=args.until_task,
+                evidence_sha256=args.evidence_sha256, text=args.text,
+            ):
+                raise WorkflowError("run is not eligible for the generated-interface build continuation")
         elif args.command == "retry-dependent-fixes":
             if not engine.retry_dependent_fixes():
                 raise WorkflowError(
@@ -268,6 +277,15 @@ def build_parser() -> argparse.ArgumentParser:
     replan.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     replan.add_argument("--report-root", type=Path)
 
+    packet_build = subparsers.add_parser(
+        "continue-packet-build", help="continue approved downstream handlers while retaining a premature failed build"
+    )
+    packet_build.add_argument("run_dir", type=Path)
+    for name in ("repository", "blocker-id", "review-sha256", "validation-id", "until-task", "evidence-sha256", "text"):
+        packet_build.add_argument(f"--{name}", required=True)
+    packet_build.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    packet_build.add_argument("--report-root", type=Path)
+
     dependent_fix_retry = subparsers.add_parser(
         "retry-dependent-fixes",
         help="retry fixes after an accepted upstream contract fix",
@@ -343,7 +361,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "replan-decision"}:
+        elif args.command in {"retry-corrected-handoff", "replan-decision", "continue-packet-build"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},
