@@ -24,7 +24,13 @@ Existing ticket / spec / request → grounded implementation spec
 
 The execution skills accept existing Jira/GitHub tickets directly; they do not recreate tickets, publish child issues, or require `idea-to-ticket`. They reuse source excerpts and code/doc evidence, then use the existing plan as the implementation contract. The fast skill keeps this in `plan.md`; the durable skill uses its canonical hash-pinned plan and internal work packets. Independent review checks the original source as well as the plan, so a mistaken interpretation cannot hide behind task completion.
 
-Discovery is evidence-first: adopt justified, reversible, in-scope implementation recommendations without routine confirmation. Ask zero questions when clear, normally 1–3 when necessary, and **at most 10 independently answerable clarification questions across the whole task**, including inherited discovery, follow-ups, escalation, and resume. Ten is a ceiling, not a quota; lower/no-interview preferences are honored. Unresolved material decisions remain blockers at the cap. High-risk plan approval, migration safety, and external-write authorization are never waived. See the bundled [discovery contract](skills/end-to-end-development/DISCOVERY.md).
+Discovery is evidence-first: adopt justified, reversible, in-scope implementation recommendations without routine confirmation. Ask zero questions when clear, otherwise one at a time (up to three only when independent), and **at most 10 independently answerable clarification questions across the whole task**, including inherited discovery, follow-ups, escalation, and resume. Ten is a ceiling, not a quota; lower/no-interview preferences are honored. Unresolved material decisions remain blockers at the cap. High-risk plan approval, migration safety, and external-write authorization are never waived. See the bundled [discovery contract](skills/end-to-end-development/DISCOVERY.md).
+
+### Prompt inspiration
+
+The prompts adapt the actual `to-spec`, `to-tickets`, and `grill-with-docs` skills: synthesis rather than another interview; problem/solution and meaningful stories; implementation/testing decisions with high existing behavioral test seams; domain glossary/ADRs; and independently verifiable vertical slices with genuine blocking dependencies. Necessary prefactors and wide-refactor expand–contract sequences stay within existing safety gates. Long-lived ticket prose stays outcome-oriented while local execution evidence retains real baseline-bound paths and commands.
+
+We deliberately do not import exhaustive story quotas, repeated seam/breakdown approval quizzes, automatic tracker publication/labels, or mandatory new tickets. See [source snapshots and adaptation rationale](docs/prompt-inspiration.md) and the self-contained [idea-to-ticket examples](skills/idea-to-ticket/EXAMPLES.md).
 
 ## Install with `npx skills`
 

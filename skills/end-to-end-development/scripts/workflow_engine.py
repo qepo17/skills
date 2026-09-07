@@ -3043,9 +3043,14 @@ class WorkflowEngine:
                     instructions=[
                         "Use the canonical plan as the implementation spec for the existing ticket, spec, or request; do not create another spec or tracker tickets.",
                         "Reuse pinned intake sources, codebase evidence, recommendations, and question history when present; verify relevant current code and refresh only stale or missing evidence.",
-                        "In task steps, explain current behavior with paths/symbols, the smallest suitable approach and rationale, and meaningful edge/error cases; link requirements to files and validation IDs.",
+                        "Synthesize settled context into the existing plan fields: user problem/solution, meaningful actor/capability/benefit stories linked to requirements, implementation/testing decisions, non-goals, and further notes. Do not invent an exhaustive story quota or a new spec interview.",
+                        "Use the domain glossary in CONTEXT.md (following CONTEXT-MAP.md when present) and applicable ADRs; record terminology and decision rationale without editing project files during planning.",
+                        "In task steps, explain current behavior with baseline-bound paths/symbols, the smallest suitable approach and rationale, and meaningful edge/error cases; link requirements to files and validation IDs. Keep durable product prose at module/interface level, not speculative file edits.",
+                        "State Testing Decisions: external behavior, the highest practical existing test seam, modules exercised, and similar tests as prior art. Prefer the fewest useful seams, not new interfaces for private-helper mocks; supported routine seams need no confirmation.",
                         "Adopt evidence-backed, reversible, in-scope implementation recommendations without routine confirmation. Do not interview the user; report genuinely unresolved material choices as decision blockers.",
                         "Produce the smallest outcome-oriented plan that covers every assigned requirement.",
+                        "Prefer tracer-bullet vertical slices: narrow complete behavior across only the layers needed, including tests, independently verifiable within existing packet limits. Declare genuine blocking dependencies; the graph works the eligible frontier without a breakdown-approval quiz.",
+                        "Prefactor first only when necessary, behavior-preserving, and tested. For wide mechanical refactors consider expand–contract: compatible form, bounded caller batches, then removal blocked by every batch. Preserve checks and risk gates; unsupported intermediate steps block for integration/replanning, never invent an integration branch or multiple repository write scopes.",
                         "Group related tasks into bounded work packets and declare every risk and high-cost mechanism.",
                     ],
                     extras=extras,
@@ -3842,7 +3847,7 @@ class WorkflowEngine:
                 "Review the complete baseline-to-worktree change independently."
                 if round_number == 1
                 else "Verify only the assigned findings, their fixes, and affected hunks.",
-                "Check repository standards and the original ticket/spec/request in pinned intake/requirements against the implementation spec and code; implementing a mistaken plan is still a spec defect."
+                "Check repository standards and the original ticket/spec/request in pinned intake/requirements against the implementation spec and code; implementing a mistaken plan is still a spec defect. Inspect story/acceptance coverage, domain glossary/ADR consistency, observable-behavior tests at the chosen seams, and genuine slice dependencies."
                 if round_number == 1
                 else "Keep verification within the assigned finding scope.",
                 "Report actionable correctness/spec findings without duplicating passing tool output.",

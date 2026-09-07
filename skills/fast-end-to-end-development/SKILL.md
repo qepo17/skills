@@ -50,7 +50,7 @@ Keep concise evidence there; keep full command output in a `logs/` child directo
 | File | Required contents |
 | --- | --- |
 | `request.md` | User wording, resolved scope, ticket/spec reference and material snapshot, inherited decisions, and clarification ledger (limit, every question/resolution, count) |
-| `plan.md` | Compact implementation spec: source-linked acceptance IDs, current behavior/evidence, chosen approach/recommendations, slices, checks, risks, and non-goals |
+| `plan.md` | Compact spec synthesis: problem/solution, relevant stories and acceptance IDs, implementation/testing decisions, non-goals, baseline evidence, vertical slices/dependencies, and checks |
 | `implementation.md` | What changed, changed-file inventory, and pre-review checks |
 | `review.md` | Exactly one independent review, findings, severity, and evidence |
 | `revision.md` | Finding dispositions, any fixes, and post-revision checks |
@@ -85,13 +85,13 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 Combine focused discovery and planning in one pass using [DISCOVERY.md](DISCOVERY.md). Inspect the source ticket/spec/request, current baseline, relevant code path and tests, and delivery configuration. Reuse captured evidence instead of rereading the whole repository in separate research/spec/ticket stages. Establish:
 
 - the exact baseline commit and task branch;
-- source-linked acceptance IDs mapped to files/modules and checks;
-- current behavior with paths/symbols and relevant documentation evidence;
-- the smallest suitable approach, its rationale, meaningful edge/error cases, and ordered implementation slices;
-- focused and broad validation commands;
+- the user's problem/solution and meaningful user stories linked to original acceptance IDs, using the domain glossary and respecting applicable ADRs;
+- current behavior with paths/symbols and relevant documentation evidence in a baseline-bound execution section, separate from durable spec prose;
+- settled implementation decisions, the smallest suitable approach and rationale, meaningful edge/error cases, and independently verifiable vertical slices with genuine blocking dependencies;
+- explicit testing decisions: externally observable behavior at the highest practical existing seam, modules exercised, similar tests as prior art, and focused/broad validation commands;
 - evidence-backed recommendations, risks, non-goals, and any unresolved material decision.
 
-Write this compact implementation contract in `plan.md` before coding; no separate spec or published tickets are required. Do not treat recommended product changes as user decisions. Stop on unresolved material ambiguity, even if the question budget is exhausted. If the tree is dirty, identify which changes predate the run and carry that inventory into `implementation.md` and `delivery.md`.
+Synthesize settled context into `plan.md` using the compact `to-spec`-inspired structure in [DISCOVERY.md](DISCOVERY.md); no separate spec, exhaustive story list, published tickets, routine test-seam confirmation, or breakdown-approval quiz is required. Put slice title/outcome, acceptance/verification, and `blocked by` in a small checklist and work the eligible frontier. Prefactor only when necessary and behavior-preserving. Wide refactors may need expand–contract; if the work exceeds fast scope/limits or requires unsafe intermediate steps, escalate rather than invent an integration branch or waive checks. Do not treat recommended product changes as user decisions. Stop on unresolved material ambiguity, even if the question budget is exhausted. If the tree is dirty, identify which changes predate the run and carry that inventory into `implementation.md` and `delivery.md`.
 
 ### 2. Implement
 
@@ -103,11 +103,11 @@ Run `git diff --check`, focused tests, and relevant broader checks in one valida
 
 Run one fresh, independent review against the baseline-to-current diff. Give the reviewer `request.md` (including original ticket/spec excerpts and decisions), `plan.md`, the acceptance criteria, repository instructions, changed-file inventory, and the diff; do not give it the implementer's conclusions. Review both standards and the original source plus implementation spec: following a plan that misinterprets the ticket is still a spec defect. The reviewer checks:
 
-- requirement and acceptance-criteria coverage;
+- original story/acceptance coverage, domain vocabulary, and applicable ADR consistency;
 - correctness, edge cases, and error handling;
 - security and data-safety implications appropriate to the scope;
 - compatibility with repository conventions;
-- tests and missing validation;
+- tests of external behavior at the chosen seams, missing validation, and genuine slice dependencies;
 - accidental scope expansion or undeclared mechanisms.
 
 Do not fix files during review. Write `review.md` with a stable finding ID, severity (`must-fix` or `advisory`), evidence path/hunk, and disposition. A review with no findings must say so explicitly and record the reviewed baseline and head.
