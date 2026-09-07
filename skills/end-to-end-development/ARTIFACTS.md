@@ -34,7 +34,8 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ```text
 <run-dir>/
 ├── request.md
-├── requirements.json
+├── requirements.json                   # includes optional immutable source intake/question history
+├── logs/clarifications.md               # optional append-only coordinator interaction ledger; not gate evidence
 ├── run.json
 ├── agents.json
 ├── events.jsonl
@@ -246,7 +247,11 @@ The local gate is satisfied only when every effective blocking check has current
 }
 ```
 
-Every requirement has non-empty source text, acceptance criteria, and repository IDs. Preserve the user's material wording.
+Every requirement has non-empty source text, acceptance criteria, and repository IDs. Preserve the user's material wording and original ticket acceptance IDs in the criteria.
+
+New skill-driven bootstrap specifications include the optional `intake` extension described in [ORCHESTRATION.md](ORCHESTRATION.md#source-intake-and-question-history): non-empty `sources` (`reference`, `text`), `codebase_evidence`, `recommendations`, `question_limit` (integer 0–10), and ordered `questions` (`question`, non-empty `resolution`). Optional `prior_question_count` (default 0) preserves the already-asked prefix when intake begins or the user lowers/ends the interview. New questions must fit `max(0, question_limit - prior_question_count)`; prior history is never erased or a new allowance. A lower cap/no-interview preference can therefore coexist with resolved inherited questions without blocking otherwise-ready execution. The engine validates its types/limits (including the enclosing 64 KiB maximum) and preserves it verbatim inside this hash-pinned artifact. Workers already receive it as canonical requirements input. It captures original ticket/spec excerpts separately from agent recommendations, without another source/spec artifact or tracker write. Existing artifacts without intake remain valid.
+
+Intake records the initial cumulative clarification count; later coordinator questions/resolutions are appended to `logs/clarifications.md` before/after presentation. This interaction-only log is an explicit exception for coordinator note-taking, not mutable workflow state or accepted gate evidence. It cannot authorize work, change pinned requirements/plans, waive safety approval, or reset a budget. The coordinator counts inherited plus later questions under the same maximum of 10 (or lower selected limit); at exhaustion unresolved material choices remain blockers. Workers return decision blockers rather than run their own interviews.
 
 ## `agents.json` (`agents`)
 

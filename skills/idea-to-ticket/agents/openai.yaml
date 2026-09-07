@@ -1,0 +1,4 @@
+interface:
+  display_name: "Idea to Ticket"
+  short_description: "Research ideas and draft outcome-focused tickets"
+  default_prompt: "Use $idea-to-ticket to research this idea and draft an evidence-backed ticket, clarifying only material unknowns and publishing only with explicit authorization."

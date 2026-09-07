@@ -1,13 +1,15 @@
 ---
 name: fast-end-to-end-development
-description: "Run a lightweight single-repository change through planning, implementation, one independent review and revision, and verified PR delivery. Uses stage-specific reasoning, scripted GitHub delivery, final-head CI evidence, and one separate bounded CI fix. Use for quick ordinary changes that do not require durable orchestration, high-risk approval, multi-repository integration, or whole-run resumability."
+description: "Take an existing ticket, spec, or request through grounded implementation planning, coding, one independent review/revision, and verified PR delivery. Ask only essential evidence-unresolved questions, at most 10 per task. Use for ordinary single-repository changes without durable orchestration, high-risk approval, or multi-repository integration."
 ---
 
 # Fast End-to-End Development
 
 Use this skill for a small or medium change that should move from request to pull request in one bounded pass:
 
-`plan → implement → review once → revise once → PR + required CI → [CI fix once] → [optional HTML explainer]`
+`ticket / spec / request → grounded implementation spec → implement + validate → review once → revise once → PR + required CI → [CI fix once] → [optional HTML explainer]`
+
+Read [DISCOVERY.md](DISCOVERY.md) before intake/planning. Reuse existing tickets and specs; never require `idea-to-ticket` or a `to-tickets` stage. `plan.md` is the compact implementation spec, not an additional document.
 
 The current agent owns the run. Keep the process fast by removing Herdr worker orchestration, multi-profile policy selection, mandatory plan-approval pauses, integration workers, and retry loops. Keep the safety that matters: preserve pre-existing work, inspect repository instructions, record evidence, use a fresh reviewer, cap remediation at one batch, and stop on material ambiguity or high-risk scope.
 
@@ -30,7 +32,7 @@ Before reporting completion, account for every Herdr pane created by this run an
 Use the fast path for one repository and ordinary application changes. Before editing:
 
 - Escalate to `end-to-end-development` for multiple repositories or changes involving authorization, security-sensitive code, database migrations or backfills, destructive data operations, concurrency/distributed behavior, background processing, new storage, public contracts, or another high-cost mechanism.
-- Ask the user only when a material product decision or repository identity cannot be established. Do not pause merely for plan approval.
+- Research before asking; adopt evidence-backed, reversible, in-scope recommendations without routine confirmation. Ask only unresolved material questions under the shared task-wide cap of 10 in [DISCOVERY.md](DISCOVERY.md), including inherited questions and follow-ups. Zero is valid. Do not pause merely for plan approval or guess to bypass a safety gate.
 - Read repository-local instructions (`AGENTS.md`, `CONTRIBUTING.md`, `README`, package/build configuration, and relevant nested instructions) before planning.
 - Verify Python 3.11+, Git, and authenticated forge access before implementation. GitHub delivery uses the bundled helper and `gh`; other forges use their established CLI with the same final-head evidence requirements.
 - Never copy `.env` or database credentials into a worktree. Escalate migration-capable validation to the durable workflow and confirm an isolated local/test target before execution.
@@ -47,8 +49,8 @@ Keep concise evidence there; keep full command output in a `logs/` child directo
 
 | File | Required contents |
 | --- | --- |
-| `request.md` | User request verbatim and the resolved repository/branch scope |
-| `plan.md` | Acceptance criteria, implementation slices, checks, risks, and non-goals |
+| `request.md` | User wording, resolved scope, ticket/spec reference and material snapshot, inherited decisions, and clarification ledger (limit, every question/resolution, count) |
+| `plan.md` | Compact spec synthesis: problem/solution, relevant stories and acceptance IDs, implementation/testing decisions, non-goals, baseline evidence, vertical slices/dependencies, and checks |
 | `implementation.md` | What changed, changed-file inventory, and pre-review checks |
 | `review.md` | Exactly one independent review, findings, severity, and evidence |
 | `revision.md` | Finding dispositions, any fixes, and post-revision checks |
@@ -57,6 +59,8 @@ Keep concise evidence there; keep full command output in a `logs/` child directo
 | `ci-revision.md` | When needed: the single CI-fix batch, failure classification, changed files, and revalidation |
 | `pr-explainer.json` | When requested: sanitized structured input for the HTML renderer |
 | `pr-explainer.html` | When requested: self-contained human-readable PR explainer |
+
+Create `request.md` before asking any clarification; append questions before presenting them and resolutions afterward. Preserve source excerpts separately from interpretation. On continuation/escalation, hand off the existing question ledger and limit rather than starting a new interview. If a supplied spec is adequate, reference its captured version and add only the repository-grounded implementation delta in `plan.md`.
 
 Do not put secrets, environment values, full diffs, or unbounded terminal transcripts in these artifacts. Record commands, exit codes, short conclusions, hashes, and paths instead.
 
@@ -76,17 +80,18 @@ Do not put secrets, environment values, full diffs, or unbounded terminal transc
 
 ## Workflow
 
-### 1. Plan by the agent
+### 1. Grounded implementation spec by the agent
 
-Inspect the repository, current branch, working-tree status, recent conventions, relevant implementation files, tests, and delivery configuration. Establish:
+Combine focused discovery and planning in one pass using [DISCOVERY.md](DISCOVERY.md). Inspect the source ticket/spec/request, current baseline, relevant code path and tests, and delivery configuration. Reuse captured evidence instead of rereading the whole repository in separate research/spec/ticket stages. Establish:
 
 - the exact baseline commit and task branch;
-- observable acceptance criteria mapped to files/modules;
-- the smallest implementation slices and their order;
-- focused and broad validation commands;
-- risks, non-goals, and any required user decision.
+- the user's problem/solution and meaningful user stories linked to original acceptance IDs, using the domain glossary and respecting applicable ADRs;
+- current behavior with paths/symbols and relevant documentation evidence in a baseline-bound execution section, separate from durable spec prose;
+- settled implementation decisions, the smallest suitable approach and rationale, meaningful edge/error cases, and independently verifiable vertical slices with genuine blocking dependencies;
+- explicit testing decisions: externally observable behavior at the highest practical existing seam, modules exercised, similar tests as prior art, and focused/broad validation commands;
+- evidence-backed recommendations, risks, non-goals, and any unresolved material decision.
 
-Write `plan.md` before implementation. Keep it outcome-oriented rather than a list of speculative line edits. If the tree is dirty, identify which changes predate the run and carry that inventory into `implementation.md` and `delivery.md`.
+Synthesize settled context into `plan.md` using the compact `to-spec`-inspired structure in [DISCOVERY.md](DISCOVERY.md); no separate spec, exhaustive story list, published tickets, routine test-seam confirmation, or breakdown-approval quiz is required. Put slice title/outcome, acceptance/verification, and `blocked by` in a small checklist and work the eligible frontier. Prefactor only when necessary and behavior-preserving. Wide refactors may need expand–contract; if the work exceeds fast scope/limits or requires unsafe intermediate steps, escalate rather than invent an integration branch or waive checks. Do not treat recommended product changes as user decisions. Stop on unresolved material ambiguity, even if the question budget is exhausted. If the tree is dirty, identify which changes predate the run and carry that inventory into `implementation.md` and `delivery.md`.
 
 ### 2. Implement
 
@@ -96,13 +101,13 @@ Run `git diff --check`, focused tests, and relevant broader checks in one valida
 
 ### 3. Review once
 
-Run one fresh, independent review against the baseline-to-current diff. Give the reviewer `plan.md`, the acceptance criteria, repository instructions, changed-file inventory, and the diff; do not give it the implementer's conclusions. The reviewer checks:
+Run one fresh, independent review against the baseline-to-current diff. Give the reviewer `request.md` (including original ticket/spec excerpts and decisions), `plan.md`, the acceptance criteria, repository instructions, changed-file inventory, and the diff; do not give it the implementer's conclusions. Review both standards and the original source plus implementation spec: following a plan that misinterprets the ticket is still a spec defect. The reviewer checks:
 
-- requirement and acceptance-criteria coverage;
+- original story/acceptance coverage, domain vocabulary, and applicable ADR consistency;
 - correctness, edge cases, and error handling;
 - security and data-safety implications appropriate to the scope;
 - compatibility with repository conventions;
-- tests and missing validation;
+- tests of external behavior at the chosen seams, missing validation, and genuine slice dependencies;
 - accidental scope expansion or undeclared mechanisms.
 
 Do not fix files during review. Write `review.md` with a stable finding ID, severity (`must-fix` or `advisory`), evidence path/hunk, and disposition. A review with no findings must say so explicitly and record the reviewed baseline and head.

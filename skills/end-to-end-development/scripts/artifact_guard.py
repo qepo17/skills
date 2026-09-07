@@ -1227,6 +1227,35 @@ def validate_run(data: dict[str, Any]) -> None:
         fail("$.blockers", "must not be empty when run status is blocked")
 
 
+def validate_intake(value: Any) -> None:
+    intake = obj(value, "$.intake")
+    limit = integer(field(intake, "question_limit", "$.intake"), "$.intake.question_limit", minimum=0)
+    if limit > 10:
+        fail("$.intake.question_limit", "must be at most 10")
+    questions = array(field(intake, "questions", "$.intake"), "$.intake.questions")
+    prior = integer(intake.get("prior_question_count", 0), "$.intake.prior_question_count", minimum=0)
+    if prior > len(questions):
+        fail("$.intake.prior_question_count", "must not exceed the preserved question history")
+    # A later lower/no-interview preference cannot erase questions already asked.
+    if len(questions) > max(limit, prior):
+        fail("$.intake.questions", "exceeds the shared task question limit")
+    for index, raw in enumerate(questions):
+        loc = f"$.intake.questions[{index}]"
+        question = obj(raw, loc)
+        string(field(question, "question", loc), f"{loc}.question", max_length=2000)
+        string(field(question, "resolution", loc), f"{loc}.resolution", max_length=4000)
+    sources = array(field(intake, "sources", "$.intake"), "$.intake.sources")
+    if not sources:
+        fail("$.intake.sources", "must capture the ticket, spec, or direct request")
+    for index, raw in enumerate(sources):
+        loc = f"$.intake.sources[{index}]"
+        source = obj(raw, loc)
+        string(field(source, "reference", loc), f"{loc}.reference", max_length=2000)
+        string(field(source, "text", loc), f"{loc}.text", max_length=12000)
+    for name in ("codebase_evidence", "recommendations"):
+        string_array(field(intake, name, "$.intake"), f"$.intake.{name}", unique=True)
+
+
 def validate_requirements(data: dict[str, Any]) -> None:
     validate_common(data, "requirements")
     timestamp(field(data, "created_at", "$"), "$.created_at")
@@ -1255,6 +1284,10 @@ def validate_requirements(data: dict[str, Any]) -> None:
     if ids != sorted(ids) or len(ids) != len(set(ids)):
         fail("$.requirements", "requirement IDs must be unique and sorted")
     string_array(field(data, "constraints", "$"), "$.constraints", unique=True)
+    if "intake" in data:
+        validate_intake(data["intake"])
+        if len((json.dumps(data, indent=2) + "\n").encode("utf-8")) > MAX_BYTES["requirements"]:
+            fail("$.intake", "source intake and requirements exceed the 64 KiB artifact limit")
 
 
 def validate_agents(data: dict[str, Any]) -> None:
