@@ -854,6 +854,7 @@ class WorkflowEngineTests(unittest.TestCase):
         profile: str = "standard",
         risks: list[str] | None = None,
         report_requested: bool = False,
+        intake: dict[str, Any] | None = None,
     ) -> None:
         value = {
             "run_id": "20260822T100000Z-langgraph-test",
@@ -880,6 +881,8 @@ class WorkflowEngineTests(unittest.TestCase):
                 }
             ],
         }
+        if intake is not None:
+            value["intake"] = intake
         self.spec.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
     def initialize(
@@ -890,11 +893,13 @@ class WorkflowEngineTests(unittest.TestCase):
         risks: list[str] | None = None,
         report_requested: bool = False,
         legacy: bool = False,
+        intake: dict[str, Any] | None = None,
     ) -> WorkflowEngine:
         self.write_spec(
             profile=profile,
             risks=risks,
             report_requested=report_requested,
+            intake=intake,
         )
         engine = WorkflowEngine.initialize(
             spec_path=self.spec,
@@ -912,6 +917,88 @@ class WorkflowEngineTests(unittest.TestCase):
             run.pop('delivery_policy_version')
             engine._save_run(run)
         return engine
+
+    def test_source_intake_survives_delivery_without_extra_stages(self) -> None:
+        intake = {
+            "sources": [{"reference": "Jira APP-123 snapshot", "text": "AC-001: Implement the requested behavior."}],
+            "codebase_evidence": ["README.md at the baseline describes the existing behavior."],
+            "recommendations": ["Extend the existing module, without a new service."],
+            "question_limit": 0,
+            "questions": [],
+        }
+        batch = FakeSuccessfulBatch()
+        engine = self.initialize(batch, intake=intake)
+        run = engine.load_run()
+        requirements_path = Path(run["requirements_path"])
+        self.assertEqual(intake, json.loads(requirements_path.read_text())["intake"])
+        self.assertEqual("Implement the requested behavior.\n", Path(run["request_path"]).read_text())
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "source-intake"}, "recursion_limit": 150},
+        )
+        completed = engine.load_run()
+        self.assertEqual("complete", completed["status"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+        for assignment in batch.assignments:
+            self.assertIn({"path": str(requirements_path), "sha256": run["requirements_sha256"]}, assignment["input_artifacts"])
+            self.assertIn("Do not interview the user", " ".join(assignment["instructions"]))
+        self.assertIn("implementation spec", " ".join(batch.assignments[0]["instructions"]))
+        review = next(a for a in batch.assignments if a["stage"] == "review-1")
+        self.assertIn("mistaken plan is still a spec defect", " ".join(review["instructions"]))
+        bundle = Path(completed["plan_review"]["review_path"]).read_text()
+        for text in ("Jira APP-123", "0 further questions available at intake", "Agent recommendation (not user approval)",
+                     "Follow the repository convention.", "Expected files: feature.txt", "Validation IDs: API-VAL-001"):
+            self.assertIn(text, bundle)
+        reloaded = WorkflowEngine(self.run_dir, skill_dir=SCRIPTS_DIR.parent)
+        self.assertEqual(run["requirements_sha256"], reloaded.load_run()["requirements_sha256"])
+        self.assertEqual(intake, json.loads(requirements_path.read_text())["intake"])
+        intake["sources"][0]["text"] = "Silently changed ticket"
+        changed = json.loads(requirements_path.read_text())
+        changed["intake"] = intake
+        requirements_path.write_text(json.dumps(changed))
+        with self.assertRaises(artifact_guard.ValidationError):
+            reloaded.load_run()
+
+    def test_resolved_upstream_questions_then_no_interview_can_deliver(self) -> None:
+        intake = {
+            "sources": [{"reference": "Upstream idea-to-ticket ledger and later user preference",
+                         "text": "AC-001: Implement the requested behavior. Two questions resolved; user: no more interview."}],
+            "codebase_evidence": [], "recommendations": [], "question_limit": 0,
+            "prior_question_count": 2,
+            "questions": [{"question": "Which repository?", "resolution": "User: api."},
+                          {"question": "Preserve existing behavior?", "resolution": "User: yes."}],
+        }
+        batch = FakeSuccessfulBatch()
+        engine = self.initialize(batch, intake=intake)
+        build_graph(engine, InMemorySaver()).invoke(
+            {"run_dir": str(self.run_dir)},
+            {"configurable": {"thread_id": "no-further-interview"}, "recursion_limit": 150},
+        )
+        run = engine.load_run()
+        self.assertEqual("complete", run["status"])
+        self.assertEqual(intake, json.loads(Path(run["requirements_path"]).read_text())["intake"])
+        self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
+
+    def test_invalid_intake_is_rejected_before_run_state_is_created(self) -> None:
+        intake = {
+            "sources": [{"reference": "User request", "text": "Add a feature."}],
+            "codebase_evidence": [], "recommendations": [], "question_limit": 10,
+            "questions": [{"question": f"Question {i}", "resolution": "Answered."} for i in range(11)],
+        }
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "question limit"):
+            self.initialize(intake=intake)
+        self.assertFalse(self.run_dir.exists())
+        intake["questions"] = [{"question": "Unresolved material choice?", "resolution": ""}]
+        with self.assertRaisesRegex(artifact_guard.ValidationError, "resolution"):
+            self.initialize(intake=intake)
+        self.assertFalse(self.run_dir.exists())
+
+    def test_absent_intake_remains_absent_without_policy_retrofit(self) -> None:
+        engine = self.initialize(legacy=True)
+        run = engine.load_run()
+        self.assertNotIn("intake", json.loads(Path(run["requirements_path"]).read_text()))
+        self.assertNotIn("validation_policy_version", run)
+        self.assertNotIn("delivery_policy_version", run)
 
     def test_engine_normalizes_assignment_metadata_from_its_own_intent(self) -> None:
         batch = FakeSuccessfulBatch()

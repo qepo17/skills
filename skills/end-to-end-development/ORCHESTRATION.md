@@ -1,6 +1,6 @@
 # LangGraph orchestration
 
-LangGraph is the only executable control-flow engine for this skill. The Pi/Codex coordinator performs repository discovery and translates that evidence into a bootstrap specification. For new policy-version-1 runs it may also inspect hash-pinned evidence read-only and translate explicit user validation exceptions or evidence-based related remediation into the typed amendment request. It does not choose phases, construct or author worker assignments, launch batches, manage retries, patch source, or mutate run state directly.
+LangGraph is the only executable control-flow engine for this skill. The Pi/Codex coordinator performs repository discovery and translates that evidence into a bootstrap specification. For new policy-version-1 runs it may also inspect hash-pinned evidence read-only and translate explicit user validation exceptions or evidence-based related remediation into the typed amendment request. It may also keep the append-only clarification interaction ledger described below. It does not choose phases, construct or author worker assignments, launch batches, manage retries, patch source, or mutate run state directly.
 
 ## Authority model
 
@@ -92,6 +92,35 @@ The coordinator writes a temporary JSON file outside the repository and passes i
   ]
 }
 ```
+
+### Source intake and question history
+
+For new skill-driven runs, add `intake` to the bootstrap specification. It is optional at the engine interface for compatibility; absent intake does not add a migration, phase, approval, or retry policy. Follow [DISCOVERY.md](DISCOVERY.md). The request stays verbatim; intake separates source snapshots from interpretation:
+
+```json
+{
+  "intake": {
+    "sources": [{
+      "reference": "Jira APP-123, supplied snapshot, updated 2026-09-07",
+      "text": "AC-1: Archived rates must not appear in the selector."
+    }],
+    "codebase_evidence": ["api at baseline <sha>: src/rates.py:list_rates currently includes archived rows; tests/test_rates.py covers active rows."],
+    "recommendations": ["Agent recommendation: extend the existing selector filter and focused tests rather than add a new service; follows src/rates.py precedent."],
+    "question_limit": 10,
+    "questions": []
+  }
+}
+```
+
+All five fields are required when intake is present. `sources` must be non-empty, with non-empty `reference` (at most 2,000 characters) and `text` (at most 12,000). `codebase_evidence` and `recommendations` are unique string arrays and may be empty. The enclosing requirements artifact retains its 64 KiB limit. Capture only relevant excerpts without secrets; cite source/revision and preserve original acceptance IDs. For a direct request, use a descriptive conversation reference. For a reused spec, capture the applicable version and implementation delta rather than duplicate the entire document.
+
+`question_limit` is an integer from 0 to 10, preserving any lower user/upstream limit. `questions` is the ordered cumulative intake ledger, each entry `{ "question": "One independently answerable question.", "resolution": "User answer verbatim, or explicitly labelled evidence-based resolution." }`. Include inherited questions rather than reset the count; questions are capped at 2,000 characters and resolutions at 4,000. Every entry needs a non-empty resolution before initialization. Keep unresolved drafts outside the empty run directory and do not initialize with unresolved material choices. A syntactically valid resolution is not proof that an unsafe guess was authorized.
+
+Optional `prior_question_count` (default 0) identifies the already-asked prefix when this intake began, or when the user subsequently lowered/ended the interview. It must be a nonnegative integer no larger than the preserved ledger. Capture its provenance and any lower-limit preference in `sources`; never relabel new over-budget questions as prior history. Newly asked entries must fit `max(0, question_limit - prior_question_count)`. Equivalently, total ledger length cannot exceed `max(question_limit, prior_question_count)`. Remaining permission is always `max(0, question_limit - len(questions))`, never a fresh allowance. Thus two resolved upstream answers followed by "no more interview" use `question_limit: 0`, `prior_question_count: 2`, and both historical entries; initialization can proceed with no further questions. A prior historical overrun is preserved and disclosed, not erased or permission to ask more. A later cap reduction never blocks otherwise-ready execution solely because questions were already asked.
+
+Initialization validates intake types/question history before creating run state and copies it into the existing hash-pinned `requirements.json`. Canonical worker inputs already carry that artifact, so no separate research worker, source-artifact bundle, or ticket phase is needed. Planners inspect the relevant code themselves, reuse valid intake evidence, and express the implementation spec using existing task steps/files/validation links. Reviewers compare the original source and the implementation plan. Workers do not interview the user or publish tracker changes.
+
+After initialization, the coordinator may append interaction-only entries to `logs/clarifications.md`: question recorded **before** presentation, then its answer/resolution. Also record later lower-limit/no-more-interview preferences without editing the immutable intake. Each question counts independently along with all inherited questions; use the lowest current user/intake limit, with zero further permission after no-more-interview. Preference notes do not themselves spend a question. Read both records on resume/escalation; if history is missing, recover it before asking more, never assume a reset. This log is not authoritative workflow state and cannot amend a requirement, approve a plan, or unlock a gate. Later answers enter only through existing supported decision/replanning transitions. **Recovery limitation:** `replan-decision` accepts only the documented approved full-profile implementation decision blocker; neither it nor `resume` can recover a decision blocker first discovered during contract/planning. For those stages, preserve the blocked run and report the unsupported transition rather than solicit an answer as though it would resume the run, edit pinned artifacts, or silently start over. A later explicitly authorized replacement run must preserve the source/decision/question history and existing work. Adding general planning-decision recovery is outside this workflow change. When the remaining budget is zero, report unresolved material blockers without another questionnaire. Mandatory safety approvals remain separate. The engine validates the intake array bound; the coordinator is responsible for semantic question counting and later interaction limits.
 
 An optional repository `delivery_check_timeout_seconds` is an integer from 0 (one observation) to 1800 (default); it bounds CI polling only. Initialization pins GitHub.com delivery to the command executor, other forges to workers, new delivery evidence to version 2, and delivery-policy version 1 to the `draft-until-verified` lifecycle with its run identity. Fallback workers receive the same lifecycle/evidence obligations and must report unsupported draft creation or draft-only CI rather than silently creating a ready PR or polling forever.
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Fast End-to-End Development"
-  short_description: "Plan, build, review, revise, and ship fast"
-  default_prompt: "Use $fast-end-to-end-development to plan, implement, review, revise, and open a PR with an HTML explainer."
+  short_description: "Ground a ticket, build, review, and ship fast"
+  default_prompt: "Use $fast-end-to-end-development to turn this ticket, spec, or request into a compact implementation plan and a verified PR, adopting supported routine recommendations without confirmation."

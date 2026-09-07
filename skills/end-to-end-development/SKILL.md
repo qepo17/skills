@@ -1,11 +1,15 @@
 ---
 name: end-to-end-development
-description: Run deterministic, resumable end-to-end development across one or more repositories through a durable LangGraph control plane, risk-proportional approval and challenge gates, reusable validation evidence, single-pass review and remediation limits, isolated worktrees, auto-detected headless workers, and validated artifact handoffs.
+description: Take an existing ticket, spec, or request through grounded implementation planning and deterministic, resumable delivery across repositories with LangGraph. Reuse source evidence, ask at most 10 essential questions per task, and preserve risk-proportional approval, bounded independent review/remediation, isolated worktrees, and verified CI.
 disable-model-invocation: true
 compatibility: Requires uv, Python 3.11+, Git worktrees, Pi or Codex, a repository forge CLI, and the installed codebase-design skill. Paseo, Herdr, and tmux are detected automatically when the coordinator runs inside them; otherwise workers run headlessly. LangGraph dependencies are installed from the locked skill project.
 ---
 
 # End-to-End Development
+
+`ticket / spec / request → grounded implementation spec → implement + validate → independent review → bounded fixes → PR + verified CI`
+
+Read [DISCOVERY.md](DISCOVERY.md) for source intake, evidence-first decisions, and the task-wide question cap. Existing tickets skip ticket creation; `idea-to-ticket` is optional upstream preparation. The graph's existing `plan` phase produces the implementation spec in the canonical plan artifacts, including internal work packets. Do not add a second spec/ticket pipeline or a separate orchestrator.
 
 Use the bundled **LangGraph workflow as the sole orchestration engine**. The current Pi/Codex agent performs request/repository discovery, dedicated-worktree creation, bootstrap-spec construction, presentation of a high-risk plan-review interrupt, read-only evidence inspection, translation of explicit user validation decisions or evidence-backed related-remediation decisions into the typed amendment command, and concise presentation of status. Do not manually choose phases, construct assignments, author source-work instructions, supervise workers, manage retries, mutate run state, or bypass graph routing.
 
@@ -53,8 +57,8 @@ Do not invoke `workflow_tools.py run-batch` directly during a graph-managed run.
 
 Treat skill arguments plus relevant user conversation as the complete request.
 
-1. Discover every affected repository and every material risk before creating run state.
-2. Ask the user only when repository identity or a material product choice cannot be established from the request and repository evidence. A later plan-review interrupt is mandatory only if policy selects full.
+1. Capture the existing ticket/spec/request and discover affected repositories and material risks before creating run state. Reuse upstream evidence; limit coordinator code inspection to scope/risk and leave detailed implementation design to the graph's planner.
+2. Resolve answerable questions from code/docs and adopt supported, reversible, in-scope recommendations without routine confirmation. Ask only material unresolved questions under [DISCOVERY.md](DISCOVERY.md): zero by default, normally 1–3 at a time, at most 10 total including upstream questions and follow-ups. Preserve the ledger in the bootstrap `intake`; do not initialize with unresolved material choices. A later full-profile approval gate remains mandatory and cannot be replaced by a recommendation.
 3. **Start from an up-to-date base.** Before creating a new task worktree or planning changes, identify each repository's remote and default branch; do not assume `origin/main`. Fetch the remote and create the task branch from the latest remote default branch (or an explicitly user-selected base). If fetching or resolving the base fails, stop and report it rather than silently using a stale local base. Create one dedicated worktree per repository, preferring Worktrunk and passing the base explicitly:
 
    ```bash
@@ -63,7 +67,7 @@ Treat skill arguments plus relevant user conversation as the complete request.
    ```
 
    The dedicated worktree must be clean. Never copy `.env` or other database credentials into it. For a supplied existing task branch, inspect status and divergence first and use that branch in an isolated worktree rather than recreating it from the default branch. Preserve existing commits and local changes; never automatically pull, reset, discard, or rebase existing work.
-4. Write a bootstrap specification using the exact shape in [ORCHESTRATION.md](ORCHESTRATION.md). Preserve material user wording in requirement source text and acceptance criteria.
+4. Write a bootstrap specification using [ORCHESTRATION.md](ORCHESTRATION.md), including its `intake` source/evidence/recommendation/question record for new skill-driven runs. Keep this draft outside the not-yet-initialized run directory. Preserve material user wording in requirement source text, retain original acceptance IDs in the criteria, and distinguish recommendations from user decisions. Initialization pins intake inside `requirements.json`, already supplied to planners and reviewers; do not invent extra assignment inputs.
 5. Choose durable run state under:
 
    ```text
@@ -83,6 +87,8 @@ The command runs until completion, a validated blocker, or a full-profile plan-r
 ### Resume
 
 The fresh-base rule applies only to new task branches. Preserve the run's existing worktrees, commits, local changes, and recorded baselines; do not recreate branches or automatically pull, reset, discard, or rebase them to catch up with the remote.
+
+Recover the original intake and any later `logs/clarifications.md` entries before asking anything. The coordinator may append only interaction notes there (question before presentation, answer afterward); this is a budget ledger, not graph state or approval evidence. Count inherited and later questions together, never restart discovery on resume/escalation, and report unresolved decisions without more questions when the limit is reached. Use supported decision/replanning commands to apply later answers; never edit pinned requirements or plans. `replan-decision` is limited to an approved full-profile implementation decision blocker. A contract/planning decision blocker has no supported answer-to-resume transition: preserve it and report that limitation, not another interview or a silent replacement run.
 
 For an explicit run directory:
 

@@ -8,10 +8,23 @@ Agent Skills for simple code and taking software changes from request to pull re
 | Skill | Use it for |
 | --- | --- |
 | `simple-code` | Minimal, readable code with YAGNI, readable one-liners, and WHY-only comments. |
-| `fast-end-to-end-development` | A low-risk single-repository change with one review/revision, scripted GitHub delivery, final-head CI evidence, and one separate compatible CI fix. |
+| `idea-to-ticket` | Optional preparation for unticketed ideas: focused evidence, essential clarification, an outcome-oriented draft, and publication only when explicitly authorized. |
+| `fast-end-to-end-development` | An existing ticket/spec/request through a compact grounded implementation spec, one review/revision, and verified single-repository PR delivery. |
 | `end-to-end-development` | Durable single- or multi-repository orchestration with one review/remediation pass, automatic low-risk plan decisions, and explicit approval only for high-risk work. |
 
 The repository follows the [Agent Skills specification](https://agentskills.io/specification) and uses the conventional `skills/<name>/SKILL.md` catalog layout supported by [`npx skills`](https://github.com/vercel-labs/skills).
+
+## Two entry points, no mandatory interview
+
+```text
+Unticketed idea → idea-to-ticket → draft → explicitly authorized publication
+Existing ticket / spec / request → grounded implementation spec
+  → implement + validate → independent review → bounded fixes → PR + verified CI
+```
+
+The execution skills accept existing Jira/GitHub tickets directly; they do not recreate tickets, publish child issues, or require `idea-to-ticket`. They reuse source excerpts and code/doc evidence, then use the existing plan as the implementation contract. The fast skill keeps this in `plan.md`; the durable skill uses its canonical hash-pinned plan and internal work packets. Independent review checks the original source as well as the plan, so a mistaken interpretation cannot hide behind task completion.
+
+Discovery is evidence-first: adopt justified, reversible, in-scope implementation recommendations without routine confirmation. Ask zero questions when clear, normally 1–3 when necessary, and **at most 10 independently answerable clarification questions across the whole task**, including inherited discovery, follow-ups, escalation, and resume. Ten is a ceiling, not a quota; lower/no-interview preferences are honored. Unresolved material decisions remain blockers at the cap. High-risk plan approval, migration safety, and external-write authorization are never waived. See the bundled [discovery contract](skills/end-to-end-development/DISCOVERY.md).
 
 ## Install with `npx skills`
 
@@ -58,12 +71,12 @@ npx skills add git@github.com:qepo17/skills.git
 Update installed global skills with:
 
 ```bash
-npx skills update --global end-to-end-development fast-end-to-end-development simple-code
+npx skills update --global end-to-end-development fast-end-to-end-development idea-to-ticket simple-code
 ```
 
 ## Requirements
 
-`simple-code` has no runtime dependencies.
+`simple-code` and `idea-to-ticket` have no executable runtime dependencies. `idea-to-ticket` can draft locally; duplicate checks and explicitly authorized publication require an available authenticated tracker tool.
 
 ### Fast workflow
 
@@ -102,6 +115,9 @@ skills/
 │   ├── SKILL.md
 │   ├── agents/
 │   └── scripts/
+├── idea-to-ticket/
+│   ├── SKILL.md
+│   └── agents/
 └── simple-code/
     ├── SKILL.md
     └── agents/
@@ -117,6 +133,6 @@ Run all repository checks:
 ./scripts/check.sh
 ```
 
-The check validates the skill catalog, runs workflow/repair/forge/reasoning tests, checks the identical standalone delivery resources, smoke-tests an isolated fast-only installation and the HTML renderer, and verifies discovery with the pinned `skills` CLI version. Test Git operations target temporary local repositories; no real forge or database is modified.
+The check validates the skill catalog, runs workflow/intake/repair/forge/reasoning tests, checks the identical standalone delivery and discovery resources, smoke-tests isolated fast-only and idea-to-ticket installations and the HTML renderer, and verifies discovery with the pinned `skills` CLI version. Intake tests cover zero/lower/capped questions, resolved inherited questions followed by no-more-interview, rejected unresolved or newly over-budget intake, bounded source snapshots, immutable handoffs, and unchanged stage counts; they do not claim to mechanically prove an agent's semantic question counting or live tracker behavior. Test Git operations target temporary local repositories; no real forge or database is modified.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before changing a skill.

@@ -17,7 +17,8 @@ Each finding contains stable ID, category (`standards` or `spec`), severity, act
 - Critical and high actionable findings are always `must-fix`.
 - Medium correctness/spec findings normally block; low findings normally remain advisory and are grouped into the report.
 - Do not repeat style findings enforced by passing tooling.
-- Check contract/plan conformance and complexity drift.
+- Check repository standards and the original request/ticket/spec (including pinned `requirements.json.intake` source excerpts when present), not only contract/plan conformance and complexity drift. A plan that misinterprets the ticket is a spec defect even if every task was implemented. Trace original acceptance IDs through requirements, task validations, and observed code behavior; distinguish source facts/user decisions from agent recommendations.
+- Reuse pinned source evidence rather than restart discovery or interview the user. Report unresolved material choices through decision blockers; workers cannot allocate another question budget or edit the source tracker.
 - For validation-policy version 1, inspect every plan validation's semantic `purpose`, `gate`, and `rationale`; reject mandatory acceptance/repository/migration work presented as advisory or supplemental. Confirm every task retains blocking acceptance evidence.
 - Review the effective policy and pinned exclusions supplied by the assignment. Preserve historical failures as failures and disclose advisory/excluded warnings, but do not recreate a must-fix finding solely because an eligible supplemental command is advisory or explicitly excluded. Exceptions never satisfy genuine acceptance, security, contract, or integration obligations.
 - Reviewers never edit project files.
