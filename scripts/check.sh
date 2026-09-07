@@ -64,5 +64,27 @@ npx --yes skills@1.5.23 add . --list >"$TMP_DIR/skills-list.txt"
 grep -Fq 'end-to-end-development' "$TMP_DIR/skills-list.txt"
 grep -Fq 'fast-end-to-end-development' "$TMP_DIR/skills-list.txt"
 grep -Fq 'simple-code' "$TMP_DIR/skills-list.txt"
+grep -Fq 'idea-to-ticket' "$TMP_DIR/skills-list.txt"
+
+# Validate the idea skill with no sibling skills available.
+cp -R skills/idea-to-ticket "$TMP_DIR/idea-to-ticket"
+PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT/scripts" "$TMP_DIR/idea-to-ticket" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import validate_repository
+
+skill_dir = Path(sys.argv[2])
+validate_repository.ROOT = skill_dir.parent
+errors = []
+validate_repository.validate_skill(skill_dir, errors)
+if errors:
+    raise SystemExit("\n".join(errors))
+print("Validated standalone idea-to-ticket skill.")
+PY
+npx --yes skills@1.5.23 add "$TMP_DIR/idea-to-ticket" --list >"$TMP_DIR/idea-skills-list.txt"
+grep -Fq 'idea-to-ticket' "$TMP_DIR/idea-skills-list.txt"
+! grep -Eq 'end-to-end-development|simple-code' "$TMP_DIR/idea-skills-list.txt"
 
 printf 'All repository checks passed.\n'
