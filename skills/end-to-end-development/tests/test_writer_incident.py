@@ -23,7 +23,7 @@ class WriterIncidentTests(unittest.TestCase):
     write_spec = fixtures.WorkflowEngineTests.write_spec
     initialize = fixtures.WorkflowEngineTests.initialize
 
-    def prepare(self):
+    def prepare(self, *, historical_validation=False):
         timeout = lifecycle.InterruptedBatch(timeout=True)
         engine = self.initialize(timeout, profile='full')
         graph = fixtures.build_graph(engine, InMemorySaver())
@@ -41,11 +41,21 @@ class WriterIncidentTests(unittest.TestCase):
         for agent in agents['agents']:
             agent.update(cleanup_status='complete', backend='herdr')
         engine._save_agents(agents)
+        historical = engine.load_run()
+        historical['next_actions'] = []
+        historical['repositories']['api']['active_writer'] = None
+        engine._save_run(historical)
         second_path = engine._replacement(source)
         second = json.loads(second_path.read_text())
         engine.batch_runner = lifecycle.InterruptedBatch()
         engine._execute_assignments([second_path])
         fixtures.FakeSuccessfulBatch()([source_path], run_dir=self.run_dir, worker_runtime='pi', allow_existing=True)
+        if historical_validation:
+            validation_path = engine.build_assignment(stage='validate', repo_id='api', scope='historical',
+                instructions=['Historical isolated check fixture.'], validation_ids=source['validation_ids'],
+                validation_commands=source['validation_commands'])
+            engine.batch_runner = fixtures.FakeSuccessfulBatch()
+            engine._execute_assignments([validation_path])
         engine._install_actions([second_path])
         run = engine.load_run()
         run.update(status='working', phase='implement', external_resume_generation=1, blockers=[])
@@ -69,7 +79,7 @@ class WriterIncidentTests(unittest.TestCase):
                    'source_sha256': writer_incident.reference(Path(source['output_artifact']))['sha256'],
                    'damaged_sha256': writer_incident.reference(broken_path)['sha256'],
                    'plan_review_sha256': review['review_sha256'],
-                   'repository_state': workflow_tools.repository_state(self.worktree)}
+                   'repository_state': workflow_tools.repository_state(self.worktree), 'worker_identities': {}}
         supervisor = mock.Mock()
         supervisor.close_settled_incident_workers.return_value = {
             'before': {'result': {'agents': []}}, 'workspaces_before': {'result': {'workspaces': []}},
@@ -126,7 +136,7 @@ class WriterIncidentTests(unittest.TestCase):
         self.assertEqual([], recovered['next_actions'])
         self.assertEqual(original_agents, engine.agents_path.read_bytes())
         self.assertEqual(before_tree, workflow_tools.repository_state(self.worktree))
-        for key in ('validation_policy_version', 'delivery_policy_version', 'plan_review', 'limits', 'external_resume_generation'):
+        for key in ('validation_policy_version', 'delivery_policy_version', 'plan_review', 'retry_limits', 'workflow_policy', 'external_resume_generation'):
             self.assertEqual(original.get(key), recovered.get(key))
         self.assertEqual(original['repositories']['api']['baseline'], recovered['repositories']['api']['baseline'])
         expected_refs = dict(original['repositories']['api']['accepted_artifacts'])
@@ -183,6 +193,66 @@ class WriterIncidentTests(unittest.TestCase):
             self.apply(engine, request, supervisor)
         supervisor.close_settled_incident_workers.assert_not_called()
 
+    def test_unrelated_pinned_log_corruption_aborts_before_cleanup(self):
+        engine, _, _, request, supervisor = self.prepare(historical_validation=True)
+        run = engine.load_run(validate=False)
+        artifacts = [json.loads(Path(ref['path']).read_text()) for ref in run['repositories']['api']['accepted_artifacts'].values()]
+        validation = next(a for a in artifacts if a.get('stage') == 'validate')
+        log = Path(validation['validations'][0]['log_path'])
+        log.write_bytes(log.read_bytes() + b'changed prior accepted log\n')
+        before = engine.run_path.read_bytes()
+        with self.assertRaises(artifact_guard.ValidationError):
+            self.apply(engine, request, supervisor)
+        self.assertEqual(before, engine.run_path.read_bytes())
+        supervisor.close_settled_incident_workers.assert_not_called()
+
+    def test_pre_projection_crash_reuses_exact_immutable_intent_with_new_clock_and_cleanup(self):
+        engine, _, _, request, supervisor = self.prepare()
+        before = engine.run_path.read_bytes()
+        with mock.patch.object(engine, '_save_run', side_effect=OSError('simulated pre-projection crash')):
+            with self.assertRaisesRegex(OSError, 'pre-projection'):
+                self.apply(engine, request, supervisor)
+        self.assertEqual(before, engine.run_path.read_bytes())
+        record_path = next((self.run_dir / 'logs' / 'incidents').glob('writer-recovery-*/recovery.json'))
+        intent = record_path.read_bytes()
+        engine.now = lambda: '2026-08-20T12:00:00Z'
+        supervisor.close_settled_incident_workers.return_value = {
+            **supervisor.close_settled_incident_workers.return_value, 'additional_observation': 'a later positive cleanup probe'}
+        self.assertEqual('applied', self.apply(engine, request, supervisor))
+        self.assertEqual(intent, record_path.read_bytes())
+        self.assertEqual(2, supervisor.close_settled_incident_workers.call_count)
+        self.assertEqual('implement', engine.load_run()['phase'])
+
+    def test_retained_one_shot_verifier_is_adopted_after_settlement_without_relaunch(self):
+        engine, graph, config, request, supervisor = self.prepare()
+        self.apply(engine, request, supervisor)
+        verify, batch = self.verifier()
+        def retained(paths, **kwargs):
+            code, manifest = verify(paths, **kwargs)
+            manifest['workers'][0].update(status='timeout', settled=False, timed_out=True, cleanup_status='retained')
+            return 1, manifest
+        engine.batch_runner = retained
+        with mock.patch.object(engine, '_wait_for_crash_survivor', return_value={'settled': False, 'cleanup_status': 'retained'}):
+            graph.invoke(None, config)
+        blocked = engine.load_run()
+        self.assertEqual('blocked', blocked['status'])
+        self.assertEqual(1, len(blocked['next_actions']))
+        verify_id = blocked['next_actions'][0]['action_id']
+        self.assertIn(verify_id, blocked['writer_incident_attempts'])
+        self.assertNotIn(verify_id, blocked['repositories']['api']['accepted_artifacts'])
+        self.assertEqual(1, len(batch.assignments))
+        self.assertTrue(engine.resume_external_blockers())
+        with mock.patch.object(engine, '_wait_for_crash_survivor', return_value={'settled': True, 'cleanup_status': 'complete'}):
+            engine.reconcile()
+        accepted = engine.load_run()
+        self.assertEqual([], accepted['next_actions'])
+        self.assertIn(verify_id, accepted['repositories']['api']['accepted_artifacts'])
+        self.assertEqual(1, len(batch.assignments))
+        engine.batch_runner, finish = self.verifier()
+        graph.invoke({'run_dir': str(self.run_dir)}, config)
+        self.assertEqual('complete', engine.load_run()['status'])
+        self.assertFalse(any(a['stage'] == 'implement' for a in finish.assignments))
+
     def test_cleanup_failure_preserves_invalid_status_and_all_outputs(self):
         engine, _, _, request, supervisor = self.prepare()
         before = engine.run_path.read_bytes()
@@ -196,7 +266,7 @@ class WriterIncidentTests(unittest.TestCase):
     def test_drift_during_cleanup_aborts_the_transition(self):
         engine, _, _, request, supervisor = self.prepare()
         before = engine.run_path.read_bytes()
-        def drift(_):
+        def drift(_, **kwargs):
             (self.worktree / 'feature.txt').write_text('Still writing.\n')
             return {'observations': []}
         supervisor.close_settled_incident_workers.side_effect = drift

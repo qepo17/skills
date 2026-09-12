@@ -10,7 +10,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,13 +40,84 @@ def preserve(path: Path, content: bytes) -> dict[str, str]:
     return reference(path)
 
 
+def session_launch_binding(session: dict[str, Any], assignment_path: Path,
+                           timeout: dict[str, Any]) -> dict[str, str]:
+    """Prove a Pi session started for this assignment before the recorded timeout.
+
+    Only a bounded initial prefix is read. Preserve hashes/identity, not private
+    session transcripts; later append-only session activity cannot change origin.
+    """
+    if (not isinstance(session, dict) or session.get("agent") != "pi"
+            or session.get("kind") != "path" or session.get("source") != "herdr:pi"):
+        raise ValueError("missing original Pi session identity")
+    path = Path(session["value"])
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_uid != os.getuid():
+        raise ValueError("session origin must be an owned regular local file")
+    assignment = json.loads(assignment_path.read_text())
+    prefix = bytearray()
+    header = None
+    with path.open("rb") as handle:
+        while len(prefix) < 1024 * 1024:
+            line = handle.readline(1024 * 1024 + 1 - len(prefix))
+            if not line or not line.endswith(b"\n"):
+                break
+            prefix.extend(line)
+            entry = json.loads(line)
+            if entry.get("type") == "session":
+                header = entry
+            message = entry.get("message", {})
+            if entry.get("type") != "message" or message.get("role") != "user":
+                continue
+            content = message.get("content", [])
+            text = " ".join(part.get("text", "") for part in content if isinstance(part, dict)) if isinstance(content, list) else str(content)
+            if not header or header.get("cwd") != assignment["cwd"] or str(assignment_path) not in text:
+                raise ValueError("session origin does not bind the original task assignment")
+            start = datetime.fromisoformat(header["timestamp"].replace("Z", "+00:00"))
+            earliest = datetime.fromisoformat(timeout["started_at"].replace("Z", "+00:00"))
+            latest = datetime.fromisoformat(timeout["ended_at"].replace("Z", "+00:00"))
+            if not earliest <= start <= latest:
+                raise ValueError("session was not started within the original timed-out worker lifetime")
+            return {"session_path": str(path), "session_id": header["id"], "started_at": header["timestamp"],
+                    "cwd": header["cwd"], "assignment_path": str(assignment_path),
+                    "prefix_sha256": hashlib.sha256(prefix).hexdigest()}
+    raise ValueError("original session launch cannot be proven from its bounded prefix")
+
+
+def validate_history(run: dict[str, Any]) -> list[dict[str, str]]:
+    """Check existing bindings, then pin their bytes; never bless a changed log."""
+    references = list(run.get("accepted_artifacts", {}).values())
+    references.extend(ref for repo in run["repositories"].values() for ref in repo["accepted_artifacts"].values())
+    evidence = {ref["path"]: ref for ref in references}
+    previous = artifact_guard.CURRENT_ARTIFACT_PATH
+    try:
+        for ref in references:
+            path = Path(artifact_guard.hashed_file_reference(ref, "$.incident.history"))
+            if path.suffix != ".json":
+                continue
+            artifact = json.loads(path.read_text())
+            artifact_guard.CURRENT_ARTIFACT_PATH = path
+            artifact_guard.VALIDATORS[artifact["artifact_kind"]](artifact)
+            if artifact.get("assignment_path"):
+                assignment_path = Path(artifact["assignment_path"])
+                assignment = json.loads(assignment_path.read_text())
+                artifact_guard.validate_assignment(assignment)
+                evidence[str(assignment_path)] = reference(assignment_path)
+                for input_ref in assignment["input_artifacts"]:
+                    evidence[input_ref["path"]] = input_ref
+            for file in workflow_tools.artifact_evidence_paths(artifact):
+                evidence[str(file)] = reference(file)
+    finally:
+        artifact_guard.CURRENT_ARTIFACT_PATH = previous
+    return [evidence[key] for key in sorted(evidence)]
+
+
 def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
             text: str, context: str | None = None, supervisor: Any = None) -> str:
     """Called under the CLI execution lock, before opening an invalid checkpoint."""
     if text.strip().lower() not in {"yes", "approved", "authorized"} or digest(request) != request_sha256:
         raise ValueError("explicit authorization of the exact incident request is required")
     required = {"run_id", "repo_id", "source_action_id", "damaged_action_id", "run_sha256",
-                "source_sha256", "damaged_sha256", "plan_review_sha256", "repository_state"}
+                "source_sha256", "damaged_sha256", "plan_review_sha256", "repository_state", "worker_identities"}
     if set(request) != required:
         raise ValueError("incident request must contain exactly the documented identity and hash fields")
     run_bytes = engine.run_path.read_bytes()
@@ -62,6 +135,7 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
             or run.get("validation_policy_version") != 1 or run.get("delivery_policy_version") != 1
             or run.get("external_resume_generation", 0) < 1 or run.get("writer_incident_recoveries")
             or (run.get("worker_execution") or {}).get("backend") != "herdr"
+            or (run.get("worker_execution") or {}).get("runtime") != "pi"
             or (run.get("plan_review") or {}).get("status") != "approved"
             or run["plan_review"]["review_sha256"] != request["plan_review_sha256"]
             or any(a["action_id"] != damaged_id for a in run["next_actions"])):
@@ -75,6 +149,7 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
     projected = copy.deepcopy(run)
     del projected["repositories"][repo_id]["accepted_artifacts"][damaged_id]
     artifact_guard.validate_run(projected)
+    historical_evidence = validate_history(projected)
     assignments = {}
     for action_id in (source_id, damaged_id):
         slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", action_id).strip("-").lower()
@@ -112,22 +187,32 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
             or {v["id"] for v in result["validations"]} != set(source["validation_ids"])
             or any(v.get("result") != "pass" for v in result["validations"])):
         raise ValueError("requires a late complete candidate and an infrastructure-blocked, unexecuted replacement")
-    evidence = []
-    timed_out = False
+    evidence = historical_evidence
+    timeouts = []
     for path in sorted((engine.run_dir / "supervisor").glob("manifest-*.json")):
         value = json.loads(path.read_text())
         matching = [w for w in value.get("workers", []) if w.get("action_id") in assignments]
         if matching:
             evidence.append(reference(path))
-            timed_out |= any(w.get("action_id") == source_id and w.get("timed_out") is True
-                             and w.get("settled") is False and w.get("cleanup_status") == "retained" for w in matching)
-    if not timed_out:
+            timeouts.extend(w for w in matching if w.get("action_id") == source_id and w.get("timed_out") is True
+                            and w.get("settled") is False and w.get("cleanup_status") == "retained")
+    if not timeouts:
         raise ValueError("missing immutable proof of the original retained timed-out handle")
     agents = engine.load_agents()
-    expected = {a["name"]: repo["worktree"] for a in agents["agents"] if a.get("repo_id") == repo_id}
-    if (not expected or any(a.get("backend") != "herdr" or a.get("cleanup_status") != "complete"
+    known_names = {a["name"] for a in agents["agents"] if a.get("repo_id") == repo_id}
+    if (not known_names or any(a.get("backend") != "herdr" or a.get("cleanup_status") != "complete"
             for a in agents["agents"] if a.get("repo_id") == repo_id)):
         raise ValueError("settle all recorded handles first; this command only repairs proven Herdr identity loss")
+    expected = artifact_guard.obj(request["worker_identities"], "$.worker_identities")
+    bindings = {}
+    for name, identity in expected.items():
+        timeout = next((w for w in timeouts if w.get("agent_name") == name), None)
+        if name not in known_names or timeout is None or identity.get("assignment_path") != str(source_path):
+            raise ValueError("only the proven original timed-out task session can be reclaimed")
+        binding = session_launch_binding(identity.get("agent_session"), source_path, timeout)
+        if digest(binding) != identity.get("launch_binding_sha256"):
+            raise ValueError("session origin differs from the reviewed request")
+        bindings[name] = binding
     for path in sorted(workflow_tools.artifact_evidence_paths(result) | workflow_tools.artifact_evidence_paths(broken)):
         if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(engine.run_dir):
             raise ValueError("incident evidence must remain inside this run")
@@ -139,6 +224,9 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
     directory = engine.run_dir / "logs" / "incidents" / f"writer-recovery-{request_sha256[:16]}"
     snapshots = {"run": preserve(directory / "run-before.json", run_bytes),
                  "agents": preserve(directory / "agents-before.json", engine.agents_path.read_bytes())}
+    for name, binding in bindings.items():
+        evidence.append(preserve(directory / f"session-origin-{hashlib.sha256(name.encode()).hexdigest()[:16]}.json",
+                                 (json.dumps(binding, indent=2, sort_keys=True) + "\n").encode()))
     for action_id in assignments:
         path = engine.run_dir / "supervisor" / worker_supervisor.WorkerSupervisor.record_name(action_id)
         if path.exists():
@@ -149,7 +237,7 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
         supervisor = worker_supervisor.WorkerSupervisor(engine.run_dir,
             worker_supervisor.ExecutionContext("herdr", "pi", "authorized-writer-incident", {}))
     try:
-        cleanup = supervisor.close_settled_incident_workers(expected)
+        cleanup = supervisor.close_settled_incident_workers(expected, cwd=repo["worktree"], known_names=known_names)
     except RuntimeError as error:
         raise ValueError(str(error)) from error
     cleanup_bytes = (json.dumps(cleanup, indent=2, sort_keys=True) + "\n").encode()
@@ -168,7 +256,19 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
         "cleanup": cleanup_ref, "previous_plan_review": run["plan_review"], "repository_states": {repo_id: state},
         "changed_files": sorted(set(result["changed_files"]) | set(broken["changed_files"]))}
     artifact_guard.validate_writer_incident_recovery(record, "$.writer_incident")
-    record_ref = preserve(directory / "recovery.json", (json.dumps(record, indent=2, sort_keys=True) + "\n").encode())
+    record_path = directory / "recovery.json"
+    if record_path.exists():
+        existing = json.loads(record_path.read_text())
+        artifact_guard.validate_writer_incident_recovery(existing, "$.writer_incident.intent")
+        def stable(value: dict[str, Any]) -> dict[str, Any]:
+            value = copy.deepcopy(value)
+            value.pop("cleanup")  # Both immutable proofs already validated; cleanup was freshly re-observed.
+            value["authorization"].pop("recorded_at")
+            return value
+        if stable(existing) != stable(record):
+            raise ValueError("existing recovery intent differs from the unchanged authorized request")
+        record = existing
+    record_ref = preserve(record_path, (json.dumps(record, indent=2, sort_keys=True) + "\n").encode())
     projected.setdefault("writer_incident_recoveries", {})[damaged_id] = record_ref
     projected["status"], projected["next_actions"], projected["blockers"] = "working", [], []
     projected["repositories"][repo_id]["active_writer"] = None

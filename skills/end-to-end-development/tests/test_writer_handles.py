@@ -24,7 +24,7 @@ class WriterHandleTests(unittest.TestCase):
             if command[1:3] == ['agent', 'list']:
                 return {'result': {'agents': [] if closed else [agent]}}
             if command[1:3] == ['workspace', 'list']:
-                return {'result': {'workspaces': [] if closed else [{'label': 'test-worker', 'workspace_id': 'w-original'}]}}
+                return {'result': {'workspaces': [] if closed else [{'label': 'test-worker', 'workspace_id': 'w-original', 'pane_count': 1, 'tab_count': 1}]}}
             if command[1:3] == ['agent', 'get']:
                 return {'result': {'agent': dict(agent)}}
             raise AssertionError(command)
@@ -50,21 +50,24 @@ class WriterHandleTests(unittest.TestCase):
         query, cleanup = self.backend(self.identity())
         with mock.patch.object(supervisor, '_checked_json', side_effect=query), \
              mock.patch.object(supervisor, '_cleanup', side_effect=cleanup) as close:
-            proof = supervisor.close_settled_incident_workers({'test-worker': str(self.root)})
+            proof = supervisor.close_settled_incident_workers({'test-worker': self.identity()},
+                        cwd=str(self.root), known_names={'test-worker'})
         self.assertEqual([], proof['after']['result']['agents'])
         close.assert_called_once()
         self.assertEqual(before, record.read_bytes())
 
     def test_working_unknown_or_mismatched_handles_never_close(self):
         for changes in ({'agent_status': 'working'}, {'name': 'someone-else'},
-                        {'workspace_id': 'w-other'}, {'pane_id': 'w-other:p1'}, {'cwd': '/unrelated'}):
+                        {'workspace_id': 'w-other'}, {'pane_id': 'w-other:p1'}, {'cwd': '/unrelated'},
+                        {'agent_session': None}, {'agent_session': {'value': 'consistently-substituted-session'}}):
             with self.subTest(changes=changes):
                 supervisor = self.supervisor()
                 query, _ = self.backend({**self.identity(), **changes})
                 with mock.patch.object(supervisor, '_checked_json', side_effect=query), \
                      mock.patch.object(supervisor, '_cleanup') as close:
                     with self.assertRaisesRegex(RuntimeError, 'mismatched'):
-                        supervisor.close_settled_incident_workers({'test-worker': str(self.root)})
+                        supervisor.close_settled_incident_workers({'test-worker': self.identity()},
+                            cwd=str(self.root), known_names={'test-worker'})
                     close.assert_not_called()
 
     def test_identity_change_between_preflight_and_close_aborts(self):
@@ -78,8 +81,33 @@ class WriterHandleTests(unittest.TestCase):
         with mock.patch.object(supervisor, '_checked_json', side_effect=changed), \
              mock.patch.object(supervisor, '_cleanup') as close:
             with self.assertRaisesRegex(RuntimeError, 'identity changed'):
-                supervisor.close_settled_incident_workers({'test-worker': str(self.root)})
+                supervisor.close_settled_incident_workers({'test-worker': self.identity()},
+                    cwd=str(self.root), known_names={'test-worker'})
             close.assert_not_called()
+
+    def test_shared_workspace_or_unknown_pane_never_closes(self):
+        for shared in ('agent', 'pane', 'tab', 'unknown-count'):
+            with self.subTest(shared=shared):
+                supervisor = self.supervisor()
+                query, _ = self.backend(self.identity())
+                def response(command):
+                    result = query(command)
+                    if shared == 'agent' and command[1:3] == ['agent', 'list']:
+                        result['result']['agents'].append({'name': 'unrelated', 'cwd': '/unrelated',
+                            'workspace_id': 'w-original', 'pane_id': 'w-original:p2', 'agent_status': 'working'})
+                    if command[1:3] == ['workspace', 'list']:
+                        workspace = result['result']['workspaces'][0]
+                        if shared in {'pane', 'tab'}:
+                            workspace[shared + '_count'] = 2
+                        elif shared == 'unknown-count':
+                            workspace.pop('pane_count')
+                    return result
+                with mock.patch.object(supervisor, '_checked_json', side_effect=response), \
+                     mock.patch.object(supervisor, '_cleanup') as close:
+                    with self.assertRaisesRegex(RuntimeError, 'shared|exclusive'):
+                        supervisor.close_settled_incident_workers({'test-worker': self.identity()},
+                            cwd=str(self.root), known_names={'test-worker'})
+                    close.assert_not_called()
 
     def test_late_herdr_done_probe_cleans_only_matching_retained_pane(self):
         for pane, closes in [('w-original:p1', True), ('w-other:p1', False)]:

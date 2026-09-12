@@ -1039,11 +1039,13 @@ class WorkerSupervisor:
         handle = WorkerHandle(backend, handle_id, dict(record.get("details", {})))
         return self._run_one(request, handle, record)
 
-    def close_settled_incident_workers(self, expected: dict[str, str]) -> dict[str, Any]:
-        """Close only live, exactly identified Herdr handles; never trust reused records.
+    def close_settled_incident_workers(self, expected: dict[str, dict[str, Any]], *,
+                                      cwd: str, known_names: set[str]) -> dict[str, Any]:
+        """Close only request-pinned original sessions in exclusively owned workspaces.
 
-        This is restricted to the explicitly authorized incident-recovery command.
-        Historical worker records remain untouched, including incorrect old projections.
+        The guarded caller proves session origin against the original assignment and
+        timeout manifest. Live agreement alone is not original identity evidence.
+        Historical (possibly misleading) lifecycle records remain untouched.
         """
         if self.context.backend != "herdr":
             raise RuntimeError("writer-incident recovery currently requires Herdr identity evidence")
@@ -1053,17 +1055,27 @@ class WorkerSupervisor:
             if not isinstance(agents, list) or any(not isinstance(a, dict) for a in agents):
                 raise RuntimeError("unrecognized Herdr agent listing; cleanup is unproven")
             return value, agents
+        def validate(agent: dict[str, Any], agents: list[dict[str, Any]], workspaces: Any) -> None:
+            name = agent.get("name")
+            identities = ("workspace_id", "pane_id", "agent_session")
+            entries = workspaces.get("result", {}).get("workspaces")
+            if not isinstance(entries, list):
+                raise RuntimeError("unrecognized Herdr workspace listing")
+            workspace = next((w for w in entries if w.get("workspace_id") == agent.get("workspace_id")), None)
+            if (name not in expected or name not in known_names or agent.get("cwd") != cwd
+                    or agent.get("agent_status") != "done"
+                    or any(not expected[name].get(k) or agent.get(k) != expected[name][k] for k in identities)
+                    or not workspace or workspace.get("label") != name
+                    or not agent["pane_id"].startswith(agent["workspace_id"] + ":")):
+                raise RuntimeError("unknown, working, or mismatched incident writer")
+            occupants = [a for a in agents if a.get("workspace_id") == agent["workspace_id"]]
+            if workspace.get("pane_count") != 1 or workspace.get("tab_count") != 1 or occupants != [agent]:
+                raise RuntimeError("incident workspace is shared or its exclusive ownership is unproven")
         before, agents = listing()
-        targets = [a for a in agents if a.get("cwd") in expected.values() or a.get("name") in expected]
+        targets = [a for a in agents if a.get("cwd") == cwd or a.get("name") in known_names]
         workspaces = self._checked_json([self.herdr_binary, "workspace", "list"])
         for agent in targets:
-            name = agent.get("name")
-            workspace = _find_labeled_workspace(workspaces, name) if name else None
-            if (name not in expected or agent.get("cwd") != expected[name]
-                    or agent.get("agent_status") != "done" or not agent.get("pane_id")
-                    or not workspace or workspace[0] != agent.get("workspace_id")
-                    or not agent["pane_id"].startswith(workspace[0] + ":")):
-                raise RuntimeError("unknown, working, or mismatched incident writer; no handles were closed")
+            validate(agent, agents, workspaces)
         observations = []
         for agent in targets:
             value = self._checked_json([self.herdr_binary, "agent", "get", agent["name"]])
@@ -1071,15 +1083,19 @@ class WorkerSupervisor:
             if not isinstance(current, dict) or any(current.get(k) != agent.get(k) for k in
                     ("name", "cwd", "workspace_id", "pane_id", "agent_status", "agent_session")):
                 raise RuntimeError("incident writer identity changed before cleanup")
+            _, latest_agents = listing()
+            latest_workspaces = self._checked_json([self.herdr_binary, "workspace", "list"])
+            validate(current, latest_agents, latest_workspaces)
             handle = WorkerHandle("herdr", agent["name"], {"workspace_id": agent["workspace_id"], "pane_id": agent["pane_id"]})
             status, error = self._cleanup(handle, settled=True)
-            observations.append({"identity": value, "cleanup_status": status, "cleanup_error": error})
+            observations.append({"identity": value, "workspace_proof": latest_workspaces,
+                                 "cleanup_status": status, "cleanup_error": error})
             if status != "complete":
                 raise RuntimeError("incident writer cleanup failed; recovery remains unapplied")
         after, remaining = listing()
         remaining_workspaces = self._checked_json([self.herdr_binary, "workspace", "list"])
-        if (any(a.get("cwd") in expected.values() or a.get("name") in expected for a in remaining)
-                or any(_find_labeled_workspace(remaining_workspaces, name) for name in expected)):
+        if (any(a.get("cwd") == cwd or a.get("name") in known_names for a in remaining)
+                or any(_find_labeled_workspace(remaining_workspaces, name) for name in known_names)):
             raise RuntimeError("incident handles remain after cleanup")
         return {"before": before, "workspaces_before": workspaces, "observations": observations,
                 "after": after, "workspaces_after": remaining_workspaces}

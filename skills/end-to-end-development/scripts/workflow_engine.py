@@ -305,6 +305,7 @@ class WorkflowEngine:
         kind: str = "code",
         repo_id: str | None = None,
         gate: dict[str, Any] | None = None,
+        preserve_actions: bool = False,
     ) -> None:
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         if not evidence_path.exists():
@@ -321,10 +322,12 @@ class WorkflowEngine:
         with RunLock(self.run_dir):
             run = self.load_run()
             run["status"] = "blocked"
-            run["next_actions"] = []
+            if not preserve_actions:
+                run["next_actions"] = []
             run["blockers"] = [blocker]
             for key, repository in run["repositories"].items():
-                repository["active_writer"] = None
+                if not preserve_actions:
+                    repository["active_writer"] = None
                 if repo_id is None or repo_id == key:
                     repository["status"] = "blocked"
             self._save_run(run)
@@ -999,9 +1002,11 @@ class WorkflowEngine:
                 self._save_run(current)
             result = self._execute_assignments([assignment_path])
             if result.rejected:
-                self._block(summary=f"External-repair verification evidence rejected for {verify_id}.",
-                            evidence_path=result.manifest_path, kind="decision", repo_id=repo_id,
-                            required_action="Inspect the new immutable verification evidence; no automatic repair or source replay is authorized.")
+                retained = any(worker.get("cleanup_status", "complete") != "complete" for _, worker in result.rejected)
+                self._block(summary=f"Packet verification evidence is not yet accepted for {verify_id}.",
+                            evidence_path=result.manifest_path, kind="infrastructure" if retained else "decision", repo_id=repo_id,
+                            preserve_actions=retained,
+                            required_action="Adopt and settle the retained verifier, or inspect rejected evidence. Never relaunch the one-shot verifier or replay source work.")
                 return "blocked"
             return "implement"
         return None
@@ -1071,13 +1076,19 @@ class WorkflowEngine:
             worker = self._wait_for_crash_survivor(
                 resolved_assignment_path, assignment
             )
+            record_path = self.run_dir / "supervisor" / workflow_tools.worker_supervisor.WorkerSupervisor.record_name(assignment["action_id"])
+            unfinished_history = any(agent["output_artifact"] == assignment["output_artifact"]
+                                     and agent.get("cleanup_status", "complete") != "complete"
+                                     for agent in self.load_agents()["agents"])
+            unknown = worker is None and (record_path.exists() or preflight.get("worker_execution") or unfinished_history)
+            if unknown or (worker is not None and (not worker.get("settled") or worker.get("cleanup_status", "complete") != "complete")):
+                self._block(summary=f"Recorded worker {action['action_id']} is not settled and cleaned.",
+                            evidence_path=resolved_assignment_path, kind="infrastructure", repo_id=assignment.get("repo_id"),
+                            preserve_actions=True,
+                            required_action="Preserve the original handle and output; reconcile its settlement before accepting evidence or launching another writer.")
+                return preflight["phase"]
             if worker is not None:
                 recovered_workers[assignment["action_id"]] = worker
-                if not worker.get("settled") or worker.get("cleanup_status", "complete") != "complete":
-                    self._block(summary=f"Recorded worker {action['action_id']} is not settled and cleaned.",
-                                evidence_path=resolved_assignment_path, kind="infrastructure", repo_id=assignment.get("repo_id"),
-                                required_action="Preserve the original handle and output; reconcile its settlement before accepting evidence or launching another writer.")
-                    return preflight["phase"]
 
         with RunLock(self.run_dir):
             run = self.load_run()
@@ -1145,7 +1156,11 @@ class WorkflowEngine:
                      if item["output_artifact"] == assignment["output_artifact"]),
                     workflow_tools._agent_name(assignment),
                 )
-                if assignment.get("execution_mode") != "command" and not any(item["name"] == agent_name for item in agents["agents"]):
+                existing_agent = next((item for item in agents["agents"] if item["name"] == agent_name), None)
+                if existing_agent is not None and worker.get("settled") and worker.get("cleanup_status") == "complete":
+                    existing_agent.update(status="closed", cleanup_status="complete", cleanup_error=None,
+                                          ended_at=worker.get("ended_at") or self.now())
+                if assignment.get("execution_mode") != "command" and existing_agent is None:
                     recovered_at = self.now()
                     cleanup_status = worker.get("cleanup_status", "complete")
                     agents["agents"].append(
@@ -2001,10 +2016,14 @@ class WorkflowEngine:
                         agents["agents"].append(agent_record)
                     else:
                         existing_agent.update(agent_record)
+                worker = dict(worker, cleanup_status=cleanup_status)
+                if cleanup_status != "complete" or worker.get("settled") is False:
+                    worker.update(status="rejected", reason="Worker settlement/cleanup is unproven; preserve its action and output for adoption.")
                 repo_id = assignment.get("repo_id")
                 if repo_id:
                     repository = run["repositories"][repo_id]
-                    repository["active_writer"] = None
+                    if cleanup_status == "complete":
+                        repository["active_writer"] = None
                     repository["status"] = (
                         "pending" if worker.get("status") == "accepted" else "failed"
                     )
@@ -2022,7 +2041,8 @@ class WorkflowEngine:
                         accepted.append((assignment, artifact))
                 if worker.get("status") != "accepted":
                     rejected.append((assignment, worker))
-            run["next_actions"] = []
+            retained = {a["action_id"] for a, worker in rejected if worker.get("cleanup_status") != "complete"}
+            run["next_actions"] = [action for action in run["next_actions"] if action["action_id"] in retained]
             self._save_agents(agents)
             self._save_run(run)
 
@@ -2170,7 +2190,7 @@ class WorkflowEngine:
                         summary=f"Worker {assignment['action_id']} has an unclosed handle; replacement is forbidden.",
                         evidence_path=result.manifest_path,
                         required_action="Let the recorded worker settle and resume through reconciliation. Do not start another writer or discard its handle.",
-                        kind="infrastructure", repo_id=assignment.get("repo_id"),
+                        kind="infrastructure", repo_id=assignment.get("repo_id"), preserve_actions=True,
                     )
                     return tuple(accepted)
                 is_repair = assignment.get("execution_mode") == "artifact-repair"

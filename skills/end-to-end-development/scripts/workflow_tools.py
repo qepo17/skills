@@ -736,7 +736,7 @@ def run_assignment_batch(
         }
         if outcome["timed_out"]:
             result["status"] = "timeout"
-        elif outcome["settled"]:
+        elif outcome["settled"] and outcome["cleanup_status"] == "complete":
             output = Path(assignment["output_artifact"])
             try:
                 raw = output.read_bytes()
@@ -768,6 +768,8 @@ def run_assignment_batch(
             ) as error:
                 result["reason"] = str(error)
                 result.update(artifact_guard.rejection_details(error))
+        elif outcome["settled"]:
+            result["reason"] = "Worker settled but cleanup is unproven; evidence remains unaccepted."
         entries.append(result)
         with batch_log.open("a", encoding="utf-8") as handle:
             handle.write(

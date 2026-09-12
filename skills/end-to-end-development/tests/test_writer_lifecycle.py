@@ -108,6 +108,65 @@ class WriterLifecycleTests(unittest.TestCase):
         self.assertEqual(before, Path(original['output_artifact']).read_bytes())
         self.assertEqual(1, batch.writes)
 
+    def test_settled_but_uncleaned_source_is_not_accepted_or_replaced(self):
+        batch = fixtures.FakeSuccessfulBatch()
+        def worker(paths, **kwargs):
+            code, manifest = batch(paths, **kwargs)
+            if json.loads(paths[0].read_text())['stage'] == 'implement':
+                manifest['workers'][0].update(settled=True, cleanup_status='failed', cleanup_error='close failed')
+            return code, manifest
+        engine = self.start_blocked(worker)
+        run = engine.load_run()
+        source = next(a for a in batch.assignments if a['stage'] == 'implement')
+        self.assertEqual('blocked', run['status'])
+        self.assertEqual([source['action_id']], [a['action_id'] for a in run['next_actions']])
+        self.assertNotIn(source['action_id'], run['repositories']['api']['accepted_artifacts'])
+        self.assertEqual(['plan', 'implement'], [a['stage'] for a in batch.assignments])
+
+    def test_batch_seam_does_not_normalize_a_settled_output_before_cleanup(self):
+        batch = InterruptedBatch(timeout=True)
+        engine = self.start_blocked(batch)
+        source = next(a for a in batch.assignments if a['stage'] == 'implement')
+        path = next(p for p in (self.run_dir / 'assignments').glob('*.json')
+                    if json.loads(p.read_text())['action_id'] == source['action_id'])
+        fixtures.FakeSuccessfulBatch()([path], run_dir=self.run_dir, worker_runtime='pi', allow_existing=True)
+        output = Path(source['output_artifact'])
+        before = output.read_bytes()
+        outcome = {'action_id': source['action_id'], 'agent_name': 'fixture', 'assignment_path': str(path),
+                   'backend': 'direct', 'handle_id': 'fixture', 'settled': True, 'timed_out': False,
+                   'reason': 'cleanup failed', 'cleanup_status': 'failed', 'cleanup_error': 'close failed',
+                   'started_at': self.now(), 'ended_at': self.now()}
+        with mock.patch.object(worker_supervisor.WorkerSupervisor, 'run_batch', return_value=[outcome]), \
+             mock.patch.object(fixtures.workflow_tools, 'normalize_worker_artifact') as normalize:
+            code, manifest = fixtures.workflow_tools.run_assignment_batch([path], run_dir=self.run_dir,
+                worker_runtime='pi', worker_backend='direct', allow_existing=True)
+            normalize.assert_not_called()
+        self.assertEqual(1, code)
+        self.assertEqual('rejected', manifest['workers'][0]['status'])
+        self.assertEqual(before, output.read_bytes())
+
+    def test_unknown_starting_record_never_becomes_presumed_cleanup(self):
+        batch = InterruptedBatch(timeout=True)
+        engine = self.start_blocked(batch)
+        source = next(a for a in batch.assignments if a['stage'] == 'implement')
+        path = next(p for p in (self.run_dir / 'assignments').glob('*.json')
+                    if json.loads(p.read_text())['action_id'] == source['action_id'])
+        fixtures.FakeSuccessfulBatch()([path], run_dir=self.run_dir, worker_runtime='pi', allow_existing=True)
+        output = Path(source['output_artifact'])
+        before = output.read_bytes()
+        record = self.run_dir / 'supervisor' / worker_supervisor.WorkerSupervisor.record_name(source['action_id'])
+        record.write_text(json.dumps({'action_id': source['action_id'], 'status': 'starting',
+                                     'cleanup_status': 'pending', 'handle_id': None}))
+        self.assertTrue(engine.resume_external_blockers())
+        with mock.patch.object(engine, '_wait_for_crash_survivor', return_value=None), \
+             mock.patch('workflow_tools.retry_worker_cleanups', return_value=[]):
+            engine.reconcile()
+        run = engine.load_run()
+        self.assertEqual('blocked', run['status'])
+        self.assertEqual([source['action_id']], [a['action_id'] for a in run['next_actions']])
+        self.assertNotIn(source['action_id'], run['repositories']['api']['accepted_artifacts'])
+        self.assertEqual(before, output.read_bytes())
+
     def test_existing_supervisor_handle_is_adopted_not_overwritten(self):
         supervisor = worker_supervisor.WorkerSupervisor(
             self.run_dir, worker_supervisor.ExecutionContext('herdr', 'pi', 'test', {}))
