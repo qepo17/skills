@@ -425,6 +425,8 @@ class WorkerSupervisor:
             "schema_version": 1,
             "action_id": request.action_id,
             "agent_name": request.agent_name,
+            "cwd": str(request.cwd.resolve()),
+            "assignment_path": str(request.assignment_path.resolve()),
             "backend": self.context.backend,
             "runtime": request.runtime,
             "model": DEFAULT_WORKER_MODEL,
@@ -827,6 +829,15 @@ class WorkerSupervisor:
                 late_settled = bool(status.get("finished_at")) and isinstance(
                     status.get("exit_code"), int
                 )
+                if not late_settled and record.get("backend") == "herdr":
+                    try:
+                        value = self._checked_json([self.herdr_binary, "agent", "get", record["handle_id"]])
+                        late_settled = (
+                            _find_string(value, {"agent_status"}) == "done"
+                            and _find_string(value, {"pane_id"}) == record.get("details", {}).get("pane_id")
+                        )
+                    except (KeyError, OSError, RuntimeError, subprocess.TimeoutExpired):
+                        pass
             if (
                 record.get("backend") != self.context.backend
                 or (
@@ -1028,6 +1039,51 @@ class WorkerSupervisor:
         handle = WorkerHandle(backend, handle_id, dict(record.get("details", {})))
         return self._run_one(request, handle, record)
 
+    def close_settled_incident_workers(self, expected: dict[str, str]) -> dict[str, Any]:
+        """Close only live, exactly identified Herdr handles; never trust reused records.
+
+        This is restricted to the explicitly authorized incident-recovery command.
+        Historical worker records remain untouched, including incorrect old projections.
+        """
+        if self.context.backend != "herdr":
+            raise RuntimeError("writer-incident recovery currently requires Herdr identity evidence")
+        def listing() -> tuple[Any, list[dict[str, Any]]]:
+            value = self._checked_json([self.herdr_binary, "agent", "list"])
+            agents = value.get("result", {}).get("agents")
+            if not isinstance(agents, list) or any(not isinstance(a, dict) for a in agents):
+                raise RuntimeError("unrecognized Herdr agent listing; cleanup is unproven")
+            return value, agents
+        before, agents = listing()
+        targets = [a for a in agents if a.get("cwd") in expected.values() or a.get("name") in expected]
+        workspaces = self._checked_json([self.herdr_binary, "workspace", "list"])
+        for agent in targets:
+            name = agent.get("name")
+            workspace = _find_labeled_workspace(workspaces, name) if name else None
+            if (name not in expected or agent.get("cwd") != expected[name]
+                    or agent.get("agent_status") != "done" or not agent.get("pane_id")
+                    or not workspace or workspace[0] != agent.get("workspace_id")
+                    or not agent["pane_id"].startswith(workspace[0] + ":")):
+                raise RuntimeError("unknown, working, or mismatched incident writer; no handles were closed")
+        observations = []
+        for agent in targets:
+            value = self._checked_json([self.herdr_binary, "agent", "get", agent["name"]])
+            current = value.get("result", {}).get("agent")
+            if not isinstance(current, dict) or any(current.get(k) != agent.get(k) for k in
+                    ("name", "cwd", "workspace_id", "pane_id", "agent_status", "agent_session")):
+                raise RuntimeError("incident writer identity changed before cleanup")
+            handle = WorkerHandle("herdr", agent["name"], {"workspace_id": agent["workspace_id"], "pane_id": agent["pane_id"]})
+            status, error = self._cleanup(handle, settled=True)
+            observations.append({"identity": value, "cleanup_status": status, "cleanup_error": error})
+            if status != "complete":
+                raise RuntimeError("incident writer cleanup failed; recovery remains unapplied")
+        after, remaining = listing()
+        remaining_workspaces = self._checked_json([self.herdr_binary, "workspace", "list"])
+        if (any(a.get("cwd") in expected.values() or a.get("name") in expected for a in remaining)
+                or any(_find_labeled_workspace(remaining_workspaces, name) for name in expected)):
+            raise RuntimeError("incident handles remain after cleanup")
+        return {"before": before, "workspaces_before": workspaces, "observations": observations,
+                "after": after, "workspaces_after": remaining_workspaces}
+
     def run_batch(self, requests: list[WorkerRequest]) -> list[dict[str, Any]]:
         if not requests:
             return []
@@ -1035,6 +1091,12 @@ class WorkerSupervisor:
         outcomes: list[dict[str, Any]] = []
         for request in requests:
             paths = self._worker_paths(request)
+            if paths["record"].exists():
+                recovered = self.recover(request)
+                if recovered is None:
+                    raise RuntimeError("recorded worker cannot be recovered; refusing to overwrite its handle")
+                outcomes.append(recovered)
+                continue
             record = self._starting_record(request, paths)
             record["record_path"] = str(paths["record"])
             self._atomic_write(paths["record"], record)

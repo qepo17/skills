@@ -233,7 +233,8 @@ def normalize_worker_artifact(
             if repository_state(Path(repository["worktree"])) != expected:
                 raise artifact_guard.ValidationError("artifact-only repair changed pinned repository/Git state")
     if assignment.get("execution_mode") == "packet-verification":
-        recovery = load_json(Path(assignment["external_repair"]["path"]))
+        family = "writer_incident" if "writer_incident" in assignment else "external_repair"
+        recovery = load_json(Path(assignment[family]["path"]))
         for repository in assignment["repositories"]:
             if repository_state(Path(repository["worktree"])) != recovery["repository_states"][repository["repo_id"]]:
                 raise artifact_guard.ValidationError("packet verification changed authorized repository/Git state")
@@ -632,6 +633,11 @@ def run_assignment_batch(
         if run.get("run_id") not in run_ids:
             raise ValueError("assignment run_id does not match the supplied run directory")
         artifact_guard.validate_run(run)
+        references = list(run.get("accepted_artifacts", {}).values())
+        references.extend(ref for repo in run["repositories"].values() for ref in repo["accepted_artifacts"].values())
+        if any(Path(assignment["output_artifact"]).resolve() == Path(ref["path"]).resolve()
+               for _, assignment in loaded for ref in references):
+            raise ValueError("accepted output paths are immutable, including with allow_existing")
         _enforce_user_plan_approval(run, loaded)
     elif any(
         assignment.get("project_file_access") == "write"

@@ -913,13 +913,16 @@ class WorkflowEngine:
         return "applied"
 
     def _verify_external_repairs(self, run: dict[str, Any]) -> str | None:
-        for action_id, reference in run.get("external_repair_recoveries", {}).items():
+        recoveries = [(family, action_id, reference)
+                      for family in ("external_repair", "writer_incident")
+                      for action_id, reference in run.get(f"{family}_recoveries", {}).items()]
+        for family, action_id, reference in recoveries:
             record = _load_json(Path(reference["path"]))
             repo_id = record["request"]["repo_id"]
             # A renewed plan cannot use old recovery authority or packet evidence.
             if record["previous_plan_review"] != run.get("plan_review"):
                 continue
-            scope = f"external-repair-{hashlib.sha256(action_id.encode()).hexdigest()[:16]}"
+            scope = f"{family.replace('_', '-')}-{hashlib.sha256(action_id.encode()).hexdigest()[:16]}"
             verify_id = f"implement:{repo_id}:{scope}:attempt-1"
             accepted = run["repositories"][repo_id]["accepted_artifacts"].get(verify_id)
             if accepted:
@@ -960,9 +963,9 @@ class WorkflowEngine:
             if any(workflow_tools.repository_state(Path(run["repositories"][key]["worktree"])) != state
                    for key, state in record["repository_states"].items()):
                 raise WorkflowError("source/Git state changed after external recovery authorization")
-            if verify_id in run.get("external_repair_attempts", {}):
-                self._block(summary=f"External-repair verification {verify_id} already launched without accepted evidence.",
-                            evidence_path=Path(run["external_repair_attempts"][verify_id]["path"]), kind="decision", repo_id=repo_id,
+            if verify_id in run.get(f"{family}_attempts", {}):
+                self._block(summary=f"Packet verification {verify_id} already launched without accepted evidence.",
+                            evidence_path=Path(run[f"{family}_attempts"][verify_id]["path"]), kind="decision", repo_id=repo_id,
                             required_action="Inspect preserved output and supervisor evidence; the one-shot verification cannot relaunch.")
                 return "blocked"
             existing = self.run_dir / "assignments" / f"{_slug(verify_id)}.json"
@@ -972,7 +975,8 @@ class WorkflowEngine:
             assignment_path = self.build_assignment(
                 stage="implement", repo_id=repo_id, scope=scope,
                 instructions=["Independently inspect and verify the preserved packet on the current tree; do not replay or edit source.",
-                    "Audit the authorized rebase/test-only repair against the exact approved requirements, contract and packet. "
+                    "Audit the preserved source and pinned repair/rebase or writer-incident evidence against the exact approved requirements, contract and packet. "
+                    "A late source result from overlapping writers is only an unaccepted candidate; independently inspect the combined changes. "
                     "Report packet_verification as compatible only if the assigned work is fully present and no material scope/contract change exists. "
                     "Otherwise report blocked with a decision blocker for material change (normal replanning and renewed whole-bundle approval), "
                     "or a code blocker for unfinished work. Never infer completion from external logs.",
@@ -981,7 +985,7 @@ class WorkflowEngine:
                     "Confirm the isolated database target before migration-capable checks; never use inherited/shared targets or destructive unplanned commands."],
                 validation_ids=original_assignment["validation_ids"], validation_commands=original_assignment["validation_commands"],
                 task_ids=original_assignment["task_ids"], packet_id=record["packet_id"],
-                extras={"execution_mode": "packet-verification", "external_repair": reference,
+                extras={"execution_mode": "packet-verification", family: reference,
                         "project_file_access": "none", "thinking": "medium",
                         "repositories": self._repository_scope(run, None, write=False),
                         "input_tree_fingerprint": record["repository_states"][repo_id]["fingerprint"]},
@@ -991,7 +995,7 @@ class WorkflowEngine:
             self._install_actions([assignment_path])
             with RunLock(self.run_dir):
                 current = self.load_run()
-                current.setdefault("external_repair_attempts", {})[verify_id] = _reference(assignment_path)
+                current.setdefault(f"{family}_attempts", {})[verify_id] = _reference(assignment_path)
                 self._save_run(current)
             result = self._execute_assignments([assignment_path])
             if result.rejected:
@@ -1069,6 +1073,11 @@ class WorkflowEngine:
             )
             if worker is not None:
                 recovered_workers[assignment["action_id"]] = worker
+                if not worker.get("settled") or worker.get("cleanup_status", "complete") != "complete":
+                    self._block(summary=f"Recorded worker {action['action_id']} is not settled and cleaned.",
+                                evidence_path=resolved_assignment_path, kind="infrastructure", repo_id=assignment.get("repo_id"),
+                                required_action="Preserve the original handle and output; reconcile its settlement before accepting evidence or launching another writer.")
+                    return preflight["phase"]
 
         with RunLock(self.run_dir):
             run = self.load_run()
@@ -1115,8 +1124,10 @@ class WorkflowEngine:
                         run["repositories"][repository_id]["active_writer"] = None
                     remaining_actions.append(action)
                     continue
+                references = run["repositories"][assignment["repo_id"]]["accepted_artifacts"] if assignment.get("repo_id") else run["accepted_artifacts"]
                 try:
-                    artifact = self._validate_worker_output(assignment, output_path)
+                    artifact = (_load_json(output_path) if assignment["action_id"] in references
+                                else self._validate_worker_output(assignment, output_path))
                 except (OSError, ValueError, artifact_guard.ValidationError):
                     action["status"] = "pending"
                     changed = True
@@ -1286,7 +1297,8 @@ class WorkflowEngine:
         """Return current canonical inputs without stale plan/critic generations."""
         paths = [Path(run["request_path"]), Path(run["requirements_path"])]
         paths.extend(Path(ref["path"]) for ref in run.get("run_amendments", []))
-        paths.extend(Path(ref["path"]) for ref in run.get("external_repair_recoveries", {}).values())
+        paths.extend(Path(ref["path"]) for family in ("external_repair", "writer_incident")
+                     for ref in run.get(f"{family}_recoveries", {}).values())
         if run.get("contract_path"):
             paths.append(Path(run["contract_path"]))
 
@@ -1430,7 +1442,10 @@ class WorkflowEngine:
                     return assignment_path
                 if (assignment.get("output_kind") == "result"
                         and run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
-                        and assignment["action_id"] not in run.get("artifact_repairs", {})):
+                        and assignment["action_id"] not in run.get("artifact_repairs", {})
+                        and assignment["action_id"] not in (
+                            run["repositories"][repo_id]["accepted_artifacts"] if repo_id else run["accepted_artifacts"]
+                        )):
                     try:
                         self._validate_worker_output(assignment, output_path)
                     except artifact_guard.ValidationError as error:
@@ -1451,7 +1466,7 @@ class WorkflowEngine:
             if repo_id is None
             else self.run_dir / "repos" / repo_id / "logs"
         )
-        if run.get("validation_policy_version") == 1 or run.get("external_repair_recoveries"):
+        if run.get("validation_policy_version") == 1 or run.get("external_repair_recoveries") or run.get("writer_incident_recoveries"):
             log_dir = log_dir / _slug(action_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         assignment: dict[str, Any] = {
@@ -1632,16 +1647,20 @@ class WorkflowEngine:
     def _validate_worker_output(
         self, assignment: dict[str, Any], output_path: Path
     ) -> dict[str, Any]:
+        run = self.load_run()
+        references = run["repositories"][assignment["repo_id"]]["accepted_artifacts"] if assignment.get("repo_id") else run["accepted_artifacts"]
+        accepted = any(Path(ref["path"]).resolve() == output_path.resolve() for ref in references.values())
         raw = output_path.read_bytes()
         if len(raw) > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
             raise artifact_guard.ValidationError("artifact exceeds its size limit")
         artifact = json.loads(raw)
-        artifact = workflow_tools.normalize_worker_artifact(
-            self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json",
-            assignment,
-            output_path,
-            artifact,
-        )
+        if not accepted:
+            artifact = workflow_tools.normalize_worker_artifact(
+                self.run_dir / "assignments" / f"{_slug(assignment['action_id'])}.json",
+                assignment,
+                output_path,
+                artifact,
+            )
         if output_path.stat().st_size > artifact_guard.MAX_BYTES[assignment["output_kind"]]:
             raise artifact_guard.ValidationError("normalized artifact exceeds its size limit")
         artifact_guard.CURRENT_ARTIFACT_PATH = output_path
@@ -1725,7 +1744,10 @@ class WorkflowEngine:
             if assignment.get("repo_id") is None
             else run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
         )
-        target[assignment["action_id"]] = _reference(output_path)
+        reference = _reference(output_path)
+        if assignment["action_id"] in target and target[assignment["action_id"]] != reference:
+            raise WorkflowError("refusing to replace an accepted artifact reference")
+        target[assignment["action_id"]] = reference
         repo_id = assignment.get("repo_id")
         for pending_key, assignment_key in (("pending_check_remediations", "remediation"),
                                             ("pending_validation_refresh", "validation_refresh")):
@@ -1753,10 +1775,9 @@ class WorkflowEngine:
             ).resolve()
         )
         path = self.run_dir / "assignments" / f"{_slug(replacement['action_id'])}.json"
-        if self.load_run(validate=False).get("external_repair_recoveries"):
-            base = self.run_dir / "repos" / assignment["repo_id"] if assignment.get("repo_id") else self.run_dir
-            replacement["log_dir"] = str(base / "logs" / _slug(replacement["action_id"]))
-            Path(replacement["log_dir"]).mkdir(parents=True, exist_ok=True)
+        base = self.run_dir / "repos" / assignment["repo_id"] if assignment.get("repo_id") else self.run_dir
+        replacement["log_dir"] = str(base / "logs" / _slug(replacement["action_id"]))
+        Path(replacement["log_dir"]).mkdir(parents=True, exist_ok=True)
         if not path.exists():
             workflow_tools.atomic_write_json(path, replacement)
         artifact_guard.validate_assignment(_load_json(path))
@@ -1843,6 +1864,17 @@ class WorkflowEngine:
                 "elapsed_seconds": result["elapsed_seconds"], "output_artifact": assignment["output_artifact"]}
 
     def _execute_assignments(self, paths: list[Path]) -> BatchResult:
+        run = self.load_run()
+        for path in paths:
+            assignment = _load_json(path)
+            references = run["repositories"][assignment["repo_id"]]["accepted_artifacts"] if assignment.get("repo_id") else run["accepted_artifacts"]
+            if assignment["action_id"] in references or any(ref["path"] == assignment["output_artifact"] for ref in references.values()):
+                raise WorkflowError("refusing to execute an assignment with accepted evidence")
+            for agent in self.load_agents()["agents"]:
+                if (agent.get("repo_id") == assignment.get("repo_id")
+                        and agent.get("cleanup_status", "complete") != "complete"
+                        and agent["output_artifact"] != assignment["output_artifact"]):
+                    raise WorkflowError(f"uncleaned worker {agent['name']} prevents another assignment for this repository")
         self._install_actions(paths)
         with RunLock(self.run_dir):
             run = self.load_run()
@@ -2105,10 +2137,7 @@ class WorkflowEngine:
             refs = (run["repositories"][assignment["repo_id"]]["accepted_artifacts"]
                     if assignment.get("repo_id") else run.get("accepted_artifacts", {}))
             reference = refs.get(assignment["action_id"])
-            recover_planning = bool(run.get("decision_replans")) and assignment["stage"] in {
-                "contract", "plan", "design-challenge"
-            }
-            if reference and (assignment.get("execution_mode") == "artifact-repair" or recover_planning):
+            if reference:
                 if _reference(Path(reference["path"])) != reference:
                     raise WorkflowError("accepted artifact evidence changed")
                 artifact = _load_json(Path(reference["path"]))
@@ -2136,6 +2165,14 @@ class WorkflowEngine:
                 break
             replacements: list[Path] = []
             for assignment, worker in result.rejected:
+                if worker.get("cleanup_status", "complete") != "complete":
+                    self._block(
+                        summary=f"Worker {assignment['action_id']} has an unclosed handle; replacement is forbidden.",
+                        evidence_path=result.manifest_path,
+                        required_action="Let the recorded worker settle and resume through reconciliation. Do not start another writer or discard its handle.",
+                        kind="infrastructure", repo_id=assignment.get("repo_id"),
+                    )
+                    return tuple(accepted)
                 is_repair = assignment.get("execution_mode") == "artifact-repair"
                 if repair_enabled and not is_repair and worker.get("error_code") == "missing-field" and re.fullmatch(
                     r"\$\.blockers\[[0-9]+\]\.kind", worker.get("error_path", "")
@@ -2153,7 +2190,7 @@ class WorkflowEngine:
                         kind="decision", repo_id=assignment.get("repo_id"),
                     )
                     return tuple(accepted)
-                if replacement_round < replacement_limit:
+                if replacement_round < replacement_limit and assignment["attempt"] <= replacement_limit:
                     replacements.append(self._replacement(assignment))
                     continue
                 self._block(
