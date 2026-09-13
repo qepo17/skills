@@ -2160,11 +2160,13 @@ class WorkflowEngineTests(unittest.TestCase):
         (self.worktree / "uncommitted-after-delivery.txt").write_text(
             "not delivered\n", encoding="utf-8"
         )
+        accepted_bytes = deliveries[-1][0].read_bytes()
         with self.assertRaisesRegex(
             artifact_guard.ValidationError,
-            "read-only worker changed repository content",
+            "delivery worktree differs",
         ):
             engine._validate_worker_output(deliveries[-1][2], deliveries[-1][0])
+        self.assertEqual(accepted_bytes, deliveries[-1][0].read_bytes())
 
     def test_cli_persists_plan_interrupt_in_sqlite(self) -> None:
         fake = FakePlanningBatch()

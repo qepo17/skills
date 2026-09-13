@@ -27,7 +27,8 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 - Older schema-v1 runs without profile fields remain valid and behave as legacy `full` runs when resumed.
 - New fast/standard runs set `workflow_policy.user_plan_approval_required: false`; full sets it to `true`. Every run still records an approved hash-pinned bundle before project-file work. On resume, omission of this key in an older profiled run is treated as approval-required for backward safety.
 - New runs pin `validation_policy_version: 1`, `delivery_policy_version: 1`, `worker_reasoning_policy: stage-v1`, `retry_limits.artifact_repairs_per_action: 1`, and repository `delivery_executor` (`github-command` or `worker`), `delivery_repository`, `delivery_evidence_version: 2`, and `delivery_check_timeout_seconds` (0–1800). Missing policy versions preserve the entire legacy validation/recovery/delivery path. Unknown versions fail. Never infer, retrofit, migrate, or mutate a policy on an existing run.
-- Before validation, the coordinator normalizes mechanical evidence (`assignment_sha256`, Git HEAD/status, content fingerprint, command hashes, and policy-version-1 validation `log_sha256`). Workers remain responsible for semantic conclusions, command execution results, findings, and blockers. Every action has its own log directory; a later action never overwrites an older log.
+- Accepted output is never re-normalized or relaunched. A retained/unsettled handle prevents replacement, even if an output file exists; recover the original backend identity rather than overwriting its lifecycle record. The only unavailable-reference quarantine is the explicitly authorized [writer-incident transition](schemas/writer-incident-recovery.md), which preserves the original reference and never converts overwritten bytes to accepted evidence.
+- Before first acceptance, the coordinator normalizes mechanical evidence (`assignment_sha256`, Git HEAD/status, content fingerprint, command hashes, and policy-version-1 validation `log_sha256`). Workers remain responsible for semantic conclusions, command execution results, findings, and blockers. Every action has its own log directory; a later action never overwrites an older log.
 
 ## Directory layout
 
@@ -48,6 +49,7 @@ python3 "$SKILL_DIR/scripts/artifact_guard.py" <kind> <artifact-path>
 ├── plan-feedback-vN.json                # exact user-requested revision basis
 ├── decision-replan-vN.json              # preserved implementation decision/approval/work evidence
 ├── external-repair-<action-hash>.json    # explicit rejected-packet source transition; not a pass
+├── logs/incidents/writer-recovery-*/*   # immutable incident quarantine, history and live cleanup proof
 ├── run-amendment-vN.json                # scoped validation/remediation decision
 ├── amendment-evidence/<request-sha>/*   # immutable decision-time log snapshots
 ├── profile-escalation-*.json            # deterministic escalation evidence
@@ -215,6 +217,7 @@ The graph may add these coordinator fields when applicable:
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
 - `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
 - `external_repair_recoveries`: one hashed immutable [`external-repair-recovery`](schemas/external-repair-recovery.md) record per rejected implementation action. It preserves the caller's reviewed request/digest, exact external and later recovery authorization separately from coordinator interpretation, old approval/blocker, historical evidence and old/current source bindings. The old rejected result stays unaccepted and unchanged. Admission schedules fresh read-only packet verification; it does not assert completion or a passing check;
+- `writer_incident_recoveries` and `writer_incident_attempts`: hashed [writer-incident recovery records](schemas/writer-incident-recovery.md) and one-shot read-only verification assignments. The original unavailable reference remains in immutable quarantine, with overwritten/late outputs pinned separately and unaccepted. The record preserves approved policy/source/history; no limits reset. Only passing fresh verification completes the packet;
 - `external_repair_attempts`: one hashed `packet-verification` assignment per new verification action, saved before launch. This is a one-shot launch claim, not a retry-budget reset. Accepted fresh results and their scope/check logs are revalidated on subsequent run loads. No missing/invalid claimed result can cause another worker launch;
 - `run_amendments`: ordered hashed references to immutable [`run-amendment`](schemas/run-amendment.md) artifacts. This field is valid only with `validation_policy_version: 1`; repeated request hashes are invalid;
 - `pending_check_remediations`: at most one hashed `fix-related` amendment per repository, consumed by the existing `validation-fix` or `pipeline-fix` route;
@@ -351,7 +354,7 @@ New assignments pin `reasoning_policy: stage-v1`: use `medium` for artifact-only
 
 The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Workers keep `gpt-6-astra`, honoring the stage level. The actual configuration is recorded in the manifest and handle record for recovery. Deterministic commands do not create agent records.
 
-Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker is retained for diagnosis. Crash reconciliation reads the same record and performs the same cleanup, including when the worker wrote its artifact before the coordinator stopped.
+Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker retains its original handle, pending action and lease/one-shot claim for later adoption. Settled output with failed/unknown cleanup remains unaccepted and is never normalized yet. Missing adoption cannot stand in for positive cleanup. Crash reconciliation reads the same record, performs cleanup, and only then accepts the output, including when it was written before the coordinator stopped.
 
 ### Artifact-only assignments
 
@@ -361,7 +364,7 @@ An `execution_mode: artifact-repair` assignment keeps the original result stage,
 
 ### External-repair packet verification
 
-An `execution_mode: packet-verification` assignment retains the rejected packet's implementation stage, task/packet IDs and exact check IDs/commands, but all repository access is read-only and project/Git/forge writes are forbidden. `external_repair` pins its immutable recovery record. It binds the current approved plan, source fingerprint and all repository Git states, uses a unique output and log directory, and honors medium reasoning under an existing stage-v1 policy without upgrading legacy run policies. The new result inventories preserved packet files plus authorized test repairs; it does not claim the verifier wrote them.
+An `execution_mode: packet-verification` assignment retains the rejected packet's implementation stage, task/packet IDs and exact check IDs/commands, but all repository access is read-only and project/Git/forge writes are forbidden. Exactly one of `external_repair` or `writer_incident` pins its immutable recovery record. Writer-incident verification inspects the preserved combined source from overlapping workers rather than treating either old result as an accepted pass. It binds the current approved plan, source fingerprint and all repository Git states, uses a unique output and log directory, and honors medium reasoning under an existing stage-v1 policy without upgrading legacy run policies. The new result inventories preserved packet files plus authorized test repairs; it does not claim the verifier wrote them.
 
 The result adds `packet_verification` with `outcome: compatible|material-change|incomplete`, concise `summary`, fresh assignment-local `evidence_path`, and coordinator-owned `evidence_sha256`. Only compatible inspected work can be `complete`; material/unfinished work must be blocked. Material change requires decision blockers and normal renewed plan approval. Every original assigned check must be reported with exact canonical command/cwd, fresh cache status, null source artifact, a new assignment-local log and acceptance-time hash, including on legacy runs. Complete reporting with failed checks is valid factual evidence, but the recovery gate remains blocked until passing evidence exists; the one-shot transition does not rerun or fix it automatically. Full-plan validation, independent review, integration and delivery remain mandatory. See [the complete contract](schemas/external-repair-recovery.md).
 
@@ -486,5 +489,6 @@ Events describe transitions; they never duplicate artifact narratives.
 | `report` | 32 KiB |
 | `run-amendment` | 64 KiB |
 | coordinator `external-repair-recovery` | 128 KiB |
+| coordinator `writer-incident-recovery` | 128 KiB |
 
 Move verbose evidence into logs rather than growing an artifact.

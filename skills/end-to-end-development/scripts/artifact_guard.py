@@ -1081,24 +1081,26 @@ def validate_run(data: dict[str, Any]) -> None:
         for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
             hashed_file_reference(reference, f"{loc}.evidence[{index}]")
 
-    external_recoveries = obj(data.get("external_repair_recoveries", {}), "$.external_repair_recoveries")
-    for action_id, reference in external_recoveries.items():
-        loc = f"$.external_repair_recoveries.{action_id}"
-        record_path = hashed_file_reference(reference, loc)
-        record = load_json_object(record_path, loc)
-        validate_external_recovery(record, loc)
-        if record["action_id"] != action_id or record["run_id"] != data["run_id"]:
-            fail(loc, "recovery identity differs from run")
-    for action_id, reference in obj(data.get("external_repair_attempts", {}), "$.external_repair_attempts").items():
-        loc = f"$.external_repair_attempts.{action_id}"
-        path = hashed_file_reference(reference, loc)
-        assignment = load_json_object(path, loc)
-        if (assignment.get("action_id") != action_id or assignment.get("execution_mode") != "packet-verification"
-                or assignment.get("external_repair") not in external_recoveries.values()):
-            fail(loc, "must identify a one-shot packet-verification assignment")
-        accepted = repositories[assignment["repo_id"]]["accepted_artifacts"].get(action_id)
-        if accepted:
-            validate_recorded_packet_verification(Path(hashed_file_reference(accepted, loc + ".accepted")))
+    for family, validator in (("external_repair", validate_external_recovery),
+                              ("writer_incident", validate_writer_incident_recovery)):
+        recoveries = obj(data.get(f"{family}_recoveries", {}), f"$.{family}_recoveries")
+        for action_id, reference in recoveries.items():
+            loc = f"$.{family}_recoveries.{action_id}"
+            record = load_json_object(hashed_file_reference(reference, loc), loc)
+            validator(record, loc)
+            if record["action_id"] != action_id or record["run_id"] != data["run_id"]:
+                fail(loc, "recovery identity differs from run")
+            if family == "writer_incident" and action_id in repositories[record["request"]["repo_id"]]["accepted_artifacts"]:
+                fail(loc, "invalidated writer evidence must never become an accepted artifact")
+        for action_id, reference in obj(data.get(f"{family}_attempts", {}), f"$.{family}_attempts").items():
+            loc = f"$.{family}_attempts.{action_id}"
+            assignment = load_json_object(hashed_file_reference(reference, loc), loc)
+            if (assignment.get("action_id") != action_id or assignment.get("execution_mode") != "packet-verification"
+                    or assignment.get(family) not in recoveries.values()):
+                fail(loc, "must identify a one-shot packet-verification assignment")
+            accepted = repositories[assignment["repo_id"]]["accepted_artifacts"].get(action_id)
+            if accepted:
+                validate_recorded_packet_verification(Path(hashed_file_reference(accepted, loc + ".accepted")))
 
     replans = array(data.get("decision_replans", []), "$.decision_replans")
     for index, reference in enumerate(replans):
@@ -1346,6 +1348,70 @@ def validate_recorded_packet_verification(path: Path) -> None:
         CURRENT_ARTIFACT_PATH = previous
 
 
+def validate_writer_incident_recovery(record: dict[str, Any], loc: str) -> None:
+    """Keep the unavailable reference visible without ever trusting its new bytes."""
+    if len(json.dumps(record, indent=2, sort_keys=True).encode()) + 1 > 128 * 1024:
+        fail(loc, "writer-incident recovery exceeds 128 KiB")
+    if record.get("schema_version") != 1 or record.get("artifact_kind") != "writer-incident-recovery":
+        fail(loc, "unknown writer-incident recovery format")
+    identity = obj(field(record, "identity_request", loc), loc + ".identity_request")
+    expected_digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if record.get("request_sha256") != expected_digest:
+        fail(loc, "incident authorization digest differs")
+    authorization = obj(field(record, "authorization", loc), loc + ".authorization")
+    if authorization.get("text", "").strip().lower() not in {"yes", "approved", "authorized"}:
+        fail(loc, "explicit scoped incident authorization is required")
+    snapshots = obj(field(record, "snapshots", loc), loc + ".snapshots")
+    prior = load_json_object(hashed_file_reference(field(snapshots, "run", loc), loc + ".prior_run"), loc)
+    prior_agents = load_json_object(hashed_file_reference(field(snapshots, "agents", loc), loc + ".prior_agents"), loc)
+    validate_agents(prior_agents)
+    request = obj(field(record, "request", loc), loc + ".request")
+    repo = request["repo_id"]
+    original = load_json_object(hashed_file_reference(request["assignment"], loc + ".assignment"), loc)
+    candidate = load_json_object(hashed_file_reference(request["result"], loc + ".result"), loc)
+    damaged = load_json_object(hashed_file_reference(request["damaged_assignment"], loc + ".damaged_assignment"), loc)
+    broken = load_json_object(hashed_file_reference(request["damaged_result"], loc + ".damaged_result"), loc)
+    invalidated = obj(field(record, "invalidated_reference", loc), loc + ".invalidated_reference")
+    if (record["run_id"] != prior["run_id"] or record["action_id"] != identity["damaged_action_id"]
+            or snapshots["run"]["sha256"] != identity["run_sha256"]
+            or original["action_id"] != identity["source_action_id"] or damaged["action_id"] != record["action_id"]
+            or original["attempt"] != 1 or damaged["attempt"] != 2
+            or prior["repositories"][repo]["accepted_artifacts"].get(record["action_id"]) != invalidated
+            or invalidated["path"] != request["damaged_result"]["path"]
+            or invalidated["sha256"] == request["damaged_result"]["sha256"]
+            or request["result"]["sha256"] != identity["source_sha256"]
+            or request["damaged_result"]["sha256"] != identity["damaged_sha256"]
+            or candidate.get("status") != "complete" or broken.get("status") != "blocked"
+            or record["previous_plan_review"] != prior["plan_review"]
+            or record["previous_plan_review"]["review_sha256"] != identity["plan_review_sha256"]
+            or record["packet_id"] != original["packet_id"]
+            or record["changed_files"] != sorted(set(candidate["changed_files"]) | set(broken["changed_files"]))):
+        fail(loc, "incident identity, quarantine, source candidate, or approval differs from preserved history")
+    if prior.get("writer_incident_recoveries"):
+        fail(loc, "writer-incident recovery is one-shot; recursive recovery is forbidden")
+    del prior["repositories"][repo]["accepted_artifacts"][record["action_id"]]
+    validate_run(prior)  # Only the explicitly quarantined reference may be invalid.
+    for index, ref in enumerate(array(field(record, "historical_evidence", loc), loc + ".historical_evidence")):
+        hashed_file_reference(ref, f"{loc}.historical_evidence[{index}]")
+    cleanup = load_json_object(hashed_file_reference(field(record, "cleanup", loc), loc + ".cleanup"), loc)
+    observations = array(field(cleanup, "observations", loc), loc + ".cleanup.observations")
+    if any(item.get("cleanup_status") != "complete" for item in observations):
+        fail(loc, "incident cleanup must be proven before verification")
+    remaining = array(field(obj(field(cleanup, "after", loc), loc)["result"], "agents", loc), loc + ".cleanup.after.agents")
+    workspaces = array(field(obj(field(cleanup, "workspaces_after", loc), loc)["result"], "workspaces", loc), loc + ".cleanup.after.workspaces")
+    names = {a["name"] for a in prior_agents["agents"] if a.get("repo_id") == repo}
+    if (any(a.get("cwd") == prior["repositories"][repo]["worktree"] or a.get("name") in names for a in remaining)
+            or any(w.get("label") in names for w in workspaces)):
+        fail(loc, "incident cleanup still has a live or unidentified handle")
+    states = obj(field(record, "repository_states", loc), loc + ".repository_states")
+    if set(states) != {repo} or states[repo] != identity["repository_state"]:
+        fail(loc, "writer-incident recovery is limited to one repository")
+    for key in ("fingerprint", "index_sha256"):
+        sha256(field(states[repo], key, loc), loc + f".repository_states.{key}")
+    if states[repo]["head"] != candidate["git"]["head"] or states[repo]["branch"] != prior["repositories"][repo]["branch"]:
+        fail(loc, "incident source Git identity differs")
+
+
 def validate_external_recovery(record: dict[str, Any], loc: str) -> None:
     if record.get("artifact_kind") != "external-repair-recovery" or record.get("schema_version") != 1:
         fail(loc, "invalid external recovery record")
@@ -1396,10 +1462,14 @@ def validate_assignment(data: dict[str, Any]) -> None:
     repair_mode = data.get("execution_mode") == "artifact-repair"
     packet_verification = execution_mode == "packet-verification"
     if packet_verification:
-        ref = field(data, "external_repair", "$")
-        record = load_json_object(hashed_file_reference(ref, "$.external_repair"), "$.external_repair")
-        validate_external_recovery(record, "$.external_repair")
-        original = load_json_object(record["request"]["assignment"]["path"], "$.external_repair.assignment")
+        family = "writer_incident" if "writer_incident" in data else "external_repair"
+        if "writer_incident" in data and "external_repair" in data:
+            fail("$.execution_mode", "packet verification must pin exactly one recovery authority")
+        ref = field(data, family, "$")
+        record = load_json_object(hashed_file_reference(ref, f"$.{family}"), f"$.{family}")
+        validator = validate_writer_incident_recovery if family == "writer_incident" else validate_external_recovery
+        validator(record, f"$.{family}")
+        original = load_json_object(record["request"]["assignment"]["path"], f"$.{family}.assignment")
         if (stage != "implement" or data.get("project_file_access") != "none"
                 or data.get("git_access") != "none" or data.get("forge_access") != "none"
                 or any(repo.get("access") != "read" for repo in data.get("repositories", []))
@@ -2977,7 +3047,8 @@ def validate_result(data: dict[str, Any]) -> None:
     if assignment.get("execution_mode") == "artifact-repair":
         validate_repaired_payload(assignment, data)
     if assignment.get("execution_mode") == "packet-verification":
-        record = load_json_object(assignment["external_repair"]["path"], "$.external_repair")
+        family = "writer_incident" if "writer_incident" in assignment else "external_repair"
+        record = load_json_object(assignment[family]["path"], f"$.{family}")
         verification = obj(field(data, "packet_verification", "$"), "$.packet_verification")
         outcome = enum(field(verification, "outcome", "$.packet_verification"),
                        {"compatible", "material-change", "incomplete"}, "$.packet_verification.outcome")
