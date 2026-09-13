@@ -30,6 +30,8 @@ Discovery is evidence-first: adopt justified, reversible, in-scope implementatio
 
 The prompts adapt the actual `to-spec`, `to-tickets`, and `grill-with-docs` skills: synthesis rather than another interview; problem/solution and meaningful stories; implementation/testing decisions with high existing behavioral test seams; domain glossary/ADRs; and independently verifiable vertical slices with genuine blocking dependencies. Necessary prefactors and wide-refactor expand–contract sequences stay within existing safety gates. Long-lived ticket prose stays outcome-oriented while local execution evidence retains real baseline-bound paths and commands.
 
+Plan writing also borrows `show-me`'s smallest-useful-view principle: **what changes and why → how it works → concrete slices → proof**. Keep rationale and checks beside the behavior they explain; use a small flow, tree, or diff only when clearer than prose. Both execution skills bundle an example-led [plan-writing guide](skills/end-to-end-development/PLAN-WRITING.md), without requiring `show-me`, extra artifacts, or new approval pauses.
+
 We deliberately do not import exhaustive story quotas, repeated seam/breakdown approval quizzes, automatic tracker publication/labels, or mandatory new tickets. See [source snapshots and adaptation rationale](docs/prompt-inspiration.md) and the self-contained [idea-to-ticket examples](skills/idea-to-ticket/EXAMPLES.md).
 
 ## Install with `npx skills`

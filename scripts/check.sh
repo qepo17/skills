@@ -11,6 +11,7 @@ python3 scripts/validate_repository.py
 
 # Both npx skills installations must remain self-contained with the same shared contracts.
 cmp skills/end-to-end-development/DISCOVERY.md skills/fast-end-to-end-development/DISCOVERY.md
+cmp skills/end-to-end-development/PLAN-WRITING.md skills/fast-end-to-end-development/PLAN-WRITING.md
 cmp skills/end-to-end-development/scripts/delivery_tools.py \
   skills/fast-end-to-end-development/scripts/delivery_tools.py
 cp -R skills/fast-end-to-end-development "$TMP_DIR/fast-only"

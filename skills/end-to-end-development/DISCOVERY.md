@@ -27,6 +27,8 @@ Workers do not interview the user or allocate their own question budgets. They i
 
 ## One implementation contract: synthesize, do not re-interview
 
+Read [PLAN-WRITING.md](PLAN-WRITING.md) when composing or presenting the plan. Lead with the outcome and approach, then concrete slices and their proof; the concerns below are a coverage checklist, not mandatory headings or a prose quota.
+
 Adapt `to-spec`'s useful structure inside the **existing** plan, not a second `spec.md` plus a duplicate ticket list. A small bug needs only a few focused bullets; expand only where the feature warrants it:
 
 | Concern | What to capture |
