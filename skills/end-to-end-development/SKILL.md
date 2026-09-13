@@ -166,7 +166,7 @@ A material decision discovered during approved implementation remains blocked un
 Fast and standard runs still emit a complete hash-pinned review bundle, but policy accepts it atomically without a user pause. When a full-profile graph returns `status: awaiting-user` and `phase: plan-review`:
 
 1. Read `plan_review.path` and verify the reported SHA-256 still matches.
-2. Present the bundle path, hash, and concise per-repository task/packet/risk/validation summaries.
+2. Use [PLAN-WRITING.md](PLAN-WRITING.md) to present a readable overview: what changes and why, how it works, then ordered slices and proof. Include the bundle path/hash and per-repository task/packet/risk/validation coverage. Keep material risks visible; do not rewrite the pinned bundle or substitute the overview for the complete approval target.
 3. Ask exactly: **“Approve all plans in this exact review bundle, or send the changes you want.”**
 4. End the turn. Do not create implementation work, edit project files, or invoke a generic resume.
 

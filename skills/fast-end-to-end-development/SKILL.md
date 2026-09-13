@@ -9,7 +9,7 @@ Use this skill for a small or medium change that should move from request to pul
 
 `ticket / spec / request → grounded implementation spec → implement + validate → review once → revise once → PR + required CI → [CI fix once] → [optional HTML explainer]`
 
-Read [DISCOVERY.md](DISCOVERY.md) before intake/planning. Reuse existing tickets and specs; never require `idea-to-ticket` or a `to-tickets` stage. `plan.md` is the compact implementation spec, not an additional document.
+Read [DISCOVERY.md](DISCOVERY.md) before intake/planning and [PLAN-WRITING.md](PLAN-WRITING.md) when writing or presenting the plan. Lead with what changes and why, then explain the approach, concrete slices, and proof; use the smallest useful visual only when it helps. Reuse existing tickets and specs; never require `idea-to-ticket` or a `to-tickets` stage. `plan.md` is the compact implementation spec, not an additional document.
 
 The current agent owns the run. Keep the process fast by removing Herdr worker orchestration, multi-profile policy selection, mandatory plan-approval pauses, integration workers, and retry loops. Keep the safety that matters: preserve pre-existing work, inspect repository instructions, record evidence, use a fresh reviewer, cap remediation at one batch, and stop on material ambiguity or high-risk scope.
 
