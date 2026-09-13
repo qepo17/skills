@@ -56,6 +56,26 @@ class WriterHandleTests(unittest.TestCase):
         close.assert_called_once()
         self.assertEqual(before, record.read_bytes())
 
+    def test_restored_idle_original_requires_pinned_finished_turn_proof(self):
+        for proven in (False, True):
+            with self.subTest(proven=proven):
+                supervisor = self.supervisor()
+                query, cleanup = self.backend({**self.identity(), 'agent_status': 'idle'})
+                expected = self.identity()
+                if proven:
+                    expected['finished_binding_sha256'] = 'f' * 64
+                with mock.patch.object(supervisor, '_checked_json', side_effect=query), \
+                     mock.patch.object(supervisor, '_cleanup', side_effect=cleanup) as close:
+                    if proven:
+                        supervisor.close_settled_incident_workers({'test-worker': expected},
+                            cwd=str(self.root), known_names={'test-worker'})
+                        close.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'mismatched'):
+                            supervisor.close_settled_incident_workers({'test-worker': expected},
+                                cwd=str(self.root), known_names={'test-worker'})
+                        close.assert_not_called()
+
     def test_working_unknown_or_mismatched_handles_never_close(self):
         for changes in ({'agent_status': 'working'}, {'name': 'someone-else'},
                         {'workspace_id': 'w-other'}, {'pane_id': 'w-other:p1'}, {'cwd': '/unrelated'},

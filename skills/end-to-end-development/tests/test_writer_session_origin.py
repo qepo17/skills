@@ -39,6 +39,32 @@ class SessionOriginTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     writer_incident.session_launch_binding(*self.fixture(**options))
 
+    def test_finished_turn_binding_rejects_initial_idle_pending_tools_and_reused_session(self):
+        session, assignment, timeout = self.fixture()
+        path = self.root / 'session.jsonl'
+        with self.assertRaisesRegex(ValueError, 'unfinished'):
+            writer_incident.session_finished_binding(session)
+        initial = path.read_text()
+        finished = {'type': 'message', 'timestamp': '2026-09-12T17:00:00Z',
+                    'message': {'role': 'assistant', 'stopReason': 'stop',
+                                'content': [{'type': 'text', 'text': 'Original task finished.'}]}}
+        path.write_text(initial + json.dumps(finished) + '\n')
+        binding = writer_incident.session_finished_binding(session)
+        self.assertEqual(1, binding['user_message_count'])
+        self.assertNotIn('Original task finished.', json.dumps(binding))
+        with path.open('a') as handle:
+            handle.write(json.dumps({'type': 'custom', 'data': 'restored session metadata'}) + '\n')
+        self.assertEqual(binding, writer_incident.session_finished_binding(session))
+        finished['message']['stopReason'] = 'toolUse'
+        path.write_text(initial + json.dumps(finished) + '\n')
+        with self.assertRaisesRegex(ValueError, 'unfinished'):
+            writer_incident.session_finished_binding(session)
+        finished['message']['stopReason'] = 'stop'
+        extra = {'type': 'message', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 'A different task'}]}}
+        path.write_text(initial + json.dumps(extra) + '\n' + json.dumps(finished) + '\n')
+        with self.assertRaisesRegex(ValueError, 'reused'):
+            writer_incident.session_finished_binding(session)
+
     def test_missing_session_and_symlink_origin_are_refused(self):
         session, assignment, timeout = self.fixture()
         with self.assertRaises(ValueError):

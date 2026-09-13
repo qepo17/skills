@@ -1063,7 +1063,8 @@ class WorkerSupervisor:
                 raise RuntimeError("unrecognized Herdr workspace listing")
             workspace = next((w for w in entries if w.get("workspace_id") == agent.get("workspace_id")), None)
             if (name not in expected or name not in known_names or agent.get("cwd") != cwd
-                    or agent.get("agent_status") != "done"
+                    or agent.get("agent_status") not in {"done", "idle"}
+                    or (agent.get("agent_status") == "idle" and not expected[name].get("finished_binding_sha256"))
                     or any(not expected[name].get(k) or agent.get(k) != expected[name][k] for k in identities)
                     or not workspace or workspace.get("label") != name
                     or not agent["pane_id"].startswith(agent["workspace_id"] + ":")):

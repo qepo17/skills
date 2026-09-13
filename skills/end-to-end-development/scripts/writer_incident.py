@@ -83,6 +83,27 @@ def session_launch_binding(session: dict[str, Any], assignment_path: Path,
     raise ValueError("original session launch cannot be proven from its bounded prefix")
 
 
+def session_finished_binding(session: dict[str, Any]) -> dict[str, Any]:
+    """Prove the original task turn finished, including after Herdr restores it idle."""
+    path = Path(session["value"])
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_uid != os.getuid():
+        raise ValueError("finished session must be an owned regular local file")
+    with path.open("rb") as handle:
+        raw = handle.read(32 * 1024 * 1024 + 1)
+    if len(raw) > 32 * 1024 * 1024 or not raw.endswith(b"\n"):
+        raise ValueError("finished session evidence is oversized or incomplete")
+    messages = [entry for line in raw.splitlines() if (entry := json.loads(line)).get("type") == "message"]
+    users = [entry for entry in messages if entry.get("message", {}).get("role") == "user"]
+    final = messages[-1] if messages else {}
+    message = final.get("message", {})
+    if (len(users) != 1 or message.get("role") != "assistant" or message.get("stopReason") != "stop"
+            or not any(part.get("type") == "text" for part in message.get("content", []))
+            or any(part.get("type") == "toolCall" for part in message.get("content", []))):
+        raise ValueError("original task session is unfinished or has been reused for another user turn")
+    return {"session_path": str(path), "final_at": final["timestamp"], "user_message_count": len(users),
+            "final_message_sha256": digest(final)}
+
+
 def validate_history(run: dict[str, Any]) -> list[dict[str, str]]:
     """Check existing bindings, then pin their bytes; never bless a changed log."""
     references = list(run.get("accepted_artifacts", {}).values())
@@ -210,9 +231,11 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
         if name not in known_names or timeout is None or identity.get("assignment_path") != str(source_path):
             raise ValueError("only the proven original timed-out task session can be reclaimed")
         binding = session_launch_binding(identity.get("agent_session"), source_path, timeout)
-        if digest(binding) != identity.get("launch_binding_sha256"):
-            raise ValueError("session origin differs from the reviewed request")
-        bindings[name] = binding
+        finished = session_finished_binding(identity["agent_session"])
+        if (digest(binding) != identity.get("launch_binding_sha256")
+                or digest(finished) != identity.get("finished_binding_sha256")):
+            raise ValueError("session origin or completed turn differs from the reviewed request")
+        bindings[name] = {"launch": binding, "finished": finished}
     for path in sorted(workflow_tools.artifact_evidence_paths(result) | workflow_tools.artifact_evidence_paths(broken)):
         if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(engine.run_dir):
             raise ValueError("incident evidence must remain inside this run")
@@ -245,7 +268,9 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
     if (engine.run_path.read_bytes() != run_bytes or engine.agents_path.read_bytes() != Path(snapshots["agents"]["path"]).read_bytes()
             or workflow_tools.repository_state(Path(repo["worktree"])) != state
             or reference(result_path)["sha256"] != request["source_sha256"]
-            or reference(damaged_result_path)["sha256"] != request["damaged_sha256"]):
+            or reference(damaged_result_path)["sha256"] != request["damaged_sha256"]
+            or any(digest(session_finished_binding(identity["agent_session"])) != identity["finished_binding_sha256"]
+                   for identity in expected.values())):
         raise ValueError("run, outputs, or source changed during handle cleanup; recovery remains unapplied")
     record = {"schema_version": 1, "artifact_kind": "writer-incident-recovery", "run_id": run["run_id"],
         "action_id": damaged_id, "packet_id": source["packet_id"], "request_sha256": request_sha256,
