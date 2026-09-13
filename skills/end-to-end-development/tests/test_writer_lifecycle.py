@@ -145,6 +145,36 @@ class WriterLifecycleTests(unittest.TestCase):
         self.assertEqual('rejected', manifest['workers'][0]['status'])
         self.assertEqual(before, output.read_bytes())
 
+    def test_modern_ordinary_prelaunch_crash_performs_first_launch_once(self):
+        batch = fixtures.FakeSuccessfulBatch()
+        def before_supervisor(paths, **kwargs):
+            if json.loads(paths[0].read_text())['stage'] == 'implement':
+                raise KeyboardInterrupt
+            return batch(paths, **kwargs)
+        engine = self.initialize(before_supervisor)
+        run = engine.load_run()
+        run['worker_execution'] = {'schema_version': 1, 'backend': 'direct', 'runtime': 'pi',
+                                   'detected_from': 'test', 'evidence': {}}
+        engine._save_run(run)
+        graph = build_graph(engine, InMemorySaver())
+        config = {'configurable': {'thread_id': 'prelaunch'}, 'recursion_limit': 150}
+        with self.assertRaises(KeyboardInterrupt):
+            graph.invoke({'run_dir': str(self.run_dir)}, config)
+        action = engine.load_run()['next_actions'][0]
+        self.assertEqual('working', action['status'])
+        self.assertFalse(Path(action['output_artifact']).exists())
+        record = self.run_dir / 'supervisor' / worker_supervisor.WorkerSupervisor.record_name(action['action_id'])
+        self.assertFalse(record.exists())
+        engine.batch_runner = batch
+        with mock.patch.object(engine, '_wait_for_crash_survivor', return_value=None):
+            engine.reconcile()
+            self.assertEqual('pending', engine.load_run()['next_actions'][0]['status'])
+            graph.invoke(None, config)
+        self.assertEqual('complete', engine.load_run()['status'])
+        sources = [a for a in batch.assignments if a['stage'] == 'implement']
+        self.assertEqual([action['action_id']], [a['action_id'] for a in sources])
+        self.assertEqual(1, sources[0]['attempt'])
+
     def test_unknown_starting_record_never_becomes_presumed_cleanup(self):
         batch = InterruptedBatch(timeout=True)
         engine = self.start_blocked(batch)

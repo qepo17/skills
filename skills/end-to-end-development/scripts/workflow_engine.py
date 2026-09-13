@@ -1077,10 +1077,16 @@ class WorkflowEngine:
                 resolved_assignment_path, assignment
             )
             record_path = self.run_dir / "supervisor" / workflow_tools.worker_supervisor.WorkerSupervisor.record_name(assignment["action_id"])
-            unfinished_history = any(agent["output_artifact"] == assignment["output_artifact"]
-                                     and agent.get("cleanup_status", "complete") != "complete"
-                                     for agent in self.load_agents()["agents"])
-            unknown = worker is None and (record_path.exists() or preflight.get("worker_execution") or unfinished_history)
+            history = [agent for agent in self.load_agents()["agents"]
+                       if agent["output_artifact"] == assignment["output_artifact"]]
+            unfinished_history = any(agent.get("cleanup_status", "complete") != "complete" for agent in history)
+            # The supervisor persists its starting record before any backend launch.
+            # An ordinary untouched intent can therefore perform its first launch;
+            # existing outputs/history and one-shot claims still require adoption.
+            prelaunch = (not record_path.exists() and not history and not Path(assignment["output_artifact"]).exists()
+                         and assignment.get("execution_mode", "worker") == "worker")
+            unknown = worker is None and (record_path.exists() or unfinished_history
+                                          or (preflight.get("worker_execution") and not prelaunch))
             if unknown or (worker is not None and (not worker.get("settled") or worker.get("cleanup_status", "complete") != "complete")):
                 self._block(summary=f"Recorded worker {action['action_id']} is not settled and cleaned.",
                             evidence_path=resolved_assignment_path, kind="infrastructure", repo_id=assignment.get("repo_id"),
