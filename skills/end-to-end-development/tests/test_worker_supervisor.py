@@ -271,7 +271,8 @@ class WorkerCommandTests(unittest.TestCase):
                             "herdr agent": (0, {"status": "idle"}),
                         })
                         supervisor = worker_supervisor.WorkerSupervisor(
-                            self.run_dir, worker_supervisor.ExecutionContext(backend, runtime, "test", {}),
+                            self.run_dir / f"{backend}-{runtime}-{level}",
+                            worker_supervisor.ExecutionContext(backend, runtime, "test", {}),
                             run_process=runner,
                         )
                         result = supervisor.run_batch([self.request(runtime, level)])[0]

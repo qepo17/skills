@@ -10,7 +10,7 @@ Used by implementation, validation, batched fixes, and pipeline fixes. For a sta
 
 For `execution_mode: artifact-repair`, initialization copies the original result. Repair only missing existing blocker classifications from the pinned evidence. Keep all other semantic fields unchanged, including status, outcomes, validations, blocker text, and IDs. Do not run tests or write project/Git/forge state. The graph pins the original assignment/output, evidence files, content, HEAD, branch, and index; any mutation or failed repair blocks rather than starting another source writer.
 
-For `execution_mode: packet-verification`, do not edit or replay source work. Independently inspect existing packet completion and compatibility with approved requirements/contract, including the pinned external repair/rebase. Add:
+For `execution_mode: packet-verification`, do not edit or replay source work. Independently inspect existing packet completion and compatibility with approved requirements/contract, including the pinned external repair/rebase or the combined current source from a `writer_incident`. Neither a late writer's narrative nor its historical passing logs establish compatibility. Add:
 
 ```json
 "packet_verification": {

@@ -19,7 +19,7 @@ from langgraph.types import Command
 sys.dont_write_bytecode = True
 
 import artifact_guard  # noqa: E402
-from workflow_engine import WorkflowEngine, WorkflowError, build_graph  # noqa: E402
+from workflow_engine import RunLock, WorkflowEngine, WorkflowError, build_graph  # noqa: E402
 
 
 def _json_default(value: Any) -> Any:
@@ -158,6 +158,14 @@ def _invoke(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]:
 
 
 def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]:
+    if args.command == "recover-writer-incident":
+        import writer_incident
+        engine = WorkflowEngine(args.run_dir.resolve(), worker_runtime=args.worker_runtime, report_root=args.report_root)
+        with RunLock(engine.run_dir):
+            outcome = writer_incident.recover(engine, json.loads(args.input.read_text()),
+                        request_sha256=args.request_sha256, text=args.text, context=args.context)
+        if outcome == "already-applied" or args.no_drive:
+            return {**_result(engine), "recovery": outcome}
     with _open_graph(
         args.run_dir.resolve(),
         worker_runtime=args.worker_runtime,
@@ -314,6 +322,18 @@ def build_parser() -> argparse.ArgumentParser:
     external.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     external.add_argument("--report-root", type=Path)
 
+    incident = subparsers.add_parser(
+        "recover-writer-incident", help="quarantine one proven overwritten blocked handoff and require fresh read-only packet verification"
+    )
+    incident.add_argument("run_dir", type=Path)
+    incident.add_argument("--input", type=Path, required=True)
+    incident.add_argument("--request-sha256", required=True)
+    incident.add_argument("--text", required=True)
+    incident.add_argument("--context", default="")
+    incident.add_argument("--no-drive", action="store_true", help="apply the guarded transition without launching verification yet")
+    incident.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    incident.add_argument("--report-root", type=Path)
+
     replan = subparsers.add_parser(
         "replan-decision", help="return an accepted implementation decision to bounded planning"
     )
@@ -401,7 +421,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "replan-decision", "amend"}:
+        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},
