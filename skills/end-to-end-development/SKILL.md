@@ -157,10 +157,11 @@ output/log paths, not another run or a fabricated pass. Inspect, then resume thr
 LangGraph; all checks, review and delivery remain mandatory. Missing panes alone do
 not prove descendant settlement. Protected-process permission errors and missing
 cwd on a still-present process remain unknown settlement, with an actionable PID
-error. Never exempt a system-looking process or run this runner as root; this
-transition has no privileged-attestation input. Read the contract's protected-process
-section before proposing a separate inspection extension. Never edit the initializer
-or canonical state.
+error. Never exempt a system-looking process or run this runner as root. Only a
+separately user-authorized [one-time read-only inspector](schemas/privileged-process-inspection.md)
+may obtain the missing metadata; it has a reviewed source hash, original-user scope,
+noninteractive isolated sudo invocation and consumed authorization, never automatic
+retry or file-based clearance. Never edit the initializer or canonical state.
 
 ### Scoped validation and remediation decisions
 

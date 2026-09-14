@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -96,6 +98,78 @@ class InterruptedPacketRecoveryTests(unittest.TestCase):
         for path, content in evidence.items():
             self.assertEqual(content, path.read_bytes(), str(path))
         self.assertEqual('already-applied', self.recover(engine, request))
+
+    def test_explicit_one_time_inspection_keeps_the_existing_recovery_route(self):
+        engine, _, _, request = self.incident()
+        request['privileged_inspection'] = {
+            'mode': 'sudo-once', 'authority': 'user', 'text': 'Use root once for read-only process inspection.',
+            'authorization_id': 'a' * 32, 'subject_uid': os.getuid(), 'inspector_sha256': 'f' * 64,
+        }
+        self.assertEqual('applied', self.recover(engine, request))
+        after = engine.load_run()
+        self.assertEqual(2, after['next_actions'][0]['attempt'])
+        recovery = json.loads(Path(next(iter(after['interrupted_packet_recoveries'].values()))['path']).read_text())
+        self.assertEqual(request['privileged_inspection'], recovery['request']['privileged_inspection'])
+        self.assertEqual('already-applied', self.recover(engine, request))
+
+    def test_fresh_sudo_evidence_is_pinned_and_reapplication_never_elevates(self):
+        from test_process_settlement import ProcessSettlementTests
+        from test_privileged_inspection import PrivilegedInspectionTests
+        import privileged_inspection
+        engine, _, _, request = self.incident()
+        fixture = ProcessSettlementTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        transport = PrivilegedInspectionTests(); transport.setUp(); self.addCleanup(transport.doCleanups)
+        transport.worktree = self.worktree
+        request['privileged_inspection'] = transport.authorization
+        with fixture.observations(), mock.patch.object(privileged_inspection, 'trusted_binary', side_effect=lambda p: p):
+            query = subprocess.run
+            def commands(args, **kwargs):
+                return transport.sudo(args, **kwargs) if args[0] == '/usr/bin/sudo' else query(args, **kwargs)
+            with mock.patch.object(subprocess, 'run', side_effect=commands):
+                for expected in ('applied', 'already-applied'):
+                    self.assertEqual(expected, interrupted_packet.recover(engine, request,
+                        request_sha256=interrupted_packet.digest(request), text='yes'))
+        self.assertEqual(1, len(transport.calls))
+        recovery_ref = next(iter(engine.load_run()['interrupted_packet_recoveries'].values()))
+        recovery = json.loads(Path(recovery_ref['path']).read_text())
+        evidence = recovery['settlement']['privileged_inspection']['evidence']
+        self.assertEqual(3, len(evidence))
+        self.assertTrue(all(ref in recovery['evidence'] for ref in evidence))
+        Path(evidence[0]['path']).write_text('changed claim')
+        with self.assertRaisesRegex(interrupted_packet.artifact_guard.ValidationError, 'sha256'):
+            engine.load_run()
+
+    def test_failed_sudo_is_not_retried_and_cannot_change_application_state(self):
+        from test_process_settlement import ProcessSettlementTests
+        import privileged_inspection
+        engine, _, _, request = self.incident()
+        fixture = ProcessSettlementTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        request['privileged_inspection'] = {
+            'mode': 'sudo-once', 'authority': 'user', 'text': 'Inspect processes once, read-only.',
+            'authorization_id': 'c' * 32, 'subject_uid': os.getuid(),
+            'inspector_sha256': interrupted_packet.reference(privileged_inspection.SOURCE)['sha256'],
+        }
+        before = engine.run_path.read_bytes()
+        before_agents = engine.agents_path.read_bytes()
+        calls = []
+        with fixture.observations(), mock.patch.object(privileged_inspection, 'trusted_binary', side_effect=lambda p: p):
+            query = subprocess.run
+            def commands(args, **kwargs):
+                if args[0] == '/usr/bin/sudo':
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args, 1, '', 'authentication unavailable')
+                return query(args, **kwargs)
+            with mock.patch.object(subprocess, 'run', side_effect=commands):
+                for message in ('authentication', 'already consumed'):
+                    with self.assertRaisesRegex(ValueError, message):
+                        interrupted_packet.recover(engine, request, request_sha256=interrupted_packet.digest(request), text='yes')
+        self.assertEqual(1, len(calls))
+        self.assertEqual(before, engine.run_path.read_bytes())
+        self.assertEqual(before_agents, engine.agents_path.read_bytes())
+        self.assertFalse(list((self.run_dir / 'assignments').glob('*attempt-2.json')))
+        self.assertFalse(engine.load_run().get('interrupted_packet_recoveries'))
 
     def test_fresh_failure_blocks_before_review_or_delivery(self):
         engine, graph, config, request = self.incident()
