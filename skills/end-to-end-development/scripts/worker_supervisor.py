@@ -258,21 +258,45 @@ def detect_execution_context(
     return ExecutionContext("direct", runtime, "fallback", {})
 
 
+def require_supported_launch(backend: str, runtime: str) -> None:
+    if backend == "paseo" and runtime == "codex":
+        raise RuntimeError(
+            "Paseo Codex launch blocked: effective sandbox and approval permissions cannot be verified "
+            "before prompt submission with the supported Paseo CLI. Provider settings can override "
+            "the auto mode. Use a supported sandboxed Codex backend for a new run; do not change "
+            "a pinned backend or weaken permissions."
+        )
+
+
+def _codex_runtime_args(request: WorkerRequest, run_dir: Path) -> list[str]:
+    return [
+        "--model",
+        DEFAULT_WORKER_MODEL,
+        "--config",
+        f'model_reasoning_effort="{request.thinking}"',
+        "--cd",
+        str(request.cwd),
+        "--sandbox",
+        "workspace-write",
+        "--config",
+        'approval_policy="never"',
+        "--config",
+        f"sandbox_workspace_write.writable_roots={json.dumps([str(run_dir)])}",
+        "--config",
+        "sandbox_workspace_write.network_access=false",
+    ]
+
+
 def _runtime_command(
-    request: WorkerRequest, *, pi_binary: str, codex_binary: str
+    request: WorkerRequest, *, run_dir: Path, pi_binary: str, codex_binary: str
 ) -> list[str]:
     if request.runtime == "codex":
         return [
             codex_binary,
             "exec",
             "--ephemeral",
-            "--model",
-            DEFAULT_WORKER_MODEL,
-            "--config",
-            f'model_reasoning_effort="{request.thinking}"',
-            "--cd",
-            str(request.cwd),
-            "--dangerously-bypass-approvals-and-sandbox",
+            *_codex_runtime_args(request, run_dir),
+            "--",
             request.prompt,
         ]
     if request.runtime != "pi":
@@ -316,10 +340,12 @@ class WorkerSupervisor:
 
     def _runtime_command(self, request: WorkerRequest) -> list[str]:
         return _runtime_command(
-            request, pi_binary=self.pi_binary, codex_binary=self.codex_binary
+            request, run_dir=self.run_dir,
+            pi_binary=self.pi_binary, codex_binary=self.codex_binary,
         )
 
     def preview(self, request: WorkerRequest) -> dict[str, Any]:
+        require_supported_launch(self.context.backend, request.runtime)
         command = self._runtime_command(request)
         if self.context.backend == "direct":
             preview = command
@@ -348,15 +374,12 @@ class WorkerSupervisor:
                 "--provider",
                 request.runtime,
                 "--model",
-                (
-                    DEFAULT_WORKER_MODEL
-                    if request.runtime == "codex"
-                    else f"openai-codex/{DEFAULT_WORKER_MODEL}"
-                ),
+                f"openai-codex/{DEFAULT_WORKER_MODEL}",
                 "--thinking",
                 request.thinking,
                 "--cwd",
                 str(request.cwd),
+                "--",
                 request.prompt,
             ]
         else:
@@ -473,13 +496,7 @@ class WorkerSupervisor:
 
     def _interactive_runtime_args(self, request: WorkerRequest) -> list[str]:
         if request.runtime == "codex":
-            return [
-                "--model",
-                DEFAULT_WORKER_MODEL,
-                "--config",
-                f'model_reasoning_effort="{request.thinking}"',
-                "--dangerously-bypass-approvals-and-sandbox",
-            ]
+            return _codex_runtime_args(request, self.run_dir)
         return [
             "--model",
             f"openai-codex/{DEFAULT_WORKER_MODEL}",
@@ -571,6 +588,7 @@ class WorkerSupervisor:
     def _start_paseo(
         self, request: WorkerRequest, record: dict[str, Any]
     ) -> WorkerHandle:
+        require_supported_launch("paseo", request.runtime)
         command = [
             self.paseo_binary,
             "run",
@@ -581,11 +599,7 @@ class WorkerSupervisor:
             "--provider",
             request.runtime,
             "--model",
-            (
-                DEFAULT_WORKER_MODEL
-                if request.runtime == "codex"
-                else f"openai-codex/{DEFAULT_WORKER_MODEL}"
-            ),
+            f"openai-codex/{DEFAULT_WORKER_MODEL}",
             "--thinking",
             request.thinking,
             "--cwd",
@@ -593,9 +607,7 @@ class WorkerSupervisor:
             "--label",
             f"e2e.action_id={request.action_id}",
         ]
-        if request.runtime == "codex":
-            command.extend(["--mode", "bypass"])
-        command.append(request.prompt)
+        command.extend(["--", request.prompt])
         value = self._checked_json(command)
         agent_id = _find_string(value, {"agent_id", "agentId", "id"})
         if agent_id is None:

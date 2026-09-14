@@ -130,6 +130,18 @@ The coordinator must discover all affected repositories before initialization an
 
 Worker detection requires active-context evidence rather than installed binaries: `PASEO_AGENT_ID` plus a successful parent inspection, `HERDR_ENV=1` plus a compatible server, or `TMUX` plus a successful session probe. Precedence is Paseo, Herdr, tmux, then direct headless execution. A stale marker falls through to the next candidate. `PASEO_HOST` without a parent agent is ignored so a local coordinator never sends hash-pinned absolute paths to an unrelated remote filesystem.
 
+### Worker permission boundary
+
+New Codex launches through direct, tmux, and Herdr execution use an explicit `workspace-write` sandbox. Additional configured writable roots are replaced with only the current run directory so workers can produce durable artifacts outside the task worktree; Codex's normal temporary-directory allowances still apply. Shell network access is disabled. The `never` approval policy prevents unattended escalation: denied commands return errors instead of prompting or running outside the sandbox. It does **not** mean unrestricted execution.
+
+**New Paseo Codex launches are blocked**, including bootstrap preflight, dry-run previews, and the actual launcher. Paseo's [provider configuration takes precedence over mode presets](https://github.com/getpaseo/paseo/blob/main/packages/server/src/server/agent/providers/codex-app-server-agent.ts): `auto` alone cannot prove sandboxing or approval behavior. The supported [run CLI](https://github.com/getpaseo/paseo/blob/main/packages/cli/src/commands/agent/run.ts) submits the initial prompt during creation, while [inspect](https://github.com/getpaseo/paseo/blob/main/packages/cli/src/commands/agent/inspect.ts) reports the mode, not effective permissions. Neither a parent inspection, a mode label, nor an operator's configuration claim proves a new child's effective policy before its prompt executes. No launch or exploratory prompt is sent when that proof is unavailable.
+
+Paseo Pi remains supported. For Codex, choose direct, tmux, or Herdr execution for a separately authorized new run in the appropriate active environment; do not silently fall back, switch runtime, or edit an existing run's pinned backend. Existing Paseo Codex handles may still be adopted, waited on, and archived without a new prompt; recovery does not retrofit their permissions or permit replacement launches. Restoring Paseo Codex launch support requires a backend-enforced permission contract or a prompt-free creation and effective-policy verification path, not another mode-name check.
+
+Git metadata writes, dependency downloads, remote delivery, or checks requiring access beyond the sandbox may now block. Report the exact denied operation for separately scoped operator action; do not disable protections or switch runtime to evade a denial. Pi retains its host's existing controls; this change does not add an OS sandbox to Pi. These settings govern new launches only: adopting an already-running worker does not change its permissions. Preserve its lifecycle evidence and have the operator settle it before starting a protected replacement.
+
+The sandbox constrains command execution, not every model tool or file read. Keep credentials out of worker inputs, use least-privileged tool credentials, and treat retrieved content as untrusted even when its bytes are hash-pinned. Artifact validation and project-file access rules remain separate obligations; sandbox access is not permission to edit every writable file.
+
 ## CLI interface
 
 Run from any directory after resolving `SKILL_DIR`. The wrapper uses the locked project and places its generated virtual environment under the user cache, not inside the installed skill:
