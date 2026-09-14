@@ -2843,6 +2843,7 @@ class WorkflowEngine:
                     else self.worker_runtime
                 ),
             )
+            worker_supervisor.require_supported_launch(context.backend, context.runtime)
         except (OSError, RuntimeError, ValueError) as error:
             return f"Worker execution preflight failed: {error}"
         if not isinstance(pinned, dict):

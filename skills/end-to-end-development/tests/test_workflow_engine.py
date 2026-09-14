@@ -18,6 +18,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 import artifact_guard  # noqa: E402
 import workflow_tools  # noqa: E402
+import worker_supervisor  # noqa: E402
 from workflow_engine import WorkflowEngine, WorkflowError, build_graph  # noqa: E402
 
 
@@ -1423,6 +1424,34 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual("direct", execution["backend"])
         self.assertEqual("pi", execution["runtime"])
         self.assertEqual("fallback", execution["detected_from"])
+
+    def test_bootstrap_blocks_unverifiable_paseo_codex_before_any_assignment(self) -> None:
+        self.initialize()
+        engine = WorkflowEngine(
+            self.run_dir,
+            skill_dir=SCRIPTS_DIR.parent,
+            codebase_design_dir=self.codebase_design_dir,
+            report_root=self.root / "reports",
+            now=self.now,
+        )
+        context = worker_supervisor.ExecutionContext(
+            "paseo", "codex", "PASEO_AGENT_ID", {"parent_agent_id": "parent"},
+        )
+        baseline = engine.load_run()["repositories"]["api"]["baseline"]
+        with (
+            mock.patch("workflow_engine.worker_supervisor.detect_execution_context", return_value=context),
+            mock.patch("workflow_engine._git", side_effect=["https://example.invalid/repository", baseline]) as forge_probe,
+            mock.patch("workflow_tools.run_assignment_batch") as launch,
+        ):
+            self.assertEqual("blocked", engine.phase_bootstrap())
+        launch.assert_not_called()
+        forge_probe.assert_not_called()
+        run = engine.load_run()
+        self.assertEqual("blocked", run["status"])
+        self.assertEqual([], run["next_actions"])
+        self.assertEqual([], engine.load_agents()["agents"])
+        self.assertIn("effective sandbox and approval permissions cannot be verified",
+                      (self.run_dir / "logs" / "bootstrap-preflight.log").read_text())
 
     def test_full_graph_interrupts_for_exact_plan_bundle(
         self,

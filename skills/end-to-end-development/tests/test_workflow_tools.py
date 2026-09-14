@@ -436,6 +436,18 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertEqual("codex", manifest["workers"][0]["runtime"])
         self.assertEqual("xhigh", manifest["workers"][0]["thinking"])
 
+        context = workflow_tools.worker_supervisor.ExecutionContext("paseo", "codex", "test", {})
+        with (
+            mock.patch("workflow_tools.worker_supervisor.detect_execution_context", return_value=context),
+            mock.patch("workflow_tools.worker_supervisor.WorkerSupervisor.run_batch") as launch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "effective sandbox and approval permissions cannot be verified"):
+                workflow_tools.run_assignment_batch(
+                    [assignment_path], run_dir=self.root / "run", worker_runtime="codex", dry_run=True,
+                )
+        launch.assert_not_called()
+        self.assertFalse(output.exists())
+
     def test_project_writer_batch_requires_run_state_with_plan_approval(self) -> None:
         plan = self.root / "run" / "repos" / "api" / "plan-v1.json"
         self.write_json(
