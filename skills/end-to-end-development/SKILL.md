@@ -155,7 +155,12 @@ origin with no relocation. Tooling-repair approval alone does not establish the 
 worker's host. It queues one budgeted replacement with new
 output/log paths, not another run or a fabricated pass. Inspect, then resume through
 LangGraph; all checks, review and delivery remain mandatory. Missing panes alone do
-not prove descendant settlement. Never edit the initializer or canonical state.
+not prove descendant settlement. Protected-process permission errors and missing
+cwd on a still-present process remain unknown settlement, with an actionable PID
+error. Never exempt a system-looking process or run this runner as root; this
+transition has no privileged-attestation input. Read the contract's protected-process
+section before proposing a separate inspection extension. Never edit the initializer
+or canonical state.
 
 ### Scoped validation and remediation decisions
 
