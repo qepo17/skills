@@ -46,6 +46,48 @@ def prove_boots(boots: list[dict[str, Any]], current: str, started_at: str,
             'current_boot_first_entry': latest[0]['first_entry']}
 
 
+def inspect_process(process: Path, worktree: Path) -> None:
+    unknown = (f'cannot inspect process {process.name}; worker settlement is unknown. '
+               'No replacement is authorized. Obtain separately authorized trusted inspection; '
+               'do not exclude protected processes or elevate the recovery runner.')
+    try:
+        if process.stat().st_uid != os.getuid():
+            return
+        descriptor = os.open(process, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except (FileNotFoundError, ProcessLookupError):
+        return
+    except OSError as error:
+        raise ValueError(unknown) from error
+    try:
+        # Pin the proc directory: a recycled numeric PID must not stand in for exit evidence.
+        if os.fstat(descriptor).st_uid != os.getuid():
+            raise ValueError(unknown)
+        try:
+            cwd = os.readlink('cwd', dir_fd=descriptor)
+            # Kernel deleted-path text is ambiguous and may collide with a real outside alias.
+            if not os.path.isabs(cwd) or cwd.endswith(' (deleted)'):
+                raise ValueError(unknown)
+            resolved = Path(cwd).resolve(strict=True)
+            if os.readlink('cwd', dir_fd=descriptor) != cwd:
+                raise ValueError(unknown)
+            if resolved.is_relative_to(worktree):
+                raise ValueError('a process is still using the task worktree; settlement is not exclusive')
+        except (FileNotFoundError, ProcessLookupError) as error:
+            # Missing cwd can mean a deleted directory or an exited main thread, not process exit.
+            try:
+                os.stat('stat', dir_fd=descriptor)
+            except (FileNotFoundError, ProcessLookupError):
+                try:
+                    process.stat()
+                except (FileNotFoundError, ProcessLookupError):
+                    return
+            raise ValueError(unknown) from error
+    except OSError as error:
+        raise ValueError(unknown) from error
+    finally:
+        os.close(descriptor)
+
+
 def settlement(record: dict[str, Any], expected: dict[str, str], confirmation: dict[str, str]) -> dict[str, Any]:
     # Older supervisor records did not pin their host. Journal timestamps cannot
     # repair that missing identity: explicit local-operator confirmation is required.
@@ -73,11 +115,7 @@ def settlement(record: dict[str, Any], expected: dict[str, str], confirmation: d
     for process in Path('/proc').iterdir():
         if not process.name.isdigit():
             continue
-        try:
-            if process.stat().st_uid == os.getuid() and (process / 'cwd').resolve(strict=True).is_relative_to(worktree):
-                raise ValueError('a process is still using the task worktree; settlement is not exclusive')
-        except FileNotFoundError:
-            continue  # The process exited while observing it.
+        inspect_process(process, worktree)
     return {**proof, 'host_confirmation': confirmation, 'herdr_binary': binary,
             'agents': agents, 'workspaces': workspaces}
 

@@ -129,6 +129,28 @@ class InterruptedPacketRecoveryTests(unittest.TestCase):
         self.assertEqual(before, engine.run_path.read_bytes())
         self.assertFalse(list((self.run_dir / 'assignments').glob('*attempt-2.json')))
 
+    def test_live_process_with_missing_cwd_refuses_cli_before_state_or_replacement_writes(self):
+        from test_process_settlement import ProcessSettlementTests
+        engine, _, _, request = self.incident()
+        process_fixture = ProcessSettlementTests()
+        process_fixture.setUp()
+        self.addCleanup(process_fixture.doCleanups)
+        process_fixture.process()
+        before = {p: p.read_bytes() for p in self.run_dir.rglob('*') if p.is_file()}
+        path = self.root / 'request.json'
+        path.write_text(json.dumps(request))
+        args = orchestrator.build_parser().parse_args(['recover-interrupted-packet', str(self.run_dir),
+            '--input', str(path), '--request-sha256', interrupted_packet.digest(request), '--text', 'yes', '--no-drive'])
+        with process_fixture.observations(), \
+             mock.patch.object(orchestrator, '_open_graph', side_effect=AssertionError('must not open checkpoint')):
+            with self.assertRaisesRegex(ValueError, 'process 123.*settlement is unknown'):
+                orchestrator._invoke(args, {'run_dir': str(self.run_dir)})
+        for artifact, content in before.items():
+            self.assertEqual(content, artifact.read_bytes(), str(artifact))
+        self.assertFalse(list((self.run_dir / 'assignments').glob('*attempt-2.json')))
+        self.assertFalse((self.run_dir / 'logs' / 'incidents').exists())
+        self.assertEqual('blocked', engine.load_run()['status'])
+
     def test_stale_requests_and_generic_continue_are_rejected(self):
         engine, _, _, request = self.incident()
         with self.assertRaisesRegex(ValueError, 'authorization'):

@@ -61,6 +61,33 @@ history and local Herdr/Pi identity evidence; absence of processes or a missing 
 alone is unknown. Backend observations honor the configured `E2E_HERDR_BINARY`, not
 an implicitly substituted terminal manager.
 
+## Protected or disappearing processes
+
+Permission-denied process metadata means **unknown settlement**, not an unrelated
+system helper. The guard reports the numeric PID and refuses recovery before any
+snapshot, replacement assignment, state projection or worker launch. It never
+reads command lines/environment values, terminates a process, or invokes a
+privileged inspector. No PID/name allowlist, `sd-pam` exception, cgroup/parent/time
+heuristic, or blanket permission-error suppression is supported. Those observations
+do not authenticate a protected process's origin or its unreadable working directory.
+
+Each inspected proc directory is descriptor-bound. A missing working directory
+can mean a deleted directory or an exited main thread while other threads survive;
+it is not proof of process exit. The kernel's ambiguous ` (deleted)` suffix is
+always refused, even if its text happens to resolve to an existing outside alias.
+Missing cwd permits continuation only when both
+the pinned process's `stat` entry and its numeric proc path are gone. A surviving or
+reused numeric PID, changed ownership/cwd, or another inspection error remains
+unknown. Readable worktree/descendant cwd still blocks; readable outside cwd remains
+only a point-in-time observation, not a durable worker lease.
+
+If inspection is denied, preserve the blocked run and obtain separately authorized
+trusted inspection rather than guessing or running the orchestrator as root. This
+transition currently has **no privileged-attestation input**: a manual observation,
+user-writable JSON file, checksum or a second confirmation cannot unlock it.
+Supporting authenticated external inspection would require a separately scoped,
+reviewed extension. Do not imply the diagnostic repair itself unblocks such a host.
+
 ## Admission and preservation
 
 - Single-repository policy-version-1 run, blocked in implement, approved unchanged
