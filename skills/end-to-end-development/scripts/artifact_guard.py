@@ -747,6 +747,13 @@ def validate_run_amendment(data: dict[str, Any]) -> None:
         hashed_file_reference(reference, f"$.evidence[{index}]")
 
 
+INTERRUPTED_PACKET_INSTRUCTION = (
+    "Resume the unfinished approved packet from the preserved worktree; do not discard existing changes "
+    "or rewrite prior outputs/logs. Its initializer is not completed work or passing evidence. "
+    "Run every assigned check freshly."
+)
+
+
 def validate_run(data: dict[str, Any]) -> None:
     validate_common(data, "run")
     timestamp(field(data, "created_at", "$"), "$.created_at")
@@ -1080,6 +1087,29 @@ def validate_run(data: dict[str, Any]) -> None:
             hashed_file_reference(field(record, key, loc), f"{loc}.{key}")
         for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
             hashed_file_reference(reference, f"{loc}.evidence[{index}]")
+
+    for action_id, ref in obj(data.get("interrupted_packet_recoveries", {}), "$.interrupted_packet_recoveries").items():
+        loc = f"$.interrupted_packet_recoveries.{action_id}"
+        record = load_json_object(hashed_file_reference(ref, loc), loc)
+        request = obj(field(record, "request", loc), loc + ".request")
+        if (data.get("validation_policy_version") != 1 or record.get("run_id") != data["run_id"]
+                or record.get("artifact_kind") != "interrupted-packet-recovery"
+                or hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest() != record.get("request_sha256")):
+            fail(loc, "invalid interrupted-packet recovery identity")
+        string(field(record, "text", loc), loc + ".text", nonempty=True)
+        original = load_json_object(hashed_file_reference(request["assignment"], loc), loc)
+        replacement = load_json_object(hashed_file_reference(record["replacement"], loc), loc)
+        validate_assignment(original)
+        validate_assignment(replacement)
+        if (original["action_id"] != action_id or original["repo_id"] not in repositories
+                or action_id in repositories[original["repo_id"]]["accepted_artifacts"]
+                or replacement["attempt"] != original["attempt"] + 1
+                or replacement["instructions"] != sorted(set(original["instructions"] + [INTERRUPTED_PACKET_INSTRUCTION]))
+                or any(replacement.get(k) != v for k, v in original.items()
+                       if k not in {"attempt", "created_at", "action_id", "output_artifact", "log_dir", "instructions"})):
+            fail(loc, "unfinished evidence cannot be accepted or its replacement scope changed")
+        for index, evidence in enumerate(array(field(record, "evidence", loc), loc + ".evidence")):
+            hashed_file_reference(evidence, f"{loc}.evidence[{index}]")
 
     for family, validator in (("external_repair", validate_external_recovery),
                               ("writer_incident", validate_writer_incident_recovery)):

@@ -1057,7 +1057,7 @@ class WorkflowEngine:
         recovered_workers: dict[str, dict[str, Any]] = {}
         for action in preflight["next_actions"]:
             assignment_path = action.get("assignment_path")
-            if action.get("status") != "working" or not assignment_path:
+            if not assignment_path:
                 continue
             resolved_assignment_path = Path(assignment_path)
             assignment = _load_json(resolved_assignment_path)
@@ -1423,6 +1423,46 @@ class WorkflowEngine:
             raise WorkflowError(f"unsupported assignment stage: {stage}")
         return base / name
 
+    def _resolve_existing_assignment(self, assignment_path: Path) -> Path:
+        """Reuse existing work or its bounded artifact-only repair, never blindly replay it."""
+        run = self.load_run()
+        while True:
+            assignment = _load_json(assignment_path)
+            artifact_guard.validate_assignment(assignment)
+            redirected = self._repair_redirect(assignment_path)
+            if redirected != assignment_path:
+                return redirected
+            if assignment.get("execution_mode") in {"artifact-repair", "packet-verification"}:
+                return assignment_path  # Its original one-shot claim owns any retry decision.
+            output_path = Path(assignment["output_artifact"])
+            if not output_path.exists():
+                return assignment_path
+            try:
+                existing = _load_json(output_path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                return assignment_path
+            if existing.get("status") not in {"blocked", "failed"}:
+                return assignment_path
+            repo_id = assignment.get("repo_id")
+            if (assignment.get("output_kind") == "result"
+                    and run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
+                    and assignment["action_id"] not in run.get("artifact_repairs", {})
+                    and assignment["action_id"] not in (
+                        run["repositories"][repo_id]["accepted_artifacts"] if repo_id else run["accepted_artifacts"]
+                    )):
+                try:
+                    self._validate_worker_output(assignment, output_path)
+                except artifact_guard.ValidationError as error:
+                    if error.code == "missing-field" and re.fullmatch(r"\$\.blockers\[[0-9]+\]\.kind", error.path):
+                        return self._artifact_repair_assignment(assignment)
+                    raise WorkflowError(f"Cannot resume invalid result evidence: {error}") from error
+            refs = run["repositories"][repo_id]["accepted_artifacts"] if repo_id else run["accepted_artifacts"]
+            if assignment["action_id"] not in refs and assignment["action_id"] not in run.get("artifact_repairs", {}):
+                # Let the supervisor adopt/reject the original worker first. The
+                # ordinary replacement path then releases its pending action.
+                return assignment_path
+            assignment_path = self._replacement(assignment)
+
     def build_assignment(
         self,
         *,
@@ -1446,34 +1486,7 @@ class WorkflowEngine:
         action_id = f"{stage}:{repo_id or 'global'}:{scope}:attempt-{attempt}"
         assignment_path = self.run_dir / "assignments" / f"{_slug(action_id)}.json"
         if assignment_path.exists():
-            while True:
-                assignment = _load_json(assignment_path)
-                artifact_guard.validate_assignment(assignment)
-                redirected = self._repair_redirect(assignment_path)
-                if redirected != assignment_path:
-                    return redirected
-                output_path = Path(assignment["output_artifact"])
-                if not output_path.exists():
-                    return assignment_path
-                try:
-                    existing = _load_json(output_path)
-                except (OSError, ValueError, json.JSONDecodeError):
-                    return assignment_path
-                if existing.get("status") not in {"blocked", "failed"}:
-                    return assignment_path
-                if (assignment.get("output_kind") == "result"
-                        and run["retry_limits"].get("artifact_repairs_per_action", 0) == 1
-                        and assignment["action_id"] not in run.get("artifact_repairs", {})
-                        and assignment["action_id"] not in (
-                            run["repositories"][repo_id]["accepted_artifacts"] if repo_id else run["accepted_artifacts"]
-                        )):
-                    try:
-                        self._validate_worker_output(assignment, output_path)
-                    except artifact_guard.ValidationError as error:
-                        if error.code == "missing-field" and re.fullmatch(r"\$\.blockers\[[0-9]+\]\.kind", error.path):
-                            return self._artifact_repair_assignment(assignment)
-                        raise WorkflowError(f"Cannot resume invalid result evidence: {error}") from error
-                assignment_path = self._replacement(assignment)
+            return self._resolve_existing_assignment(assignment_path)
 
         if inputs is None:
             selected_inputs = self._canonical_inputs(run, repo_id)
@@ -3623,12 +3636,28 @@ class WorkflowEngine:
 
     def phase_implement(self) -> str:
         run = self.load_run()
+        if run["status"] == "blocked":
+            return "blocked"
         approved = run.get("plan_review")
         if not isinstance(approved, dict) or approved.get("status") != "approved":
             raise WorkflowError("implementation requires the approved plan bundle")
         recovery = self._verify_external_repairs(run)
         if recovery is not None:
             return recovery
+        pending = [Path(action["assignment_path"]) for action in run["next_actions"]
+                   if action["phase"] == "implement"]
+        if pending:
+            # A later packet's partial writes legitimately stale its predecessor's
+            # checks. Settle its existing intent before gating a new packet.
+            for path in pending:
+                assignment = _load_json(path)
+                if not self._migration_guard(assignment["repo_id"]):
+                    return "blocked"
+            for artifact in self._run_with_replacements([self._resolve_existing_assignment(path) for path in pending]):
+                if artifact.get("status") != "complete":
+                    self._block_from_artifact(artifact)
+                    return "blocked"
+            return "implement"
         assignments: list[Path] = []
         all_complete = True
         completed_repositories: set[str] = set()

@@ -143,6 +143,20 @@ If a dependent fix was started concurrently with an upstream contract fix and st
 
 The guarded transition rejects other dependency blockers, serializes remaining fixes in shared-contract dependency order, grants read-only access to upstream worktrees, and pins accepted upstream fix artifacts into each dependent assignment.
 
+### Interrupted later packet after host reboot
+
+A lost pending packet can leave an unfinished initializer and partial source behind
+its predecessor's stale local-check blocker. After explicit authorization for engine
+repair and recovery, read [the narrow interrupted-packet contract](schemas/interrupted-packet-recovery.md).
+`recover-interrupted-packet --input ... --request-sha256 ... --text ... --no-drive`
+requires the approved original assignment, unchanged history/source, settled handles,
+positive local host-reboot evidence, and separate operator confirmation of local-only
+origin with no relocation. Tooling-repair approval alone does not establish the old
+worker's host. It queues one budgeted replacement with new
+output/log paths, not another run or a fabricated pass. Inspect, then resume through
+LangGraph; all checks, review and delivery remain mandatory. Missing panes alone do
+not prove descendant settlement. Never edit the initializer or canonical state.
+
 ### Scoped validation and remediation decisions
 
 For a policy-version-1 run, inspect `status.amendment_contexts[repo_id]` (the SHA-256 string directly) and `status.eligible_actions`. The coordinator may read the cited evidence and translate either (a) an explicit user instruction to exclude or restore eligible local checks, preserving the user's exact wording, or (b) an evidence-based determination that named local/CI failures are related to the approved change and may use the existing bounded fix path. The coordinator never chooses a graph phase, edits state, patches source, or authors the resulting assignment.
