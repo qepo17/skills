@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -292,6 +293,94 @@ class WorkerCommandTests(unittest.TestCase):
                 command = supervisor.preview(self.request(runtime, level))["command"][-1]
                 expected = f"--thinking {level}" if runtime == "pi" else f'model_reasoning_effort="{level}"'
                 self.assertIn(expected, command)
+
+    def assert_codex_sandbox(self, command: list[str]) -> None:
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertEqual("workspace-write", command[command.index("--sandbox") + 1])
+        self.assertIn('approval_policy="never"', command)
+        self.assertIn("sandbox_workspace_write.network_access=false", command)
+        roots = next(arg.split("=", 1)[1] for arg in command
+                     if arg.startswith("sandbox_workspace_write.writable_roots="))
+        self.assertEqual([str(self.run_dir.resolve())], json.loads(roots))
+
+    def test_codex_direct_and_tmux_launch_with_scoped_sandbox(self) -> None:
+        fake_codex = self.root / "fake-codex.py"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "print(json.dumps(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        for backend in ("direct", "tmux"):
+            with self.subTest(backend=backend):
+                self.run_dir = self.root / f"run {backend}"
+                self.run_dir.mkdir()
+                supervisor = worker_supervisor.WorkerSupervisor(
+                    self.run_dir,
+                    worker_supervisor.ExecutionContext(backend, "codex", "test", {}),
+                    codex_binary=str(fake_codex),
+                    run_process=FakeTmuxRunner(),
+                )
+                request = self.request("codex")
+                preview = supervisor.preview(request)["command"]
+                if backend == "tmux":
+                    preview = shlex.split(preview[-1])
+                self.assert_codex_sandbox(preview)
+                outcome = supervisor.run_batch([request])[0]
+                self.assertTrue(outcome["settled"])
+                launched = json.loads(Path(outcome["stdout_path"]).read_text())
+                self.assertEqual(preview[1:], launched)
+                self.assertEqual(["--", request.prompt], launched[-2:])
+
+    def test_codex_herdr_launch_uses_the_same_scoped_sandbox(self) -> None:
+        runner = FakeCommandRunner({
+            "herdr workspace create": (0, {"workspace_id": "w1", "pane_id": "p1"}),
+            "herdr workspace close": (0, {"closed": True}),
+            "herdr agent": (0, {"status": "idle"}),
+        })
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("herdr", "codex", "test", {}),
+            run_process=runner,
+        )
+        outcome = supervisor.run_batch([self.request("codex")])[0]
+        self.assertTrue(outcome["settled"])
+        launch = next(c for c in runner.commands if c[1:3] == ["agent", "start"])
+        self.assert_codex_sandbox(launch)
+
+    def test_codex_paseo_preview_and_launch_select_sandboxed_mode(self) -> None:
+        runner = FakeCommandRunner({
+            "paseo run": (0, {"id": "worker-1"}),
+            "paseo wait": (0, {"status": "idle"}),
+            "paseo archive": (0, {"archived": True}),
+        })
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("paseo", "codex", "test", {}),
+            run_process=runner,
+        )
+        request = self.request("codex")
+        preview = supervisor.preview(request)["command"]
+        outcome = supervisor.run_batch([request])[0]
+        self.assertTrue(outcome["settled"])
+        launch = next(c for c in runner.commands if c[1] == "run")
+        for command in (preview, launch):
+            self.assertNotIn("bypass", command)
+            self.assertEqual("auto", command[command.index("--mode") + 1])
+            self.assertEqual(["--", request.prompt], command[-2:])
+
+    def test_rejected_paseo_mode_is_not_retried_without_protections(self) -> None:
+        runner = FakeCommandRunner({"paseo run": (1, "unsupported mode")})
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("paseo", "codex", "test", {}),
+            run_process=runner,
+        )
+        outcome = supervisor.run_batch([self.request("codex")])[0]
+        self.assertFalse(outcome["settled"])
+        self.assertEqual(1, len(runner.commands))
+        self.assertEqual("auto", runner.commands[0][runner.commands[0].index("--mode") + 1])
 
     def test_unknown_reasoning_policy_never_silently_changes_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported worker reasoning policy"):
