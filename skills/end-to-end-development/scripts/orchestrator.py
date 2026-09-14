@@ -166,6 +166,14 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
                         request_sha256=args.request_sha256, text=args.text, context=args.context)
         if outcome == "already-applied" or args.no_drive:
             return {**_result(engine), "recovery": outcome}
+    if args.command == "recover-interrupted-packet":
+        import interrupted_packet
+        engine = WorkflowEngine(args.run_dir.resolve(), worker_runtime=args.worker_runtime, report_root=args.report_root)
+        with RunLock(engine.run_dir):
+            outcome = interrupted_packet.recover(engine, json.loads(args.input.read_text()),
+                        request_sha256=args.request_sha256, text=args.text, context=args.context)
+        if outcome == "already-applied" or args.no_drive:
+            return {**_result(engine), "recovery": outcome}
     with _open_graph(
         args.run_dir.resolve(),
         worker_runtime=args.worker_runtime,
@@ -334,6 +342,18 @@ def build_parser() -> argparse.ArgumentParser:
     incident.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     incident.add_argument("--report-root", type=Path)
 
+    interrupted = subparsers.add_parser(
+        "recover-interrupted-packet", help="restore an unfinished approved packet lost behind its predecessor's stale checks after host reboot"
+    )
+    interrupted.add_argument("run_dir", type=Path)
+    interrupted.add_argument("--input", type=Path, required=True)
+    interrupted.add_argument("--request-sha256", required=True)
+    interrupted.add_argument("--text", required=True, help="exact explicit user recovery authorization")
+    interrupted.add_argument("--context", default="")
+    interrupted.add_argument("--no-drive", action="store_true")
+    interrupted.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    interrupted.add_argument("--report-root", type=Path)
+
     replan = subparsers.add_parser(
         "replan-decision", help="return an accepted implementation decision to bounded planning"
     )
@@ -421,7 +441,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "replan-decision", "amend"}:
+        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "recover-interrupted-packet", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,13 +31,26 @@ def reference(path: Path) -> dict[str, str]:
 
 
 def preserve(path: Path, content: bytes) -> dict[str, str]:
+    """Publish durable immutable bytes exclusively, never a partially written record."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     try:
-        with path.open("xb") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
-    except FileExistsError:
-        if path.is_symlink() or path.read_bytes() != content:
-            raise ValueError(f"incident snapshot already exists with different bytes: {path}")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or path.read_bytes() != content:
+                raise ValueError(f"incident snapshot already exists with different bytes: {path}")
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return reference(path)
 
 
