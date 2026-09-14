@@ -260,7 +260,8 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_reasoning_reaches_paseo_and_herdr_launchers(self) -> None:
         for backend in ("paseo", "herdr"):
-            for runtime in ("pi", "codex"):
+            runtimes = ("pi",) if backend == "paseo" else ("pi", "codex")
+            for runtime in runtimes:
                 for level in ("medium", "high", "xhigh"):
                     with self.subTest(backend=backend, runtime=runtime, level=level):
                         runner = FakeCommandRunner({
@@ -349,11 +350,48 @@ class WorkerCommandTests(unittest.TestCase):
         launch = next(c for c in runner.commands if c[1:3] == ["agent", "start"])
         self.assert_codex_sandbox(launch)
 
-    def test_codex_paseo_preview_and_launch_select_sandboxed_mode(self) -> None:
+    def test_codex_paseo_launch_blocks_before_submitting_any_prompt(self) -> None:
+        for label, snapshot in (
+            ("unsafe-override", {"Mode": "auto", "providerOptions": {
+                "sandbox_mode": "danger-full-access", "approval_policy": "never",
+            }}),
+            ("mode-only", {"Mode": "auto", "PendingPermissions": []}),
+            ("unknown", {}),
+        ):
+            with self.subTest(snapshot=label):
+                runner = FakeCommandRunner({
+                    "paseo inspect": (0, snapshot),
+                    "paseo run": (0, {"id": "worker-1"}),
+                    "paseo wait": (0, {"status": "idle"}),
+                    "paseo archive": (0, {"archived": True}),
+                })
+                supervisor = worker_supervisor.WorkerSupervisor(
+                    self.run_dir / label,
+                    worker_supervisor.ExecutionContext("paseo", "codex", "test", {}),
+                    run_process=runner,
+                )
+                outcome = supervisor.run_batch([self.request("codex")])[0]
+                self.assertFalse(outcome["settled"])
+                self.assertFalse(outcome["timed_out"])
+                self.assertIn("effective sandbox and approval permissions cannot be verified", outcome["reason"])
+                self.assertEqual("unavailable", outcome["handle_id"])
+                self.assertEqual([], runner.commands)
+
+    def test_codex_paseo_preview_refuses_an_unverifiable_launch(self) -> None:
+        runner = FakeCommandRunner({})
+        supervisor = worker_supervisor.WorkerSupervisor(
+            self.run_dir,
+            worker_supervisor.ExecutionContext("paseo", "codex", "test", {}),
+            run_process=runner,
+        )
+        with self.assertRaisesRegex(RuntimeError, "effective sandbox and approval permissions cannot be verified"):
+            supervisor.preview(self.request("codex"))
+        self.assertEqual([], runner.commands)
+
+    def test_existing_codex_paseo_worker_can_settle_without_a_new_launch(self) -> None:
         runner = FakeCommandRunner({
-            "paseo run": (0, {"id": "worker-1"}),
-            "paseo wait": (0, {"status": "idle"}),
-            "paseo archive": (0, {"archived": True}),
+            "paseo wait existing-worker": (0, {"status": "idle"}),
+            "paseo archive existing-worker": (0, {"archived": True}),
         })
         supervisor = worker_supervisor.WorkerSupervisor(
             self.run_dir,
@@ -361,26 +399,42 @@ class WorkerCommandTests(unittest.TestCase):
             run_process=runner,
         )
         request = self.request("codex")
-        preview = supervisor.preview(request)["command"]
+        record_path = self.run_dir / "supervisor" / supervisor.record_name(request.action_id)
+        record_path.parent.mkdir(parents=True)
+        record = {
+            "schema_version": 1,
+            "action_id": request.action_id,
+            "agent_name": request.agent_name,
+            "backend": "paseo",
+            "runtime": "codex",
+            "handle_id": "existing-worker",
+            "started_at": "2026-09-14T09:00:00Z",
+            "ended_at": None,
+            "status": "working",
+            "cleanup_status": "pending",
+            "status_path": str(self.run_dir / "status.json"),
+            "stdout_path": str(self.run_dir / "stdout.log"),
+            "stderr_path": str(self.run_dir / "stderr.log"),
+            "details": {"agent_id": "existing-worker"},
+        }
+        record_path.write_text(json.dumps(record), encoding="utf-8")
         outcome = supervisor.run_batch([request])[0]
         self.assertTrue(outcome["settled"])
-        launch = next(c for c in runner.commands if c[1] == "run")
-        for command in (preview, launch):
-            self.assertNotIn("bypass", command)
-            self.assertEqual("auto", command[command.index("--mode") + 1])
-            self.assertEqual(["--", request.prompt], command[-2:])
+        self.assertEqual("complete", outcome["cleanup_status"])
+        self.assertEqual(["wait", "archive"], [c[1] for c in runner.commands])
+        persisted = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual("existing-worker", persisted["handle_id"])
+        self.assertEqual("codex", persisted["runtime"])
 
-    def test_rejected_paseo_mode_is_not_retried_without_protections(self) -> None:
-        runner = FakeCommandRunner({"paseo run": (1, "unsupported mode")})
-        supervisor = worker_supervisor.WorkerSupervisor(
-            self.run_dir,
-            worker_supervisor.ExecutionContext("paseo", "codex", "test", {}),
-            run_process=runner,
-        )
-        outcome = supervisor.run_batch([self.request("codex")])[0]
-        self.assertFalse(outcome["settled"])
-        self.assertEqual(1, len(runner.commands))
-        self.assertEqual("auto", runner.commands[0][runner.commands[0].index("--mode") + 1])
+        record["handle_id"] = None
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        runner.commands.clear()
+        runner.responses["paseo ls"] = (0, {"id": "existing-worker"})
+        outcome = supervisor.run_batch([request])[0]
+        self.assertTrue(outcome["settled"])
+        self.assertEqual("existing-worker", outcome["handle_id"])
+        self.assertEqual("complete", outcome["cleanup_status"])
+        self.assertEqual(["ls", "wait", "archive"], [c[1] for c in runner.commands])
 
     def test_unknown_reasoning_policy_never_silently_changes_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported worker reasoning policy"):
