@@ -185,7 +185,9 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         elif args.command == "amend":
             if graph.get_state(config).next:
                 raise WorkflowError("amendment requires a settled graph cursor")
-            engine.apply_amendment(json.loads(args.input.read_text(encoding="utf-8")))
+            amendment = engine.apply_amendment(json.loads(args.input.read_text(encoding="utf-8")))
+            if args.no_drive:
+                return {**_result(engine), 'amendment': amendment}
         elif args.command == "retry-validation-evidence":
             if not engine.retry_validation_evidence():
                 raise WorkflowError(
@@ -299,6 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
     amend.add_argument("--input", type=Path, required=True)
     amend.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     amend.add_argument("--report-root", type=Path)
+    amend.add_argument('--no-drive', action='store_true', help='record the guarded decision without launching graph work')
 
     validation_retry = subparsers.add_parser(
         "retry-validation-evidence",

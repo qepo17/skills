@@ -1,6 +1,6 @@
 # LangGraph orchestration
 
-LangGraph is the only executable control-flow engine for this skill. The Pi/Codex coordinator performs repository discovery and translates that evidence into a bootstrap specification. For new policy-version-1 runs it may also inspect hash-pinned evidence read-only and translate explicit user validation exceptions or evidence-based related remediation into the typed amendment request. It may also keep the append-only clarification interaction ledger described below. It does not choose phases, construct or author worker assignments, launch batches, manage retries, patch source, or mutate run state directly.
+LangGraph is the only executable control-flow engine for this skill. The Pi/Codex coordinator performs repository discovery and translates that evidence into a bootstrap specification. For new policy-version-1 runs it may also inspect hash-pinned evidence read-only and translate explicit user validation exceptions, authorized interrupted-validation retries, or evidence-based related remediation into the typed amendment request. It may also keep the append-only clarification interaction ledger described below. It does not choose phases, construct or author worker assignments, launch batches, manage retries, patch source, or mutate run state directly.
 
 ## Authority model
 
@@ -176,7 +176,7 @@ Legacy `resume` behavior is unchanged. On a new run it may re-observe an identif
 
 ### Typed run amendments
 
-Read [schemas/run-amendment.md](schemas/run-amendment.md) before submitting a decision. The request JSON must contain exactly these fields:
+Read [schemas/run-amendment.md](schemas/run-amendment.md) before submitting a decision. The common request JSON contains these fields (interrupted-validation retries additionally require the documented `interruption` attestation):
 
 ```json
 {
@@ -203,6 +203,8 @@ Supported combinations are exact:
 
 - `kind: validation-exception`, `decision: exclude|restore`, `target: local`, `authority: user`, and non-null verbatim `text`. Only named supplemental, non-migration validations are eligible.
 - `kind: check-remediation`, `decision: fix-related`, `target: local|ci`, `authority: coordinator`, `text: null`, and non-empty hash-pinned `evidence`. The rationale/evidence must establish task relatedness and approved-scope compatibility. Required-CI IDs are `name@app_id`, or `name@*` when the policy has no app ID.
+
+- `kind: validation-retry`, `decision: retry-interrupted`, `target: local`, `authority: user`, verbatim authorization, and the documented `interruption` attestation plus reviewed source/harness-log pins. Only an accepted validation-fix result with its source-fix allowance exhausted and exactly one required interrupted local-gate command in implement/validate is eligible. Status identifies possible 124 outcomes but does not establish their cause. The graph claims one read-only verifier per repository/run; no source retries, test waivers, or replacement launches. Use `amend ... --no-drive`, inspect the preserved projection/evidence, then `resume`. Targets require fresh exact-command logs with individual timeouts; only other pinned current passing observations may be reused. Every ordinary gate remains mandatory.
 
 `check_ids` are sorted, unique, and non-empty; every evidence item is `{path, sha256}` and must be captured inside the run without secrets. The coordinator may translate exact user wording or its own read-only, evidence-based relatedness assessment, but may not invent authority, waive CI, treat unchanged files as proof of a pre-existing failure, or automatically authorize an unknown/unrelated fix.
 

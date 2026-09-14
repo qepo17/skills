@@ -688,14 +688,18 @@ def validate_amendment_request(data: dict[str, Any]) -> None:
     if len(json.dumps(data).encode()) > MAX_BYTES['run-amendment']:
         fail('$', 'amendment request exceeds its size limit')
     allowed = {"kind", "decision", "repo_id", "target", "check_ids", "authority", "text", "rationale", "expected_context", "evidence"}
+    kind = enum(field(data, 'kind', '$'), {"validation-exception", "check-remediation", "validation-retry"}, "$.kind")
+    if kind == 'validation-retry':
+        allowed.add('interruption')
     if set(data) != allowed:
         fail("$", f"amendment request must have exactly {sorted(allowed)}")
-    kind = enum(data["kind"], {"validation-exception", "check-remediation"}, "$.kind")
-    enum(data["decision"], {"exclude", "restore"} if kind == "validation-exception" else {"fix-related"}, "$.decision")
+    decisions = {'validation-exception': {'exclude', 'restore'}, 'check-remediation': {'fix-related'},
+                 'validation-retry': {'retry-interrupted'}}
+    enum(data["decision"], decisions[kind], "$.decision")
     repo_id(data["repo_id"], "$.repo_id")
-    enum(data["target"], {"local"} if kind == "validation-exception" else {"local", "ci"}, "$.target")
+    enum(data["target"], {"local", "ci"} if kind == "check-remediation" else {"local"}, "$.target")
     string_array(data["check_ids"], "$.check_ids", sorted_values=True, nonempty=True, unique=True)
-    expected_authority = "user" if kind == "validation-exception" else "coordinator"
+    expected_authority = "coordinator" if kind == "check-remediation" else "user"
     if data["authority"] != expected_authority:
         fail("$.authority", f"must be {expected_authority}")
     if expected_authority == "user":
@@ -705,8 +709,17 @@ def validate_amendment_request(data: dict[str, Any]) -> None:
     string(data["rationale"], "$.rationale", max_length=2000)
     sha256(data["expected_context"], "$.expected_context")
     evidence = array(data["evidence"], "$.evidence")
-    if kind == "check-remediation" and not evidence:
-        fail("$.evidence", "related remediation requires reviewed evidence")
+    if kind in {'check-remediation', 'validation-retry'} and not evidence:
+        fail("$.evidence", "remediation/retry requires reviewed evidence")
+    if kind == 'validation-retry':
+        if len(data['check_ids']) != 1:
+            fail('$.check_ids', 'interrupted recovery targets exactly one required command')
+        interruption = obj(data['interruption'], '$.interruption')
+        if (set(interruption) != {'kind', 'harness_exit_code', 'child_exit_code'}
+                or interruption['kind'] != 'enclosing-harness-timeout'
+                or type(interruption['harness_exit_code']) is not int or interruption['harness_exit_code'] != 124
+                or interruption['child_exit_code'] is not None):
+            fail('$.interruption', 'requires an enclosing harness timeout with unknown child exit, not an assertion failure')
     for index, reference in enumerate(evidence):
         hashed_file_reference(reference, f"$.evidence[{index}]")
 
@@ -745,6 +758,22 @@ def validate_run_amendment(data: dict[str, Any]) -> None:
         optional_hashed_file_reference(field(data, key, "$"), f"$.{key}")
     for index, reference in enumerate(array(field(data, "evidence", "$"), "$.evidence")):
         hashed_file_reference(reference, f"$.evidence[{index}]")
+    if data['kind'] == 'validation-retry':
+        source_path = hashed_file_reference(data['source_artifact'], '$.source_artifact')
+        verify_accepted_validation_evidence(load_json_object(source_path, '$.source_artifact'))
+
+
+def verify_accepted_validation_evidence(result: dict[str, Any]) -> None:
+    path = Path(result['assignment_path'])
+    if hashlib.sha256(path.read_bytes()).hexdigest() != result['assignment_sha256']:
+        fail('$.assignment_sha256', 'accepted assignment hash changed')
+    assignment = load_json_object(path, '$.assignment_path')
+    for record in result['validations']:
+        validation_log_path(record, assignment, '$.validations.log_path')
+        if record.get('log_path') and not record.get('log_sha256'):
+            fail('$.validations', 'new-run validation requires acceptance-time log identity')
+    validate_validation_records(result['validations'], '$.validations', tree_fingerprint=result['tree_fingerprint'],
+        require_cache_metadata=True, artifact_path=Path(assignment['output_artifact']), enforce_log_identity=True)
 
 
 INTERRUPTED_PACKET_INSTRUCTION = (
@@ -782,6 +811,15 @@ def validate_run(data: dict[str, Any]) -> None:
         for repo, reference in obj(data.get(pending_key, {}), f"$.{pending_key}").items():
             if repo not in data.get("repositories", {}) or reference not in amendments:
                 fail(f"$.{pending_key}", "must pin a recorded amendment for a known repository")
+    for repo, reference in obj(data.get('validation_retry_attempts', {}), '$.validation_retry_attempts').items():
+        path = hashed_file_reference(reference, '$.validation_retry_attempts.' + repo)
+        assignment = load_json_object(path, '$.validation_retry_attempts')
+        decision_ref = assignment.get('validation_refresh')
+        if (repo not in data.get('repositories', {}) or assignment.get('repo_id') != repo
+                or assignment.get('run_id') != data['run_id'] or assignment.get('stage') != 'validate'
+                or decision_ref not in amendments
+                or load_json_object(decision_ref['path'], '$.validation_retry_attempts').get('kind') != 'validation-retry'):
+            fail('$.validation_retry_attempts', 'must pin the one validation-only retry assignment for this repository/run')
     profile_value = data.get("profile")
     profile: str | None = None
     workflow_policy: dict[str, Any] | None = None
@@ -1838,10 +1876,16 @@ def validate_assignment(data: dict[str, Any]) -> None:
             path = hashed_file_reference(reference, '$.' + field_name)
             amendment = load_json_object(path, '$.' + field_name)
             validate_run_amendment(amendment)
-            if (stage not in stages or amendment['kind'] != kind or amendment['decision'] != decision
+            interrupted_retry = (field_name == 'validation_refresh' and amendment['kind'] == 'validation-retry'
+                                 and amendment['decision'] == 'retry-interrupted')
+            if (stage not in stages or (not interrupted_retry and (amendment['kind'] != kind or amendment['decision'] != decision))
                     or amendment['repo_id'] != assigned_repo or amendment['run_id'] != data['run_id']
                     or reference not in data['input_artifacts']):
                 fail('$.' + field_name, 'must pin the matching repository/stage amendment as an input')
+            if interrupted_retry and (any(data.get(key) != 'none' for key in ('project_file_access', 'git_access', 'forge_access'))
+                    or any(repo['access'] != 'read' for repo in data['repositories'])
+                    or data.get('input_tree_fingerprint') != amendment['repository_state']['fingerprint']):
+                fail('$.validation_refresh', 'interrupted validation retry must preserve source/Git/forge state')
             if field_name == 'remediation':
                 if amendment['target'] != ('ci' if stage == 'pipeline-fix' else 'local'):
                     fail('$.remediation', 'target must match the source-fix stage')
@@ -2947,6 +2991,20 @@ def validate_result(data: dict[str, Any]) -> None:
     elif profiled:
         fail("$.tree_fingerprint", "is required for profiled result artifacts")
     validation_records = field(data, "validations", "$")
+    if assignment.get('validation_refresh'):
+        refresh = load_json_object(assignment['validation_refresh']['path'], '$.assignment.validation_refresh')
+        if refresh['kind'] == 'validation-retry':
+            records = {}
+            for index, raw in enumerate(array(validation_records, '$.validations')):
+                location = f'$.validations[{index}]'
+                record = obj(raw, location)
+                records[string(field(record, 'id', location), location + '.id')] = record
+            for check_id in refresh['check_ids']:
+                if check_id not in records or records[check_id].get('cache_status') != 'fresh':
+                    fail('$.validations', 'interrupted targets require fresh exact-command evidence, never cached substitutes')
+            if any(record.get('cache_status') == 'reused' and record.get('source_artifact') != refresh['source_artifact']
+                   for record in records.values()):
+                fail('$.validations', 'retry may reuse only passing checks from the pinned current source artifact')
     if assignment.get('validation_policy_version') == 1:
         plans = [load_json_object(ref['path'], '$.assignment.input_artifacts') for ref in assignment['input_artifacts']
                  if Path(ref['path']).suffix == '.json']
