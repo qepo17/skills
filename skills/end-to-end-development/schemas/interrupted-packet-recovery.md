@@ -65,9 +65,9 @@ an implicitly substituted terminal manager.
 
 Permission-denied process metadata means **unknown settlement**, not an unrelated
 system helper. The guard reports the numeric PID and refuses recovery before any
-snapshot, replacement assignment, state projection or worker launch. It never
+snapshot, replacement assignment, state projection or worker launch. By default it never
 reads command lines/environment values, terminates a process, or invokes a
-privileged inspector. No PID/name allowlist, `sd-pam` exception, cgroup/parent/time
+privileged inspector. A separately authorized one-time inspection is described below. No PID/name allowlist, `sd-pam` exception, cgroup/parent/time
 heuristic, or blanket permission-error suppression is supported. Those observations
 do not authenticate a protected process's origin or its unreadable working directory.
 
@@ -81,12 +81,15 @@ reused numeric PID, changed ownership/cwd, or another inspection error remains
 unknown. Readable worktree/descendant cwd still blocks; readable outside cwd remains
 only a point-in-time observation, not a durable worker lease.
 
-If inspection is denied, preserve the blocked run and obtain separately authorized
-trusted inspection rather than guessing or running the orchestrator as root. This
-transition currently has **no privileged-attestation input**: a manual observation,
-user-writable JSON file, checksum or a second confirmation cannot unlock it.
-Supporting authenticated external inspection would require a separately scoped,
-reviewed extension. Do not imply the diagnostic repair itself unblocks such a host.
+If inspection is denied, preserve the blocked run rather than guessing or running
+the orchestrator as root. With separate explicit user authorization, the request
+may add the optional `privileged_inspection` object defined by the
+[one-time privileged inspection contract](privileged-process-inspection.md).
+Only that reviewed read-only helper is elevated; it inspects the original nonzero
+UID and returns fresh request-bound evidence directly through sudo. The attempt is
+consumed before launch, including on failure; no automatic retry is allowed.
+A manual observation, user-writable JSON file, checksum or second confirmation
+alone still cannot unlock recovery. All non-process admission gates remain unchanged.
 
 ## Admission and preservation
 

@@ -19,6 +19,8 @@ import validation_policy
 import worker_supervisor
 import workflow_tools
 from writer_incident import digest, preserve, reference, validate_history
+from read_only_process_inspector import inspect_process
+import privileged_inspection
 
 
 HOST_CONFIRMATION_QUESTION = (
@@ -46,49 +48,9 @@ def prove_boots(boots: list[dict[str, Any]], current: str, started_at: str,
             'current_boot_first_entry': latest[0]['first_entry']}
 
 
-def inspect_process(process: Path, worktree: Path) -> None:
-    unknown = (f'cannot inspect process {process.name}; worker settlement is unknown. '
-               'No replacement is authorized. Obtain separately authorized trusted inspection; '
-               'do not exclude protected processes or elevate the recovery runner.')
-    try:
-        if process.stat().st_uid != os.getuid():
-            return
-        descriptor = os.open(process, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    except (FileNotFoundError, ProcessLookupError):
-        return
-    except OSError as error:
-        raise ValueError(unknown) from error
-    try:
-        # Pin the proc directory: a recycled numeric PID must not stand in for exit evidence.
-        if os.fstat(descriptor).st_uid != os.getuid():
-            raise ValueError(unknown)
-        try:
-            cwd = os.readlink('cwd', dir_fd=descriptor)
-            # Kernel deleted-path text is ambiguous and may collide with a real outside alias.
-            if not os.path.isabs(cwd) or cwd.endswith(' (deleted)'):
-                raise ValueError(unknown)
-            resolved = Path(cwd).resolve(strict=True)
-            if os.readlink('cwd', dir_fd=descriptor) != cwd:
-                raise ValueError(unknown)
-            if resolved.is_relative_to(worktree):
-                raise ValueError('a process is still using the task worktree; settlement is not exclusive')
-        except (FileNotFoundError, ProcessLookupError) as error:
-            # Missing cwd can mean a deleted directory or an exited main thread, not process exit.
-            try:
-                os.stat('stat', dir_fd=descriptor)
-            except (FileNotFoundError, ProcessLookupError):
-                try:
-                    process.stat()
-                except (FileNotFoundError, ProcessLookupError):
-                    return
-            raise ValueError(unknown) from error
-    except OSError as error:
-        raise ValueError(unknown) from error
-    finally:
-        os.close(descriptor)
-
-
-def settlement(record: dict[str, Any], expected: dict[str, str], confirmation: dict[str, str]) -> dict[str, Any]:
+def settlement(record: dict[str, Any], expected: dict[str, str], confirmation: dict[str, str],
+               *, privileged: dict[str, Any] | None = None, run_dir: Path | None = None,
+               request_sha256: str | None = None) -> dict[str, Any]:
     # Older supervisor records did not pin their host. Journal timestamps cannot
     # repair that missing identity: explicit local-operator confirmation is required.
     if confirmation['machine_id_sha256'] != machine_id_sha256():
@@ -112,12 +74,15 @@ def settlement(record: dict[str, Any], expected: dict[str, str], confirmation: d
                    or w.get('label') == record['agent_name'] for w in spaces)):
         raise ValueError('the original worker or another task session has been restored; settle it first')
     worktree = Path(record['cwd']).resolve()
-    for process in Path('/proc').iterdir():
-        if not process.name.isdigit():
-            continue
-        inspect_process(process, worktree)
+    inspection = None
+    if privileged is not None:
+        inspection = privileged_inspection.inspect_once(run_dir, worktree, request_sha256, privileged)
+    else:
+        for process in Path('/proc').iterdir():
+            if process.name.isdigit():
+                inspect_process(process, worktree)
     return {**proof, 'host_confirmation': confirmation, 'herdr_binary': binary,
-            'agents': agents, 'workspaces': workspaces}
+            'agents': agents, 'workspaces': workspaces, **({'privileged_inspection': inspection} if inspection else {})}
 
 
 def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
@@ -125,10 +90,15 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
     """Called with both execution/projection locks; never starts a worker here."""
     if not re.fullmatch(r'yes+|approved|authorized', text.strip().lower()) or digest(request) != request_sha256:
         raise ValueError('the exact reviewed request and explicit user recovery authorization are required')
+    if os.getuid() == 0 or os.geteuid() != os.getuid():
+        raise ValueError('recovery runner must remain unprivileged')
     required = {'run_id', 'repo_id', 'run_sha256', 'agents_sha256', 'assignment', 'worker',
                 'output', 'repository_state', 'boot_ids', 'local_host_confirmation'}
-    if set(request) != required:
+    if set(request) not in (required, required | {'privileged_inspection'}):
         raise ValueError('interrupted packet request must contain exactly the documented fields')
+    privileged = request.get('privileged_inspection')
+    if 'privileged_inspection' in request:
+        privileged_inspection.validate_authorization(privileged)
     confirmation = request['local_host_confirmation']
     if (not isinstance(confirmation, dict) or set(confirmation) != {'authority', 'question', 'text', 'machine_id_sha256'}
             or confirmation['authority'] != 'user' or confirmation['question'] != HOST_CONFIRMATION_QUESTION
@@ -231,7 +201,10 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
         if json.loads(path.read_text()).get('cleanup_status') != 'complete':
             raise ValueError('another supervisor handle has unproven cleanup')
     history = validate_history(run)
-    proof = settlement(worker, request['boot_ids'], confirmation)
+    proof = settlement(worker, request['boot_ids'], confirmation, privileged=privileged,
+                       run_dir=engine.run_dir, request_sha256=request_sha256)
+    if 'privileged_inspection' in proof:
+        history.extend(proof['privileged_inspection']['evidence'])
     directory = engine.run_dir / 'logs' / 'incidents' / f'interrupted-packet-{request_sha256[:16]}'
     snapshots = [preserve(directory / 'run-before.json', engine.run_path.read_bytes()),
                  preserve(directory / 'agents-before.json', engine.agents_path.read_bytes())]
@@ -252,7 +225,10 @@ def recover(engine: Any, request: dict[str, Any], *, request_sha256: str,
             or (engine.run_dir / 'supervisor' / worker_supervisor.WorkerSupervisor.record_name(replacement_id)).exists()):
         raise ValueError('replacement must be a new unlaunched intent, never a reused worker')
     # Recheck mutable facts after local system observations and intent creation.
+    if 'privileged_inspection' in proof:
+        privileged_inspection.require_fresh(proof['privileged_inspection'])
     if (reference(engine.run_path)['sha256'] != request['run_sha256']
+            or reference(engine.agents_path)['sha256'] != request['agents_sha256']
             or workflow_tools.repository_state(Path(repo['worktree'])) != state
             or any(reference(paths[k]) != request[k] for k in paths)):
         raise ValueError('recovery context changed before projection')
