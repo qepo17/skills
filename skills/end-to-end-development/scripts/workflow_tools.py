@@ -243,6 +243,11 @@ def normalize_worker_artifact(
             evidence = artifact_guard.validation_log_path({"log_path": verification["evidence_path"]}, assignment,
                                                           "$.packet_verification.evidence_path")
             verification["evidence_sha256"] = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    if assignment.get('validation_refresh'):
+        decision = load_json(Path(assignment['validation_refresh']['path']))
+        if (decision['kind'] == 'validation-retry'
+                and repository_state(Path(assignment['cwd'])) != decision['repository_state']):
+            raise artifact_guard.ValidationError('validation-only retry changed pinned source/HEAD/branch/index state')
     resolved_assignment = assignment_path.resolve()
     artifact["assignment_path"] = str(resolved_assignment)
     artifact["assignment_sha256"] = hashlib.sha256(
