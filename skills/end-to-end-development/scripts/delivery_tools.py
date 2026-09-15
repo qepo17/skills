@@ -101,6 +101,7 @@ class Delivery:
         self.worktree = Path(spec.get("worktree", ".")).resolve()
         self.logs = Path(spec.get("log_dir", str(self.worktree))).resolve()
         self.repository = str(spec.get("repository", ""))
+        self.remote = spec.get("remote", "origin")
         self._pr_body: str | None = None
         self._intent: dict[str, Any] | None = None
         self.intent_path = Path(spec.get('pr_intent_path', str(self.logs / 'pr-creation-intent.json'))).resolve()
@@ -116,8 +117,10 @@ class Delivery:
         }
 
     def command(self, args: list[str], *, allow_failure: bool = False, redact_output: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
+        timeout = (self.spec.get("git_write_timeout_seconds", 30)
+                   if args[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]) else 30)
         try:
-            process = self.runner(args, self.worktree, 30)
+            process = self.runner(args, self.worktree, timeout)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise DeliveryError(f"{args[0]} operation could not finish: {type(error).__name__}",
                                 reason_code=f"{args[0]}-operation-unavailable") from error
@@ -163,6 +166,13 @@ class Delivery:
         return {name for name in output.split("\0") if name}
 
     def validate_spec(self) -> None:
+        if not isinstance(self.remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", self.remote):
+            raise DeliveryError("Delivery requires a valid configured remote name.",
+                                kind="decision", reason_code="invalid-remote")
+        git_timeout = self.spec.get("git_write_timeout_seconds", 30)
+        if type(git_timeout) is not int or not 1 <= git_timeout <= 1800:
+            raise DeliveryError("Git write timeout must be an integer between 1 and 1800 seconds.",
+                                kind="decision", reason_code="invalid-git-write-timeout")
         lifecycle = self.spec.get("pr_lifecycle")
         if lifecycle not in {None, "draft-until-verified"}:
             raise DeliveryError("Unsupported PR lifecycle policy.", kind="decision", reason_code="unsupported-pr-lifecycle")
@@ -216,9 +226,9 @@ class Delivery:
         # get-url expands insteadOf/pushInsteadOf and explicit pushurl entries.
         # Audit every effective destination before even staging task content.
         for options in (("--all",), ("--push", "--all")):
-            remotes = self.git("remote", "get-url", *options, "origin", redact_output=True).splitlines()
+            remotes = self.git("remote", "get-url", *options, self.remote, redact_output=True).splitlines()
             if not remotes or any(github_repository(remote) != self.repository for remote in remotes):
-                raise DeliveryError("An effective origin destination does not match the assigned GitHub repository.",
+                raise DeliveryError("An effective remote destination does not match the assigned GitHub repository.",
                                     kind="decision", reason_code="remote-identity-mismatch")
         if self.git("branch", "--show-current") != self.spec["branch"]:
             raise DeliveryError("Task branch changed before delivery.",
@@ -249,7 +259,7 @@ class Delivery:
                                 kind="decision", reason_code="committed-content-changed")
 
     def remote_head(self) -> str | None:
-        output = self.git("ls-remote", "--refs", "origin", f"refs/heads/{self.spec['branch']}")
+        output = self.git("ls-remote", "--refs", self.remote, f"refs/heads/{self.spec['branch']}")
         rows = output.splitlines()
         if not rows:
             return None
@@ -573,7 +583,7 @@ class Delivery:
                 if verify_only:
                     raise DeliveryError("Pushed head changed; verification cannot push over it.",
                                         kind="dependency", reason_code="pushed-head-mismatch")
-                self.git("push", "--set-upstream", "origin", f"refs/heads/{self.spec['branch']}:refs/heads/{self.spec['branch']}")
+                self.git("push", "--set-upstream", self.remote, f"refs/heads/{self.spec['branch']}:refs/heads/{self.spec['branch']}")
             self.result["pushed_head_sha"] = self.remote_head()
             if self.result["pushed_head_sha"] != head:
                 raise DeliveryError("Pushed head does not match the validated local head.",

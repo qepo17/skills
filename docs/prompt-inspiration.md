@@ -1,5 +1,7 @@
 # Prompt inspiration and deliberate adaptations
 
+Historical scope: these notes describe the durable engine and idea-to-ticket planning resources. Ordinary development now follows the concise [development guide](../skills/end-to-end-development/DEVELOPMENT.md); it does not load these references or inherit durable stage gates. The fast skill no longer bundles the older discovery and plan-writing guides.
+
 The execution and idea-preparation prompts draw on the installed `to-spec`, `to-tickets`, and `grill-with-docs` skills, read in full along with the latter's `grilling` and `domain-modeling` dependencies (including the glossary and ADR formats). The three installed entrypoints matched these source snapshots byte-for-byte:
 
 | Reference | Source snapshot | SHA-256 of SKILL.md |
@@ -8,7 +10,7 @@ The execution and idea-preparation prompts draw on the installed `to-spec`, `to-
 | `to-tickets` | [qepo17/dotfiles, d1246da](https://github.com/qepo17/dotfiles/blob/d1246dae7a0250490e81944fa50158cf9dccd236/agents/skills/to-tickets/SKILL.md) | `1846d215e24ec1219b199a708329ca915db93138d4f3675af29db4d32ee41391` |
 | `grill-with-docs` | [qepo17/dotfiles, d1246da](https://github.com/qepo17/dotfiles/blob/d1246dae7a0250490e81944fa50158cf9dccd236/agents/skills/grill-with-docs/SKILL.md) | `610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165` |
 
-Planning presentation also draws on the installed `show-me/SKILL.md`, read in full (SHA-256 `bea6da70a58096730b9aeb0bae293ddf4726103a98efc9ce13c481619942a810`). Its contribution is the smallest useful view, short adjacent prose, focused trees/flows/diffs, and restraint—not compulsory diagrams or HTML. Both execution skills bundle the resulting [plan-writing guide](../skills/end-to-end-development/PLAN-WRITING.md). This is a local source fingerprint, not a claim that an upstream repository snapshot was verified.
+Planning presentation also draws on the installed `show-me/SKILL.md`, read in full (SHA-256 `bea6da70a58096730b9aeb0bae293ddf4726103a98efc9ce13c481619942a810`). Its contribution is the smallest useful view, short adjacent prose, focused trees/flows/diffs, and restraint—not compulsory diagrams or HTML. Durable mode bundles the resulting [plan-writing guide](../skills/end-to-end-development/PLAN-WRITING.md). This is a local source fingerprint, not a claim that an upstream repository snapshot was verified.
 
 These are inspirations, not runtime dependencies or verbatim orchestration imports. Each installable skill contains its own operational guidance. Users do not need the reference skills or their setup command installed.
 
@@ -38,4 +40,4 @@ These are inspirations, not runtime dependencies or verbatim orchestration impor
 
 ## Verification boundaries
 
-The engine test checks that source-inspired synthesis/testing/slicing/review guidance reaches actual immutable worker assignments while stage counts and existing gates remain unchanged. Packaging checks validate standalone skills and matching discovery/plan-writing copies. The plan-writing guide's example and pre-presentation review support qualitative readability checks; the automated suite does not grade writing quality. The idea skill's bundled examples support read-only behavioral smoke cases. Neither substring assertions nor mocked workers prove a model's semantic coverage or question counting; record such evaluations separately and do not claim live tracker publication was tested.
+The engine test checks that source-inspired synthesis/testing/slicing/review guidance reaches actual immutable worker assignments while stage counts and existing gates remain unchanged. Packaging checks validate standalone skills and matching coordinator development/delivery resources. The plan-writing guide's example and pre-presentation review support qualitative readability checks; the automated suite does not grade writing quality. The idea skill's bundled examples support read-only behavioral smoke cases. Neither substring assertions nor mocked workers prove a model's semantic coverage or question counting; record such evaluations separately and do not claim live tracker publication was tested.
