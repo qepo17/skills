@@ -1789,9 +1789,11 @@ class WorkflowEngine:
             pending_decisions = run.get(pending_key, {})
             if repo_id in pending_decisions and pending_decisions[repo_id] == assignment.get(assignment_key):
                 if (assignment_key == 'validation_refresh'
-                        and _load_json(Path(pending_decisions[repo_id]['path']))['kind'] == 'validation-retry'
-                        and _load_json(output_path)['status'] != 'complete'):
-                    continue  # An unfinished verifier cannot escape its one-shot claim via ordinary resume.
+                        and _load_json(Path(pending_decisions[repo_id]['path']))['kind'] == 'validation-retry'):
+                    result = _load_json(output_path)
+                    covered = {record['id'] for record in result['validations'] if record['result'] != 'not-run'}
+                    if result['status'] != 'complete' or not set(assignment['validation_ids']) <= covered:
+                        continue  # Incomplete checks cannot escape the one-shot claim via ordinary resume.
                 del pending_decisions[repo_id]
         pending = run.get("pending_delivery_refresh", {})
         if (assignment.get("stage") == "deliver" and repo_id in pending
@@ -1921,8 +1923,8 @@ class WorkflowEngine:
                 action["status"] = "working"
                 assignment = _load_json(Path(action["assignment_path"]))
                 refresh = assignment.get('validation_refresh')
-                if refresh and _load_json(Path(refresh['path']))['kind'] == 'validation-retry':
-                    attempts = run.setdefault('validation_retry_attempts', {})
+                if refresh and (decision := _load_json(Path(refresh['path'])))['kind'] == 'validation-retry':
+                    attempts = run.setdefault(artifact_guard.VALIDATION_RETRY_ATTEMPTS[decision['decision']], {})
                     if assignment['repo_id'] in attempts:
                         raise WorkflowError('validation retry already claimed; reconcile its original handle, never relaunch')
                     attempts[assignment['repo_id']] = _reference(Path(action['assignment_path']))
@@ -2464,11 +2466,61 @@ class WorkflowEngine:
         return item if evaluation['coverage_complete'] and (not require_pass or evaluation['satisfied']) else None
 
     def _block_validation_gate(self, repo_id: str, result_path: Path, evaluation: dict[str, Any]) -> None:
-        self._block(summary=f"Local validation gate for {repo_id}: {', '.join(evaluation['blocking_ids'] + evaluation['missing_ids'])}.",
+        self._block(summary=f"Local validation gate for {repo_id}: {', '.join(sorted(set(evaluation['blocking_ids'] + evaluation['missing_ids'])))}.",
                     evidence_path=result_path, kind="decision", repo_id=repo_id,
                     required_action="Inspect status for scoped validation-exception or task-related check-remediation decisions. Missing or protected evidence cannot be waived.",
                     gate={"type": "local-validation", "repo_id": repo_id, "artifact": _reference(result_path),
                           "check_ids": sorted(set(evaluation["blocking_ids"] + evaluation["missing_ids"]))})
+
+    def _later_interrupted_target(self, run: dict[str, Any], context: dict[str, Any]) -> str | None:
+        """Prove a distinct final packet follows a successful, consumed original retry."""
+        repo_id = context['repo_id']
+        if (run['status'] != 'blocked' or run['phase'] not in {'implement', 'validate'}
+                or not context['source_artifact'] or repo_id in run.get('pending_validation_refresh', {})
+                or repo_id in run.get('pending_check_remediations', {})
+                or any(a['decision'] == 'retry-later-interrupted' and a['repo_id'] == repo_id for a in self._amendments())):
+            return None
+        source = _load_json(Path(context['source_artifact']['path']))
+        original = run.get('validation_retry_attempts', {}).get(repo_id)
+        if (not original or source.get('stage') != 'implement' or source.get('status') != 'complete'
+                or len(self._artifacts(repo_id=repo_id, stage='validation-fix', kind='result')) < run['retry_limits']['validation_fix_cycles']):
+            return None
+        assignment = _load_json(Path(original['path']))
+        prior_ref = run['repositories'][repo_id]['accepted_artifacts'].get(assignment['action_id'])
+        if not prior_ref:
+            return None
+        prior = _load_json(Path(prior_ref['path']))
+        prior_decision = _load_json(Path(assignment['validation_refresh']['path']))
+        if (prior.get('status') != 'complete' or any(v['result'] != 'pass' for v in prior['validations'])
+                or prior_decision['basis'] != context['basis'] or prior['tree_fingerprint'] == source['tree_fingerprint']
+                or not self._assignment_pins(_load_json(Path(source['assignment_path'])), Path(prior_ref['path']), prior_ref['sha256'])):
+            return None
+        self._verify_validation_evidence(prior)
+        plan_path, plan = self._current_plan(repo_id)
+        completed = {result.get('packet_id') for _, result, writer in self._artifacts(repo_id=repo_id, stage='implement', kind='result')
+                     if result['status'] == 'complete' and self._assignment_pins(writer, plan_path, _sha256(plan_path))}
+        if not {packet['id'] for packet in plan['work_packets']} <= completed:
+            return None
+        evaluation = validation_policy.evaluate(plan['validations'], source['validations'], self._exclusions(repo_id))
+        unresolved = set(evaluation['blocking_ids'] + evaluation['missing_ids'])
+        if len(unresolved) != 1:
+            return None
+        target = next(iter(unresolved))
+        records = {v['id']: v for v in source['validations']}
+        record = records.get(target, {})
+        row = next(check for check in evaluation['checks'] if check['id'] == target)
+        if (row['disposition'] != 'required' or row['gate'] != 'blocking'
+                or record.get('result') != 'not-run' or record.get('exit_code') is not None
+                or not record.get('log_path') or not record.get('log_sha256') or not Path(record['log_path']).stat().st_size):
+            return None
+        passing = {check['id'] for check in evaluation['checks'] if check['result'] == 'pass'}
+        for blocker in run['blockers']:
+            gate = blocker.get('gate', {})
+            if (gate.get('type') == 'local-validation' and gate.get('repo_id') == repo_id
+                    and gate.get('artifact') == context['source_artifact'] and target in gate.get('check_ids', [])
+                    and set(gate['check_ids']) <= passing | {target}):
+                return target
+        return None
 
     def status_details(self) -> dict[str, Any]:
         """Read-only projections; never prefer an old success over a new observation."""
@@ -2495,6 +2547,13 @@ class WorkflowEngine:
                     or (evidence_context['source_artifact'] and evidence_context['source_artifact'] != summary['source_artifact'])
                     or not self._amendment_state_matches(evidence_context)):
                 continue
+            later_target = self._later_interrupted_target(run, evidence_context)
+            if later_target:
+                details['eligible_actions'].append({'kind': 'validation-retry', 'decision': 'retry-later-interrupted',
+                    'authority': 'user', 'repo_id': repo_id, 'target': 'local', 'check_ids': [later_target],
+                    'expected_context': context,
+                    'requires': 'Separate explicit authorization and reviewed partial-execution log with unknown exits. '
+                                'One later read-only verifier; the original consumed claim and all source-fix limits remain unchanged.'})
             for decision, ids in (("exclude", [r["id"] for r in summary["checks"] if r["purpose"] == "supplemental" and not r["migration_capable"] and r["disposition"] != "excluded"]),
                                   ("restore", [r["id"] for r in summary["checks"] if r["disposition"] == "excluded"])):
                 if ids:
@@ -2625,6 +2684,9 @@ class WorkflowEngine:
             if not self._amendment_state_matches(context):
                 raise WorkflowError("repository content/HEAD/branch/index no longer matches accepted evidence")
             selected = set(request["check_ids"])
+            later_retry = request['kind'] == 'validation-retry' and request['decision'] == 'retry-later-interrupted'
+            if later_retry and any(a['decision'] == 'retry-later-interrupted' and a['repo_id'] == repo_id for a in self._amendments()):
+                raise WorkflowError('later validation-only retry allowance exhausted for this repository/run')
             if request["target"] == "local":
                 definitions = {check["id"]: check for check in plan["validations"]}
                 if not selected <= definitions.keys():
@@ -2635,6 +2697,11 @@ class WorkflowEngine:
                     active = self._exclusions(repo_id)
                     if request["decision"] == "restore" and not selected <= active.keys():
                         raise WorkflowError("restore requires an active exclusion for every check")
+                elif later_retry:
+                    current = self._current_observation(repo_id)
+                    if (current is None or _reference(current[0]) != context['source_artifact']
+                            or self._later_interrupted_target(run, context) not in selected):
+                        raise WorkflowError('later retry requires a distinct final accepted packet with one evidenced interruption after the successful original retry')
                 else:
                     current = self._current_validation(repo_id, require_pass=False, check_ids=selected)
                     if current is None or _reference(current[0]) != context["source_artifact"]:
@@ -2652,7 +2719,7 @@ class WorkflowEngine:
                               if check["required"] and check["state"] == "failed"}
                 if not selected <= identities:
                     raise WorkflowError("CI remediation targets must be currently failed required checks")
-            if request['kind'] == 'validation-retry':
+            if request['kind'] == 'validation-retry' and not later_retry:
                 if any(item['kind'] == 'validation-retry' and item['repo_id'] == repo_id for item in self._amendments()):
                     raise WorkflowError('validation-only retry allowance exhausted for this repository/run')
                 if (source['stage'] != 'validation-fix'
@@ -2670,6 +2737,8 @@ class WorkflowEngine:
                 observations = {record['id']: record for record in source['validations']}
                 if any(observations[key].get('exit_code') != 124 for key in selected):
                     raise WorkflowError('retry requires reviewed enclosing-harness interruption evidence, not a child failure')
+            if request['kind'] == 'validation-retry':
+                observations = {record['id']: record for record in source['validations']}
                 required_evidence = [context['source_artifact']] + [
                     {'path': observations[key]['log_path'], 'sha256': observations[key]['log_sha256']} for key in selected]
                 if any(reference not in request['evidence'] for reference in required_evidence):
@@ -2737,14 +2806,21 @@ class WorkflowEngine:
             run.setdefault("run_amendments", []).append(reference)
             if request["kind"] == "check-remediation":
                 run.setdefault("pending_check_remediations", {})[repo_id] = reference
-            elif request["decision"] in {'restore', 'retry-interrupted'} and source:
+            elif source and (request['decision'] == 'restore' or request['kind'] == 'validation-retry'):
                 run.setdefault("pending_validation_refresh", {})[repo_id] = reference
             remaining = []
             for blocker in run["blockers"]:
                 gate = blocker.get("gate", {})
                 expected_type = "required-ci" if request["target"] == "ci" else "local-validation"
-                if gate.get("repo_id") == repo_id and gate.get("type") == expected_type and request["decision"] != "restore":
-                    unresolved = set(gate["check_ids"]) - selected
+                if (gate.get("repo_id") == repo_id and gate.get("type") == expected_type and request["decision"] != "restore"
+                        and (request['kind'] != 'validation-retry' or gate.get('artifact') == context['source_artifact'])):
+                    gate_ids = set(gate['check_ids'])
+                    if later_retry:
+                        # Earlier engines discarded partial coverage. Only proved passing extras can disappear.
+                        evaluation = validation_policy.evaluate(plan['validations'], source['validations'], self._exclusions(repo_id))
+                        passing = {check['id'] for check in evaluation['checks'] if check['result'] == 'pass'}
+                        gate_ids -= passing
+                    unresolved = gate_ids - selected
                     if unresolved:
                         blocker = {**blocker, "gate": {**gate, "check_ids": sorted(unresolved)},
                                    "summary": f"Unresolved {expected_type} gate: {', '.join(sorted(unresolved))}."}
@@ -2847,9 +2923,10 @@ class WorkflowEngine:
                         extras={"remediation": reference, "failed_validation_ids": decision["check_ids"]},
                     ))
                 elif decision['kind'] == 'validation-retry':
-                    if repo_id in run.get('validation_retry_attempts', {}):
+                    attempt_key = artifact_guard.VALIDATION_RETRY_ATTEMPTS[decision['decision']]
+                    if repo_id in run.get(attempt_key, {}):
                         self._block(summary='Validation-only retry was already claimed without complete accepted verification.',
-                            evidence_path=Path(run['validation_retry_attempts'][repo_id]['path']), repo_id=repo_id,
+                            evidence_path=Path(run[attempt_key][repo_id]['path']), repo_id=repo_id,
                             kind='decision', preserve_actions=True,
                             required_action='Reconcile the original verifier and preserved output; no replacement or source replay is authorized.')
                         return 'blocked'
@@ -3756,9 +3833,9 @@ class WorkflowEngine:
                     continue
                 ids = (set(check["id"] for check in plan["validations"]) if repo_id in completed_repositories
                        else set(assignment["validation_ids"]))
-                current = self._current_validation(repo_id, require_pass=False, check_ids=ids)
+                current = self._current_observation(repo_id)
                 evaluation = validation_policy.evaluate([c for c in plan["validations"] if c["id"] in ids],
-                                current[1]["validations"] if current else [], self._exclusions(repo_id))
+                                current[1]['validations'] if current and current[1]['status'] == 'complete' else [], self._exclusions(repo_id))
                 if not evaluation["satisfied"]:
                     self._block_validation_gate(repo_id, current[0] if current else path, evaluation)
                     return "blocked"
@@ -3907,6 +3984,13 @@ class WorkflowEngine:
         missing_assignments: list[Path] = []
         for repo_id in ordered_repo_ids:
             if self._current_validation(repo_id, require_pass=False) is None:
+                observation = self._current_observation(repo_id) if self.load_run(validate=False).get('validation_policy_version') == 1 else None
+                refresh = observation[2].get('validation_refresh') if observation else None
+                if refresh and _load_json(Path(refresh['path']))['kind'] == 'validation-retry':
+                    self._block(summary='Claimed validation-only verifier has incomplete evidence; another launch is forbidden.',
+                        evidence_path=observation[0], repo_id=repo_id, kind='decision',
+                        required_action='Preserve the consumed claim and original evidence; ordinary validation cannot replace this verifier.')
+                    return 'blocked'
                 if not self._migration_guard(repo_id):
                     return "blocked"
                 missing_assignments.append(self._validation_assignment(repo_id, scope))
