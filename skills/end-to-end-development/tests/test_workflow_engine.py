@@ -942,19 +942,9 @@ class WorkflowEngineTests(unittest.TestCase):
         self.assertEqual(["plan", "implement", "review-1", "deliver"], [a["stage"] for a in batch.assignments])
         for assignment in batch.assignments:
             self.assertIn({"path": str(requirements_path), "sha256": run["requirements_sha256"]}, assignment["input_artifacts"])
-            self.assertIn("Do not interview the user", " ".join(assignment["instructions"]))
-        planning_prompt = " ".join(batch.assignments[0]["instructions"])
-        for guidance in ("implementation spec", "Synthesize settled context", "actor/capability/benefit",
-                         "CONTEXT-MAP.md", "applicable ADRs", "highest practical existing test seam",
-                         "similar tests as prior art", "supported routine seams need no confirmation",
-                         "tracer-bullet vertical slices", "genuine blocking dependencies", "eligible frontier",
-                         "expand–contract", "removal blocked by every batch", "never invent an integration branch"):
-            self.assertIn(guidance, planning_prompt)
-        review = next(a for a in batch.assignments if a["stage"] == "review-1")
-        review_prompt = " ".join(review["instructions"])
-        for guidance in ("mistaken plan is still a spec defect", "story/acceptance coverage",
-                         "domain glossary/ADR consistency", "observable-behavior tests", "genuine slice dependencies"):
-            self.assertIn(guidance, review_prompt)
+        for stage, schema in (("plan", "plan.md"), ("review-1", "review.md")):
+            assignment = next(a for a in batch.assignments if a["stage"] == stage)
+            self.assertEqual(SCRIPTS_DIR.parent / "schemas" / schema, Path(assignment["artifact_schema_path"]))
         bundle = Path(completed["plan_review"]["review_path"]).read_text()
         for text in ("Jira APP-123", "0 further questions available at intake", "Agent recommendation (not user approval)",
                      "Follow the repository convention.", "Expected files: feature.txt", "Validation IDs: API-VAL-001"):

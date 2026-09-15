@@ -1,93 +1,40 @@
-# Simplicity Challenge
+# Simplicity challenge
 
-Use this rubric only when a candidate plan declares a high-risk surface or high-cost mechanism, and always before project-file implementation. Low-risk plans in every profile waive this worker according to `run.json.workflow_policy`; discovery can still escalate the profile before implementation. The critic's job is **subtraction**, not architectural embellishment: find the least powerful design that completely satisfies the accepted requirements and canonical contract while following repository conventions.
+Apply before implementation when the candidate plan declares high risk or high-cost mechanisms. Low-risk plans waive this worker under `workflow_policy`. Seek the least powerful design satisfying accepted requirements, contract and repository conventions.
 
-The critic also applies the vocabulary and principles in the installed `codebase-design` skill, especially interface depth, the deletion test, locality, seam placement, and "one adapter means a hypothetical seam." Do not run Design It Twice by default. Use it only when the plan exposes a genuinely consequential interface choice that cannot be resolved from requirements and repository evidence.
+Use the pinned `codebase-design` guidance for interface depth, deletion tests, locality and seams. Design It Twice is warranted only for a consequential interface choice unresolved by evidence.
 
-## Critic mandate
+## Review
 
-1. Trace every plan task to an accepted requirement.
-2. Remove speculative flexibility, premature generalization, duplicate layers, and mechanisms justified only by possible future work.
-3. Prefer an existing repository convention over a novel pattern when both satisfy the requirements.
-4. Treat hidden side effects, ordering, error modes, configuration, and performance characteristics as part of a module's interface.
-5. Apply the deletion test. If deleting a proposed module or mechanism does not make necessary complexity reappear at callers, remove it.
-6. Do not introduce a seam for one production adapter. A production adapter plus a justified test adapter may establish a real seam; otherwise prefer direct code.
-7. Challenge the canonical contract when it mandates accidental implementation complexity rather than observable cross-repository behavior.
-8. Give an `accept` verdict only when every declared high-cost mechanism has been assessed and no actionable simplicity finding remains.
-9. Review work-packet shape as well as design shape: merge microscopic tasks that share one concern and repository context, but split packets that combine unrelated changes or exceed the configured task/time bounds.
+- Trace every task to a requirement. Remove speculative flexibility, duplicate layers and future-only mechanisms; prefer existing conventions.
+- Include side effects, ordering, errors, configuration and performance in interface analysis. Delete a module when necessary complexity would not reappear at callers.
+- One production adapter alone does not justify a seam; a justified test adapter may. Challenge contracts that mandate accidental implementation complexity.
+- Merge microscopic tasks sharing a concern; split unrelated work or oversized packets. Add work only for demonstrated correctness, safety, compatibility or validation gaps.
+- Assess every declared mechanism and inspect steps/files for omissions. Accept only with no actionable finding.
 
-A critic may recommend adding work only to close a demonstrated correctness, safety, compatibility, or validation gap. It must not expand product scope.
+## Mechanism ledger
 
-## High-cost mechanism ledger
+`complexity_mechanisms` declares triggers/functions/procedures, backfills, multi-release migrations, background/event flows, caches, seams/adapters, storage and comparable costs. Empty is valid.
 
-Candidate plans declare every proposed high-cost mechanism in `complexity_mechanisms`. This includes:
+Each entry links requirements/tasks, necessity, repository evidence, simpler alternatives, operational consequences and checks. Retain only when needed now, simpler choices fail required constraints, deployment/failure/recovery/observability/testing are understood, and precedent or a justified new convention supports it. An undeclared mechanism is a finding.
 
-- database triggers, database functions, and stored procedures;
-- data backfills or multi-release data migrations;
-- background jobs and event-driven flows;
-- caches;
-- new seams or adapters;
-- new storage systems;
-- another mechanism with material operational or cognitive cost.
+## Database and migration decisions
 
-For each mechanism, the plan must identify the requirements and tasks it serves, why it is necessary, concrete repository precedent or evidence, simpler alternatives considered, operational consequences, and validations. An empty ledger is valid and preferred when no such mechanism is needed.
+Prefer declarative constraints/indexes for expressible data invariants, then application transactions when the application owns all writes. Triggers/functions/procedures require independent writers or atomic enforcement that constraints cannot supply; cleaner application code or hypothetical future writers are insufficient.
 
-The critic assesses every declared mechanism and also inspects task steps and expected files for undeclared mechanisms. Omitting a mechanism from the ledger is an actionable plan finding; it is not evidence that the plan is simple.
+For retained database mechanisms, document activating writers/operations, side effects/errors, ordering, recursion, idempotency, concurrency, lock/query cost, deployment/recovery and interface-level tests.
 
-Retain a mechanism only when all of these are true:
+For material migrations, check isolated target evidence, volume/lock duration, old/new version compatibility, transaction boundaries, backfill retries, deployment order, rollback/forward-fix and resulting data/constraint validation. Split schema/backfill/enforcement/cleanup when rollout requires it; do not split safe cohesive transactions merely by line count. Combining unrelated concerns without an atomicity rationale is a finding.
 
-- an accepted requirement or contract rule needs it now;
-- a simpler mechanism cannot meet the same correctness and rollout constraints;
-- its failure, deployment, rollback or forward-fix, observability, and test implications are understood;
-- the repository either has supporting precedent or the plan explains why a new convention is warranted.
+## Findings and verdicts
 
-## Database decision order
+Findings name target (`plan`/`contract`), requirement/task IDs, evidence, simpler alternative and exact change while preserving accepted scope.
 
-Use the least powerful database mechanism that preserves the required invariant:
+| Verdict | Meaning |
+| --- | --- |
+| `accept` | Ready to become canonical; no actionable findings |
+| `revise-plan` | Planner must address actionable plan findings |
+| `revise-contract` | Revise the complexity-mandating contract before affected plans |
+| `blocked` | Evidence cannot resolve a material product/safety/environment decision |
 
-1. Prefer declarative constraints and structures such as `NOT NULL`, foreign keys, unique constraints, check constraints, and indexes for data invariants they can express.
-2. Prefer an application transaction for business workflow when the application owns all writes and the invariant does not need independent database enforcement.
-3. Use a database trigger, database function, or stored procedure only when the invariant must hold across independent writers or requires atomic database enforcement that declarative constraints cannot express.
-
-A retained trigger or database function must document:
-
-- every writer and operation that activates it;
-- visible side effects and returned database errors;
-- ordering, recursion, idempotency, and concurrency behavior;
-- lock and query-cost risks;
-- deployment ordering and rollback or forward-fix strategy;
-- observability and tests through the owning module's interface.
-
-"Keeps the application code clean" and "may support another writer later" are not sufficient justifications.
-
-## Migration review
-
-Migration line count alone is not the target. Challenge migrations that mix unrelated deployment concerns or hide risky runtime behavior.
-
-Prefer separately deployable schema, backfill, enforcement, and cleanup steps when data volume, compatibility, or rollout requires them. Do not split an otherwise cohesive and safely transactional migration merely to create smaller files.
-
-For every material migration, verify that the plan covers:
-
-- target database safety before migration-capable commands;
-- expected data volume and lock duration;
-- compatibility with old and new application versions;
-- transaction boundaries;
-- retry and idempotency behavior for backfills;
-- deployment ordering;
-- rollback safety or an explicit forward-fix strategy;
-- focused validation of resulting data and constraints.
-
-A migration that combines schema changes, a large backfill, business workflow, and enforcement without explaining why they must be atomic is an actionable finding.
-
-## Finding rules
-
-Every finding must name its target (`plan` or `contract`), affected requirement and task IDs, evidence, the simpler alternative, and the exact required change. Findings are actionable only when the proposed change preserves the accepted requirements and contract.
-
-Verdicts mean:
-
-- `accept`: the referenced plan is ready to become canonical;
-- `revise-plan`: actionable plan findings require a fresh planner revision;
-- `revise-contract`: accidental complexity is required by the current contract, so the bounded contract-revision path must run before affected plans are regenerated;
-- `blocked`: repository evidence cannot resolve a material product, safety, or environment decision.
-
-After a material plan revision, a fresh critic verifies the revised plan against the prior findings and this entire rubric. A bounded implementation deviation that preserves requirements/contract, adds no risk or mechanism, follows repository precedent, and stays inside its packet does not reopen planning. Verification is not permission to start an unbounded design loop. After all required challenges accept, full hard-stops for explicit approval; fast/standard records the policy decision and proceeds. When the configured plan-revision cycle is exhausted without an `accept` verdict, record a blocker.
+A fresh critic verifies material revisions against prior findings and this rubric. Bounded deviations preserving scope/contract, adding no risk/mechanism and following packet-local precedent do not reopen planning. Exhausted revisions block. After required acceptance, full pauses for approval; fast/standard records policy approval.

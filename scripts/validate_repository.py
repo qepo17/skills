@@ -85,22 +85,23 @@ def validate_skill(skill_dir: Path, errors: list[str]) -> None:
     if len(text.splitlines()) > 500:
         errors.append(f"{skill_md.relative_to(ROOT)}: keep SKILL.md under 500 lines")
 
-    for target in LINK_PATTERN.findall(text):
-        target = target.strip().split("#", 1)[0]
-        if not target or target.startswith(("http://", "https://", "mailto:")):
-            continue
-        resolved = (skill_dir / target).resolve()
-        try:
-            resolved.relative_to(skill_dir.resolve())
-        except ValueError:
-            errors.append(
-                f"{skill_md.relative_to(ROOT)}: relative link escapes the skill directory: {target}"
-            )
-            continue
-        if not resolved.exists():
-            errors.append(
-                f"{skill_md.relative_to(ROOT)}: relative link does not exist: {target}"
-            )
+    for resource in sorted(skill_dir.rglob("*.md")):
+        for target in LINK_PATTERN.findall(resource.read_text(encoding="utf-8")):
+            target = target.strip().split("#", 1)[0]
+            if not target or target.startswith(("http://", "https://", "mailto:")):
+                continue
+            resolved = (resource.parent / target).resolve()
+            try:
+                resolved.relative_to(skill_dir.resolve())
+            except ValueError:
+                errors.append(
+                    f"{resource.relative_to(ROOT)}: relative link escapes the skill directory: {target}"
+                )
+                continue
+            if not resolved.exists():
+                errors.append(
+                    f"{resource.relative_to(ROOT)}: relative link does not exist: {target}"
+                )
 
     openai_yaml = skill_dir / "agents" / "openai.yaml"
     if not openai_yaml.is_file():

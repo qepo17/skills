@@ -19,6 +19,7 @@ class FakeGitHub:
     def __init__(self, worktree: Path) -> None:
         self.worktree = worktree
         self.remote = worktree.parent / "remote.git"
+        self.remote_name = "origin"
         self.pr: dict[str, Any] | None = None
         self.required = [{"context": "tests", "app": None}]
         self.rules: list[dict[str, Any]] = []
@@ -43,7 +44,7 @@ class FakeGitHub:
     def __call__(self, command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
         if command[0] == "git":
-            local = [str(self.remote) if item == "origin" and command[1] in {"push", "ls-remote"} else item for item in command]
+            local = [str(self.remote) if item == self.remote_name and command[1] in {"push", "ls-remote"} else item for item in command]
             result = subprocess.run(local, cwd=cwd, capture_output=True, text=True, timeout=timeout)
             if command[1] in {"commit", "push"} and self.crash_after == command[1] and result.returncode == 0:
                 self.crash_after = None
@@ -164,6 +165,57 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(result["head_sha"], result["pushed_head_sha"])
         self.assertEqual("required", result["check_policy"]["status"])
         self.assertEqual("", self.git("status", "--porcelain"))
+
+    def test_selected_remote_is_used_for_audit_push_and_reverification(self) -> None:
+        self.git("remote", "rename", "origin", "upstream")
+        self.forge.remote_name = "upstream"
+        self.spec["remote"] = "upstream"
+        result = self.deliver()
+        self.assertEqual("complete", result["status"], result)
+        self.assertEqual(result["head_sha"], result["checked_head_sha"])
+        pushes = [c for c in self.forge.commands if c[:2] == ["git", "push"]]
+        self.assertEqual(1, len(pushes))
+        self.assertIn("upstream", pushes[0])
+        self.forge.commands.clear()
+        refreshed = delivery_tools.Delivery(self.spec, run_process=self.forge).run(verify_only=True)
+        self.assertEqual("complete", refreshed["status"], refreshed)
+        self.assertFalse(any(c[:2] == ["git", "push"] for c in self.forge.commands))
+
+    def test_selected_remote_push_destination_is_still_audited(self) -> None:
+        self.git("remote", "rename", "origin", "upstream")
+        self.spec["remote"] = "upstream"
+        self.git("config", "remote.upstream.pushurl", "git@github.com:other/private.git")
+        result = self.deliver()
+        self.assertEqual("remote-identity-mismatch", result["reason_code"])
+        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(0, self.forge.create_count)
+
+    def test_slow_git_hooks_can_finish_with_a_scoped_timeout(self) -> None:
+        def slow_commit(command, cwd, timeout):
+            if command[:2] == ["git", "commit"] and timeout < 60:
+                raise subprocess.TimeoutExpired(command, timeout)
+            if command[0] == "gh":
+                self.assertEqual(30, timeout)
+            return self.forge(command, cwd, timeout)
+
+        old_result = delivery_tools.Delivery(self.spec, run_process=slow_commit).run()
+        self.assertEqual("git-operation-unavailable", old_result["reason_code"])
+        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.spec["git_write_timeout_seconds"] = 300
+        result = delivery_tools.Delivery(self.spec, run_process=slow_commit).run()
+        self.assertEqual("complete", result["status"], result)
+        self.assertEqual(1, self.forge.create_count)
+
+    def test_invalid_remote_or_timeout_is_refused_before_git_writes(self) -> None:
+        for change in ({"remote": "--upload-pack=bad"}, {"remote": "https://github.com/example/task"},
+                       {"git_write_timeout_seconds": True}, {"git_write_timeout_seconds": 0},
+                       {"git_write_timeout_seconds": 1801}):
+            with self.subTest(change=change):
+                result = delivery_tools.Delivery({**self.spec, **change}, run_process=self.forge).run()
+                self.assertEqual("blocked", result["status"])
+                self.assertEqual("decision", result["kind"])
+                self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual([], self.forge.commands)
 
     def test_draft_lifecycle_requires_a_run_identity_before_delivery(self) -> None:
         self.spec["pr_lifecycle"] = "draft-until-verified"

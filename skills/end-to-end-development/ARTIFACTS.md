@@ -216,9 +216,9 @@ The graph may add these coordinator fields when applicable:
 - `profile_escalation`: path/hash of deterministic classifier evidence;
 - `pending_plan_revisions`: per-repository predecessor plan plus the hash-pinned feedback/escalation/contract basis used after canonical pointers must be cleared;
 - `corrected_handoff_recoveries`: one record per explicitly recovered implementation action, containing hashed `original`, `corrected`, `assignment`, `rejection`, and `evidence` references plus the recovery-time `repository_state`. Every reference is checked on subsequent run validation. This is not a retry-budget reset or permission to rewrite accepted artifacts;
-- `external_repair_recoveries`: one hashed immutable [`external-repair-recovery`](schemas/external-repair-recovery.md) record per rejected implementation action. It preserves the caller's reviewed request/digest, exact external and later recovery authorization separately from coordinator interpretation, old approval/blocker, historical evidence and old/current source bindings. The old rejected result stays unaccepted and unchanged. Admission schedules fresh read-only packet verification; it does not assert completion or a passing check;
-- `interrupted_packet_recoveries`: hashed [lost-packet recovery records](schemas/interrupted-packet-recovery.md), keyed by original unaccepted action ID. They preserve the reviewed request, user authorization, original state/history/output, proven host reboot and a new budgeted replacement assignment. Later loads verify the evidence hashes and forbid accepting the initializer. The original approval and all checks remain mandatory. Protected or missing process metadata cannot be converted into clearance. Optional, separately authorized [one-time privileged inspection](schemas/privileged-process-inspection.md) retains the original subject UID and pins consumed authorization, exact executed source and fresh direct-pipe result as evidence; the runner remains unprivileged. Unknown settlement still refuses the recovery record;
-- `writer_incident_recoveries` and `writer_incident_attempts`: hashed [writer-incident recovery records](schemas/writer-incident-recovery.md) and one-shot read-only verification assignments. The original unavailable reference remains in immutable quarantine, with overwritten/late outputs pinned separately and unaccepted. The record preserves approved policy/source/history; no limits reset. Only passing fresh verification completes the packet;
+- `external_repair_recoveries`: hashed [external-repair records](schemas/external-repair-recovery.md), preserving rejected evidence/source and authorizations; schedules fresh verification, never accepts the old result;
+- `interrupted_packet_recoveries`: hashed [interrupted-packet records](schemas/interrupted-packet-recovery.md), keyed by original action, preserving initializer/history, host proof and replacement. Optional [privileged inspection](schemas/privileged-process-inspection.md) pins consumed authorization and fresh original-UID evidence;
+- `writer_incident_recoveries` and `writer_incident_attempts`: hashed [incident records](schemas/writer-incident-recovery.md) and one-shot verification assignments; quarantined references and incident outputs stay unaccepted;
 - `external_repair_attempts`: one hashed `packet-verification` assignment per new verification action, saved before launch. This is a one-shot launch claim, not a retry-budget reset. Accepted fresh results and their scope/check logs are revalidated on subsequent run loads. No missing/invalid claimed result can cause another worker launch;
 - `run_amendments`: ordered hashed references to immutable [`run-amendment`](schemas/run-amendment.md) artifacts. This field is valid only with `validation_policy_version: 1`; repeated request hashes are invalid;
 - `pending_check_remediations`: at most one hashed `fix-related` amendment per repository, consumed by the existing `validation-fix` or `pipeline-fix` route;
@@ -253,9 +253,7 @@ The local gate is satisfied only when every effective blocking check has current
 
 Every requirement has non-empty source text, acceptance criteria, and repository IDs. Preserve the user's material wording and original ticket acceptance IDs in the criteria.
 
-New skill-driven bootstrap specifications include the optional `intake` extension described in [ORCHESTRATION.md](ORCHESTRATION.md#source-intake-and-question-history): non-empty `sources` (`reference`, `text`), `codebase_evidence`, `recommendations`, `question_limit` (integer 0–10), and ordered `questions` (`question`, non-empty `resolution`). Optional `prior_question_count` (default 0) preserves the already-asked prefix when intake begins or the user lowers/ends the interview. New questions must fit `max(0, question_limit - prior_question_count)`; prior history is never erased or a new allowance. A lower cap/no-interview preference can therefore coexist with resolved inherited questions without blocking otherwise-ready execution. The engine validates its types/limits (including the enclosing 64 KiB maximum) and preserves it verbatim inside this hash-pinned artifact. Workers already receive it as canonical requirements input. It captures original ticket/spec excerpts separately from agent recommendations, without another source/spec artifact or tracker write. Existing artifacts without intake remain valid.
-
-Intake records the initial cumulative clarification count; later coordinator questions/resolutions are appended to `logs/clarifications.md` before/after presentation. This interaction-only log is an explicit exception for coordinator note-taking, not mutable workflow state or accepted gate evidence. It cannot authorize work, change pinned requirements/plans, waive safety approval, or reset a budget. The coordinator counts inherited plus later questions under the same maximum of 10 (or lower selected limit); at exhaustion unresolved material choices remain blockers. Workers return decision blockers rather than run their own interviews.
+New skill-driven runs include `intake`; its exact source/evidence/question shape and limits are in [ORCHESTRATION.md](ORCHESTRATION.md#source-intake-and-question-history). It is copied verbatim into this hash-pinned artifact within the 64 KiB limit; missing intake remains compatible. Later interactions belong in append-only `logs/clarifications.md`, never immutable requirements. That ledger preserves the shared cap and cannot authorize work or unlock a gate.
 
 ## `agents.json` (`agents`)
 
@@ -292,70 +290,11 @@ New worker names match `^[a-z][a-z0-9_-]{0,31}$` for Herdr compatibility. They u
 
 ## Immutable assignment (`assignment`)
 
-Read [`schemas/assignment.md`](schemas/assignment.md). New profiled assignments add `profile`, stage-specific packet/finding/validation IDs, policy versions, and point `artifact_schema_path` to exactly one schema file rather than this contract.
+Read [schemas/assignment.md](schemas/assignment.md) for fields, stage scopes and policy variants. LangGraph generates assignments; do not hand-author them. Inputs are unique, path-sorted hashed references. Source writers pin the exact approved bundle and receive one repository write scope; only delivery writes Git/forge. Read-only repository assignments pin the creation-time content fingerprint; global assignments use null repository/baseline/status/fingerprint.
 
-```json
-{
-  "schema_version": 1,
-  "artifact_kind": "assignment",
-  "run_id": "20260817T083000Z-rate-management",
-  "action_id": "implement:api:api-packet-001:1",
-  "created_at": "2026-08-17T09:10:00Z",
-  "stage": "implement",
-  "attempt": 1,
-  "profile": "standard",
-  "validation_policy_version": 1,
-  "delivery_policy_version": 1,
-  "repo_id": "api",
-  "cwd": "/absolute/worktree/api-task",
-  "thinking": "high",
-  "timeout_seconds": 3600,
-  "project_file_access": "write",
-  "git_access": "none",
-  "forge_access": "none",
-  "repositories": [{
-    "repo_id": "api",
-    "root": "/absolute/source/api",
-    "worktree": "/absolute/worktree/api-task",
-    "access": "write"
-  }],
-  "baseline": "40-character-git-object-id",
-  "preexisting_status_path": "/absolute/run/repos/api/initial-status.txt",
-  "input_tree_fingerprint": null,
-  "input_artifacts": [
-    {"path": "/absolute/run/plan-review-v1.md", "sha256": "64-character-sha256"},
-    {"path": "/absolute/run/repos/api/plan-v1.json", "sha256": "64-character-sha256"},
-    {"path": "/absolute/run/request.md", "sha256": "64-character-sha256"},
-    {"path": "/absolute/run/requirements.json", "sha256": "64-character-sha256"}
-  ],
-  "requirement_ids": ["REQ-001"],
-  "task_ids": ["API-TASK-001", "API-TASK-002"],
-  "finding_ids": [],
-  "validation_ids": ["API-VAL-001"],
-  "packet_id": "API-PACKET-001",
-  "plan_review": {
-    "path": "/absolute/run/plan-review-v1.md",
-    "sha256": "64-character-sha256"
-  },
-  "instructions": ["Execute the assigned work packet and its bounded deviation policy."],
-  "validation_commands": ["repository-specific focused command"],
-  "output_kind": "result",
-  "output_artifact": "/absolute/run/repos/api/implementation-api-packet-001-1.json",
-  "log_dir": "/absolute/run/repos/api/logs/implement-api-api-packet-001-1",
-  "artifact_schema_path": "/absolute/skill/schemas/result.md",
-  "validator_path": "/absolute/skill/scripts/artifact_guard.py"
-}
-```
+Validation IDs/commands come from sorted effective checks, omitting excluded checks while pinning their amendments. Remediation targets are separate from the full effective rerun suite. Each action owns its logs.
 
-Input references are unique and path-sorted. Every project-file writer in a new run includes the exact approved review bundle—user-approved or policy-approved—in `input_artifacts` and repeats that hashed reference as `plan_review`; the batch supervisor compares it to current run state. A plan revision pins the superseded plan plus exactly one accepted design challenge or coordinator revision basis. Only implementation/fix stages write project files, exactly one repository at a time. Repository-scoped read-only assignments pin the content fingerprint present at assignment creation; the coordinator rejects any acceptance-time change. Only delivery writes Git/forge. Global assignments use null repository, baseline, pre-existing status, and input fingerprint.
-
-With `validation_policy_version: 1`, validation IDs and commands are built together from sorted effective check objects. Excluded checks are absent from future executable lists; the authorizing amendment remains a hash-pinned assignment input. `validation-fix` participates in exact ID/command coverage. A remediation assignment adds `remediation` and separately identifies its repair targets in `failed_validation_ids`, while rerunning the full effective suite. A restoration refresh adds `validation_refresh`. The assignment tells the worker to report complete source/check-reporting work as complete even when a command fails, honor exclusions, disclose advisory failures, and use its unique log paths.
-
-New assignments pin `reasoning_policy: stage-v1`: use `medium` for artifact-only repair, validation-only work, and fallback delivery; `high` for ordinary planning/review and every source writer; `xhigh` for full-profile contract/planning/challenge/review/integration. Legacy policy remains `legacy-xhigh` when not explicitly versioned.
-
-The supervisor's worker runtime is selected per batch: `--worker-runtime auto` follows the coordinator's Codex/Pi runtime (or `E2E_COORDINATOR_RUNTIME` when explicitly set). Workers keep `gpt-6-astra`, honoring the stage level. The actual configuration is recorded in the manifest and handle record for recovery. Deterministic commands do not create agent records.
-
-Each supervisor worker entry records `backend`, opaque `handle_id`, `cleanup_status`, and optional `cleanup_error`. Backend details remain in the durable supervisor record rather than leaking into graph routing. After a worker settles, its Paseo agent is archived, Herdr workspace is closed, tmux window is closed (or recognized as already gone), or direct process is reaped after artifact capture whether the artifact is accepted or rejected. A timeout or non-settled worker retains its original handle, pending action and lease/one-shot claim for later adoption. Settled output with failed/unknown cleanup remains unaccepted and is never normalized yet. Missing adoption cannot stand in for positive cleanup. Crash reconciliation reads the same record, performs cleanup, and only then accepts the output, including when it was written before the coordinator stopped.
+The supervisor records actual model/reasoning/backend and opaque handle for recovery. After artifact capture it archives/closes/reaps settled handles even for rejected output. Unknown or failed cleanup retains the action/lease/claim and blocks acceptance/replacement; reconciliation adopts the original handle before accepting output.
 
 ### Artifact-only assignments
 
@@ -363,17 +302,15 @@ An `execution_mode: artifact-repair` assignment keeps the original result stage,
 
 `run.json.artifact_repairs` maps the original action ID to a hashed repair assignment and its `resume_generation`, persisted before launch. Its `launch_started_at` claim is saved before entering the supervisor: after a crash, adopt/wait for surviving work and accept a valid output, but never relaunch a claimed repair with missing/invalid output. An indeterminate launch blocks conservatively. `external_resume_generation` advances only on supported explicit external-condition resume; crash recovery never replenishes the one-repair allowance. Accepted repairs remain immutable. Only previously missing blocker kinds and coordinator-owned metadata can differ from the original payload. Genuine blocked outcomes remain blocked; arbitrary field edits, changed input/evidence/Git state, or invalid/ambiguous classification do not become replacement source work.
 
-### External-repair packet verification
+### Packet verification
 
-An `execution_mode: packet-verification` assignment retains the rejected packet's implementation stage, task/packet IDs and exact check IDs/commands, but all repository access is read-only and project/Git/forge writes are forbidden. Exactly one of `external_repair` or `writer_incident` pins its immutable recovery record. Writer-incident verification inspects the preserved combined source from overlapping workers rather than treating either old result as an accepted pass. It binds the current approved plan, source fingerprint and all repository Git states, uses a unique output and log directory, and honors medium reasoning under an existing stage-v1 policy without upgrading legacy run policies. The new result inventories preserved packet files plus authorized test repairs; it does not claim the verifier wrote them.
-
-The result adds `packet_verification` with `outcome: compatible|material-change|incomplete`, concise `summary`, fresh assignment-local `evidence_path`, and coordinator-owned `evidence_sha256`. Only compatible inspected work can be `complete`; material/unfinished work must be blocked. Material change requires decision blockers and normal renewed plan approval. Every original assigned check must be reported with exact canonical command/cwd, fresh cache status, null source artifact, a new assignment-local log and acceptance-time hash, including on legacy runs. Complete reporting with failed checks is valid factual evidence, but the recovery gate remains blocked until passing evidence exists; the one-shot transition does not rerun or fix it automatically. Full-plan validation, independent review, integration and delivery remain mandatory. See [the complete contract](schemas/external-repair-recovery.md).
+Read [schemas/result.md](schemas/result.md) for `packet-verification`. It preserves original packet/task/check IDs, pins exactly one recovery record (`external_repair` or `writer_incident`), current approval and source state, and uses read-only scope with fresh output/logs. Inventory preserved work, not claimed verifier edits. Compatible inspected work and fresh passing checks are required; material/incomplete/failed work remains blocked. Recovery grants no replay, policy upgrade or extra fix allowance.
 
 ### Command delivery evidence
 
-New GitHub delivery uses `execution_mode: command` and `delivery_evidence_version: 2`. Delivery-policy version 1 additionally supplies `pr_lifecycle: draft-until-verified`, run identity, and a stable `pr_intent_path` to the helper. Local nonce-bearing creation intent and its matching PR marker jointly establish ownership; public markers alone do not. Immutable local readiness observations prevent undoing a later human redraft. The graph persists ordinary action intent, a portable input JSON, command logs/results, and a delivery artifact; it does not construct an agent handle. Active output projections may be completed during recovery, preserving prior snapshots and unique command result files; accepted artifacts remain immutable. Recovered outputs require fresh read-only forge queries, and cold recovery after acceptance schedules a new `verify_only: true` command assignment with no Git/forge write access. `verify_only` cannot commit, push, create/edit a PR, or change readiness. `pending_delivery_refresh` hash-pins accepted observations that need refresh after cold recovery. It survives other repositories' active actions and is cleared only when a new delivery artifact bound to the old observation is accepted (command, or a version-1 read-only fallback worker); completion rejects an outstanding refresh. A saved graph node cannot execute after recovery blocks or supersedes its intent. Command manifests have a separate `commands` array. Other forges retain worker execution with the same policy obligations; unsupported drafts/draft-only CI block rather than silently downgrading.
+Read [schemas/delivery.md](schemas/delivery.md) for version-2 head/policy evidence and version-1 ownership/draft semantics. Command assignments persist normal intents and unique command snapshots without agent records; manifests have a separate `commands` array. Recovered observations use fresh read-only forge queries. Accepted output is immutable; cold recovery creates a new `verify_only` assignment.
 
-Version-2 delivery adds `head_sha`, `pushed_head_sha`, `checked_head_sha`, and `check_policy` (`status`, `required_checks` with name/app identity, hashed `evidence`). Complete results require all heads to equal the final commit/current worktree and every required identity to be present and passing. Explicit absence is `not-configured`; empty current checks, permission failures, and unknown policy are not absence. Policy-version-1 output also preserves actual `pr_draft`, `pr_owned`, and typed `reason_code`. Scripted artifacts bind `command_evidence` and record `delivery_outcome` (`complete`, `pending`, or `blocked`). `required-ci-pending` and read-only `publication-required` do not spend a source-fix allowance. `required-ci-failed` is not remediation authority; a separate `check-remediation/fix-related` amendment is required. Evidence follows [schemas/delivery.md](schemas/delivery.md).
+`pending_delivery_refresh` pins prior observations, survives peer actions and clears only after acceptance of its bound refresh. Completion refuses outstanding refresh; saved graph nodes cannot execute superseded/blocked intent. Fallback workers have the same policy obligations. Unsupported behavior blocks.
 
 ## Worker artifact schemas
 
@@ -452,13 +389,11 @@ Critical/high actionable findings always block. Medium correctness findings norm
 
 ## `run-amendment-vN.json` (`run-amendment`)
 
-This is a coordinator-only immutable decision artifact, never a worker output. Its complete contract, exact request shape, authorization rules, lifetime, and examples are in [`schemas/run-amendment.md`](schemas/run-amendment.md). The artifact preserves the original request and its canonical `request_sha256`, repeats the flattened decision fields, records the applicable requirements/contract/plan/review basis, repository state, selected source/delivery references, and immutable snapshots of selected evidence. `run.json.run_amendments` contains its hash reference.
+See [schemas/run-amendment.md](schemas/run-amendment.md) for the exact request, authority, snapshots, lifetime and idempotency contract. The engine alone creates the artifact and pins it in `run.json.run_amendments`.
 
-Reviewed evidence is read once under the transaction and compared to its recorded hashes; those same bytes are snapshotted. Size validation precedes snapshot/intent persistence. Delivery reuse also requires current content/HEAD, canonical meaning, and repository amendments. For owned PRs a read-only observation cannot substitute for a normal delivery that published the current local-policy summary. Late amendments return to delivery even while an unrelated blocker remains; they never clear that blocker. Reports are context-scoped and regenerated after relevant evidence changes, preserving historical files. Reports explicitly label their capture time and immutable evidence-snapshot nature rather than showing a stale lifecycle badge; use `status` for live completion. CLI `report_paths` lists only the current evidence report; `historical_report_paths` labels older ones separately.
+Delivery reuse requires current content/HEAD, canonical meaning and amendments. Owned PRs need a normal delivery publishing the current policy summary; read-only observation cannot substitute. Late amendments return to delivery without clearing unrelated blockers.
 
-New HTML reports consume the engine's evaluated status, with active exclusions and current versus historical failures visible at top level. Direct `workflow_tools.py render-report` calls for these runs require `--evaluated-status` from the coordinator's status JSON; the renderer never implements gate policy.
-
-An amendment never rewrites a plan, result, delivery artifact, or historical log; never changes `fail` to `pass`; and never stands in for required acceptance, repository, migration, integration, review, or CI evidence. Identical requests are idempotent even after application; stale new input is rejected. Only active new runs accept new decisions.
+Reports are immutable evidence snapshots labelled with capture time, not live lifecycle state. Regenerate stale reports; `report_paths` lists current and `historical_report_paths` older outputs. Versioned direct `render-report` calls require coordinator `--evaluated-status`; the renderer does not evaluate gates. Show exclusions and current/historical failures truthfully.
 
 ## `events.jsonl`
 

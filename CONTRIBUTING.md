@@ -27,6 +27,10 @@ Changes to the full orchestrator should include focused unit tests under `skills
 
 The canonical standalone delivery helper is `skills/end-to-end-development/scripts/delivery_tools.py`. After changing it, copy it verbatim to `skills/fast-end-to-end-development/scripts/delivery_tools.py`; `scripts/check.sh` rejects drift and exercises the fast-only installation. Never import a sibling skill at runtime. The helper uses only Python's standard library, Git, and the existing forge CLI.
 
+The shared coordinator guides are `skills/end-to-end-development/DEVELOPMENT.md` and `DELIVERY.md`; mirror them into the fast skill. The durable engine's older discovery, planning, schema and incident guides remain scoped to `DURABLE.md`. Keep default development independent of those contracts. Preserve existing run behavior when changing shared helpers: new optional inputs must retain historical defaults when omitted.
+
+Validate substantial prompt changes with an independent, isolated development scenario. Check whether the agent actually completes the requested local work with truthful verification, preserves pre-existing work, and avoids unnecessary questions/artifacts. A prose substring assertion is not behavioral validation.
+
 Keep regression coverage at the existing engine/artifact/supervisor interfaces and the helper's Git/forge command seam. Use temporary Git repositories and fake forge responses for automated tests; real GitHub smoke tests are opt-in against an authorized disposable repository. Preserve legacy run/assignment policies in compatibility tests. Distinguish measured agent-launch counts from actual elapsed-time results.
 
 ## Pull requests
