@@ -61,6 +61,10 @@ ASSIGNMENT_STAGES = (PHASES - {"bootstrap", "plan-review", "complete"}) | {
     "pipeline-fix",
 }
 ARTIFACT_STATUSES = {"complete", "blocked", "failed"}
+VALIDATION_RETRY_ATTEMPTS = {
+    'retry-interrupted': 'validation_retry_attempts',
+    'retry-later-interrupted': 'later_validation_retry_attempts',
+}
 WORKER_ARTIFACT_KINDS = {
     "contract",
     "plan",
@@ -694,7 +698,7 @@ def validate_amendment_request(data: dict[str, Any]) -> None:
     if set(data) != allowed:
         fail("$", f"amendment request must have exactly {sorted(allowed)}")
     decisions = {'validation-exception': {'exclude', 'restore'}, 'check-remediation': {'fix-related'},
-                 'validation-retry': {'retry-interrupted'}}
+                 'validation-retry': set(VALIDATION_RETRY_ATTEMPTS)}
     enum(data["decision"], decisions[kind], "$.decision")
     repo_id(data["repo_id"], "$.repo_id")
     enum(data["target"], {"local", "ci"} if kind == "check-remediation" else {"local"}, "$.target")
@@ -715,11 +719,12 @@ def validate_amendment_request(data: dict[str, Any]) -> None:
         if len(data['check_ids']) != 1:
             fail('$.check_ids', 'interrupted recovery targets exactly one required command')
         interruption = obj(data['interruption'], '$.interruption')
-        if (set(interruption) != {'kind', 'harness_exit_code', 'child_exit_code'}
-                or interruption['kind'] != 'enclosing-harness-timeout'
-                or type(interruption['harness_exit_code']) is not int or interruption['harness_exit_code'] != 124
-                or interruption['child_exit_code'] is not None):
-            fail('$.interruption', 'requires an enclosing harness timeout with unknown child exit, not an assertion failure')
+        expected = ({'kind': 'execution-interruption', 'harness_exit_code': None, 'child_exit_code': None}
+                    if data['decision'] == 'retry-later-interrupted' else
+                    {'kind': 'enclosing-harness-timeout', 'harness_exit_code': 124, 'child_exit_code': None})
+        if (interruption != expected or (expected['harness_exit_code'] is not None
+                                        and type(interruption.get('harness_exit_code')) is not int)):
+            fail('$.interruption', 'requires the decision-specific interruption with unknown child exit, not an assertion failure')
     for index, reference in enumerate(evidence):
         hashed_file_reference(reference, f"$.evidence[{index}]")
 
@@ -811,15 +816,28 @@ def validate_run(data: dict[str, Any]) -> None:
         for repo, reference in obj(data.get(pending_key, {}), f"$.{pending_key}").items():
             if repo not in data.get("repositories", {}) or reference not in amendments:
                 fail(f"$.{pending_key}", "must pin a recorded amendment for a known repository")
-    for repo, reference in obj(data.get('validation_retry_attempts', {}), '$.validation_retry_attempts').items():
-        path = hashed_file_reference(reference, '$.validation_retry_attempts.' + repo)
-        assignment = load_json_object(path, '$.validation_retry_attempts')
-        decision_ref = assignment.get('validation_refresh')
-        if (repo not in data.get('repositories', {}) or assignment.get('repo_id') != repo
-                or assignment.get('run_id') != data['run_id'] or assignment.get('stage') != 'validate'
-                or decision_ref not in amendments
-                or load_json_object(decision_ref['path'], '$.validation_retry_attempts').get('kind') != 'validation-retry'):
-            fail('$.validation_retry_attempts', 'must pin the one validation-only retry assignment for this repository/run')
+    for decision, attempt_key in VALIDATION_RETRY_ATTEMPTS.items():
+        location = '$.' + attempt_key
+        for repo, reference in obj(data.get(attempt_key, {}), location).items():
+            path = hashed_file_reference(reference, location + '.' + repo)
+            assignment = load_json_object(path, location)
+            decision_ref = assignment.get('validation_refresh')
+            if (repo not in data.get('repositories', {}) or assignment.get('repo_id') != repo
+                    or assignment.get('run_id') != data['run_id'] or assignment.get('stage') != 'validate'
+                    or decision_ref not in amendments):
+                fail(location, 'must pin the one validation-only retry assignment for this repository/run')
+            amendment = load_json_object(decision_ref['path'], location)
+            if amendment.get('kind') != 'validation-retry' or amendment.get('decision') != decision:
+                fail(location, 'must preserve the distinct original/later retry authority')
+            if decision == 'retry-later-interrupted' and repo not in data.get('validation_retry_attempts', {}):
+                fail(location, 'the original consumed retry must remain recorded')
+            accepted = data['repositories'][repo].get('accepted_artifacts', {}).get(assignment['action_id'])
+            if accepted:
+                result_path = hashed_file_reference(accepted, location + '.accepted_result')
+                result = load_json_object(result_path, location + '.accepted_result')
+                if result.get('assignment_path') != str(path) or result.get('assignment_sha256') != reference['sha256']:
+                    fail(location, 'accepted verifier must bind its immutable claimed assignment')
+                verify_accepted_validation_evidence(result)
     profile_value = data.get("profile")
     profile: str | None = None
     workflow_policy: dict[str, Any] | None = None
@@ -1877,7 +1895,7 @@ def validate_assignment(data: dict[str, Any]) -> None:
             amendment = load_json_object(path, '$.' + field_name)
             validate_run_amendment(amendment)
             interrupted_retry = (field_name == 'validation_refresh' and amendment['kind'] == 'validation-retry'
-                                 and amendment['decision'] == 'retry-interrupted')
+                                 and amendment['decision'] in VALIDATION_RETRY_ATTEMPTS)
             if (stage not in stages or (not interrupted_retry and (amendment['kind'] != kind or amendment['decision'] != decision))
                     or amendment['repo_id'] != assigned_repo or amendment['run_id'] != data['run_id']
                     or reference not in data['input_artifacts']):
