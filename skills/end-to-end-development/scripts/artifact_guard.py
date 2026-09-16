@@ -1111,6 +1111,10 @@ def validate_run(data: dict[str, Any]) -> None:
         for index, evidence in enumerate(array(field(record, "evidence", loc), loc + ".evidence")):
             hashed_file_reference(evidence, f"{loc}.evidence[{index}]")
 
+    if data.get("generation_recovery"):
+        import generation_recovery
+        generation_recovery.load(data)
+
     for family, validator in (("external_repair", validate_external_recovery),
                               ("writer_incident", validate_writer_incident_recovery)):
         recoveries = obj(data.get(f"{family}_recoveries", {}), f"$.{family}_recoveries")
@@ -1595,6 +1599,9 @@ def validate_assignment(data: dict[str, Any]) -> None:
                 "$.repositories",
                 "design-challenge assignments must inspect exactly one repository",
             )
+
+    import generation_recovery
+    generation_recovery.validate_assignment(data)
 
     baseline = field(data, "baseline", "$")
     preexisting = field(data, "preexisting_status_path", "$")

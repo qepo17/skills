@@ -182,6 +182,14 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         if args.command == "resume":
             if not engine.resume_delivery_checks():
                 engine.resume_external_blockers()
+        elif args.command == "recover-generation-scope":
+            import generation_recovery
+            if graph.get_state(config).next:
+                raise WorkflowError("generation recovery requires a settled graph cursor")
+            outcome = generation_recovery.recover(engine, json.loads(args.input.read_text()),
+                request_sha256=args.request_sha256, text=args.text)
+            if args.no_drive or outcome == "already-applied":
+                return {**_result(engine), "recovery": outcome}
         elif args.command == "amend":
             if graph.get_state(config).next:
                 raise WorkflowError("amendment requires a settled graph cursor")
@@ -354,6 +362,15 @@ def build_parser() -> argparse.ArgumentParser:
     interrupted.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     interrupted.add_argument("--report-root", type=Path)
 
+    generation = subparsers.add_parser("recover-generation-scope", help="apply authorized producer-first ordering and exact generated-bundle scope")
+    generation.add_argument("run_dir", type=Path)
+    generation.add_argument("--input", type=Path, required=True)
+    generation.add_argument("--request-sha256", required=True)
+    generation.add_argument("--text", required=True)
+    generation.add_argument("--no-drive", action="store_true")
+    generation.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    generation.add_argument("--report-root", type=Path)
+
     replan = subparsers.add_parser(
         "replan-decision", help="return an accepted implementation decision to bounded planning"
     )
@@ -441,7 +458,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "recover-interrupted-packet", "replan-decision", "amend"}:
+        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "recover-interrupted-packet", "recover-generation-scope", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},

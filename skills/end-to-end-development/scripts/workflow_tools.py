@@ -227,6 +227,9 @@ def normalize_worker_artifact(
     and status snapshots so a correct result is not retried because a model
     copied stale mechanical metadata into its JSON artifact.
     """
+    if assignment.get("generation_recovery"):
+        import generation_recovery
+        generation_recovery.verify_source(assignment)
     if assignment.get("execution_mode") == "artifact-repair":
         for repository in assignment["repositories"]:
             expected = assignment["repair_of"]["repository_states"][repository["repo_id"]]
@@ -407,6 +410,8 @@ def _worker_prompt(assignment_path: Path) -> str:
         "Repository entries with access=read authorize project-file reads in that scope. The legacy "
         "project_file_access=none forbids project-file writes, not reads; likewise git_access=none and "
         "forge_access=none forbid writes, not scoped read-only inspection needed by the assignment. "
+        "Only a hash-pinned generation_recovery may additionally authorize the exact generated_file_writes, "
+        "including during check-only stages; producer repository access otherwise remains read-only. "
         "Read applicable repository instructions and current source/tests for grounded planning. "
         "Preserve runtime sandbox/approval controls; report blockers instead of broadening access. "
         "Write only assigned output, allowed project files and logs. Report semantic conclusions and actual "

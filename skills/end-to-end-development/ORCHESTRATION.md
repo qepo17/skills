@@ -199,6 +199,7 @@ Read the linked full contract before preparing or submitting its request; each r
 
 | Condition | Command and contract |
 | --- | --- |
+| Explicit producer-to-consumer contract interpreted backwards plus a no-change consumer blocked on generated API bundle scope | [`recover-generation-scope`](schemas/generation-recovery.md): authorized ordering interpretation and exact generated-file exception, preserving the approved design |
 | Code-blocked implementation rejected only for overlong `next_action`, then authorized test-fixture repair/forward base update | [`recover-external-repair`](schemas/external-repair-recovery.md): fresh read-only packet verification |
 | Lost later-packet intent after proven local reboot, initializer output and stale predecessor checks | [`recover-interrupted-packet`](schemas/interrupted-packet-recovery.md): one remaining budgeted replacement; separate host-origin confirmation |
 | Protected process metadata prevents interrupted-packet admission | [One-time privileged inspection](schemas/privileged-process-inspection.md): separately authorized read-only helper, never elevated orchestration |

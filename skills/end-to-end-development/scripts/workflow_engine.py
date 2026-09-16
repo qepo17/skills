@@ -1617,6 +1617,9 @@ class WorkflowEngine:
                 references.sort(key=lambda ref: ref["path"])
         if extras:
             assignment.update(dict(extras))
+        if run.get("generation_recovery"):
+            import generation_recovery
+            generation_recovery.decorate(self, assignment)
         assignment_path.parent.mkdir(parents=True, exist_ok=True)
         workflow_tools.atomic_write_json(assignment_path, assignment)
         artifact_guard.validate_assignment(assignment)
@@ -1803,6 +1806,12 @@ class WorkflowEngine:
         replacement["log_dir"] = str(base / "logs" / _slug(replacement["action_id"]))
         Path(replacement["log_dir"]).mkdir(parents=True, exist_ok=True)
         if not path.exists():
+            if self.load_run().get("generation_recovery"):
+                import generation_recovery
+                if attempt > 1 + self.load_run()["retry_limits"]["worker_replacements_per_stage"]:
+                    raise WorkflowError("generation recovery does not reset replacement limits")
+                generation_recovery.verify_replacement(self, assignment)
+                generation_recovery.decorate(self, replacement)
             workflow_tools.atomic_write_json(path, replacement)
         artifact_guard.validate_assignment(_load_json(path))
         return path
@@ -2116,6 +2125,7 @@ class WorkflowEngine:
         repair["action_id"] = assignment["action_id"] + ":artifact-repair-1"
         repair["created_at"] = self.now()
         repair["execution_mode"] = "artifact-repair"
+        repair.pop("generated_file_writes", None)
         repair["thinking"] = "medium"
         repair["timeout_seconds"] = 300
         repair["project_file_access"] = repair["git_access"] = repair["forge_access"] = "none"
@@ -2780,8 +2790,15 @@ class WorkflowEngine:
     def _run_pending_check_work(self) -> str:
         run = self.load_run()
         assignments = []
+        selected = None
+        if run.get("generation_recovery"):
+            import generation_recovery
+            pending = set(run.get("pending_check_remediations", {})) | set(run.get("pending_validation_refresh", {}))
+            selected = generation_recovery.ordered_repositories(self, pending)[0]
         for pending_key in ("pending_check_remediations", "pending_validation_refresh"):
             for repo_id, reference in sorted(run.get(pending_key, {}).items()):
+                if selected is not None and repo_id != selected:
+                    continue
                 decision = _load_json(Path(reference["path"]))
                 if decision["basis"] != self._validation_basis(repo_id):
                     raise WorkflowError("pending check decision no longer matches the approved context")
@@ -3659,9 +3676,7 @@ class WorkflowEngine:
             completed_packets_by_repo[repo_id] = completed
             if len(completed) == len(plan["work_packets"]):
                 completed_repositories.add(repo_id)
-        contract_dependencies: dict[str, set[str]] = {
-            repo: set() for repo in run["repositories"]
-        }
+        contract_dependencies = self._contract_dependencies()
         if run.get("validation_policy_version") == 1:
             for repo_id in sorted(run["repositories"]):
                 plan_path, plan = self._current_plan(repo_id)
@@ -3682,13 +3697,6 @@ class WorkflowEngine:
                 if not evaluation["satisfied"]:
                     self._block_validation_gate(repo_id, current[0] if current else path, evaluation)
                     return "blocked"
-        if run.get("contract_path"):
-            contract = _load_json(Path(run["contract_path"]))
-            for dependency in contract.get("dependencies", []):
-                contract_dependencies[dependency["from_repo_id"]].add(
-                    dependency["to_repo_id"]
-                )
-
         for repo_id in sorted(run["repositories"]):
             plan_path, plan = self._current_plan(repo_id)
             completed = completed_packets_by_repo[repo_id]
@@ -3809,12 +3817,18 @@ class WorkflowEngine:
         self, repo_ids: Iterable[str], scope: str
     ) -> Literal["pass", "again", "blocked"]:
         ordered_repo_ids = sorted(set(repo_ids))
+        recovered = bool(self.load_run().get("generation_recovery"))
+        if recovered:
+            import generation_recovery
+            ordered_repo_ids = generation_recovery.ordered_repositories(self, ordered_repo_ids)
         missing_assignments: list[Path] = []
         for repo_id in ordered_repo_ids:
             if self._current_validation(repo_id, require_pass=False) is None:
                 if not self._migration_guard(repo_id):
                     return "blocked"
                 missing_assignments.append(self._validation_assignment(repo_id, scope))
+                if recovered:
+                    break  # Settle upstream work before constructing a consumer snapshot.
         if missing_assignments:
             artifacts = self._run_with_replacements(missing_assignments)
             if self.load_run()["status"] == "blocked":
@@ -3828,6 +3842,8 @@ class WorkflowEngine:
         for repo_id in ordered_repo_ids:
             current_any = self._current_validation(repo_id, require_pass=False)
             if current_any is None:
+                if recovered and missing_assignments and repo_id != _load_json(missing_assignments[0])["repo_id"]:
+                    return "again"
                 self._block(
                     summary=(
                         f"Validation for {repo_id} did not cover the current tree "
@@ -3977,9 +3993,10 @@ class WorkflowEngine:
             return dependencies
         contract = _load_json(Path(run["contract_path"]))
         for dependency in contract.get("dependencies", []):
-            dependencies[dependency["from_repo_id"]].add(
-                dependency["to_repo_id"]
-            )
+            consumer, producer = dependency["from_repo_id"], dependency["to_repo_id"]
+            if run.get("generation_recovery"):
+                consumer, producer = producer, consumer
+            dependencies[consumer].add(producer)
         return dependencies
 
     def _phase_fix(self, round_number: int) -> str:
