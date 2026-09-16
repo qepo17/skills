@@ -377,6 +377,11 @@ class BatchSupervisorTests(unittest.TestCase):
         self.assertEqual("pi", manifest["workers"][0]["runtime"])
         self.assertEqual("xhigh", manifest["workers"][0]["thinking"])
         self.assertIn(str(assignment_path.resolve()), command[-1])
+        self.assertIn("Repository entries with access=read authorize project-file reads", command[-1])
+        self.assertIn("project_file_access=none forbids project-file writes, not reads", command[-1])
+        self.assertIn("git_access=none and forge_access=none forbid writes", command[-1])
+        self.assertIn("Preserve runtime sandbox/approval controls", command[-1])
+        self.assertEqual(assignment, json.loads(assignment_path.read_text()))
 
     def test_dry_run_uses_codex_for_a_codex_coordinator(self) -> None:
         output = self.root / "run" / "repos" / "api" / "validation-codex.json"
