@@ -292,6 +292,20 @@ def absolute_path(
     return result
 
 
+def validate_validation_kind_correction(original: dict, corrected: dict, decision_index: int) -> None:
+    """One metadata alias only; never repair a status, claim, or validation outcome."""
+    index = integer(decision_index, "decision_index", minimum=0)
+    decisions = array(field(original, "decisions", "$"), "$.decisions")
+    if index >= len(decisions) or obj(decisions[index], "decision").get("kind") != "validation-environment":
+        fail("decision_index", "only an existing validation-environment decision is eligible")
+    comparison = dict(original, decisions=[
+        dict(decision, kind="validation") if i == index else decision
+        for i, decision in enumerate(decisions)
+    ])
+    if comparison != corrected or corrected.get("status") != "complete":
+        fail("$", "only one validation-environment kind may change to validation on a complete result")
+
+
 def hashed_file_reference(value: Any, location: str) -> str:
     reference = obj(value, location)
     path_value = absolute_path(
@@ -1087,6 +1101,17 @@ def validate_run(data: dict[str, Any]) -> None:
             hashed_file_reference(field(record, key, loc), f"{loc}.{key}")
         for index, reference in enumerate(array(field(record, "evidence", loc), f"{loc}.evidence")):
             hashed_file_reference(reference, f"{loc}.evidence[{index}]")
+        if "correction_kind" in record:
+            enum(record["correction_kind"], {"validation-kind"}, loc + ".correction_kind")
+            text = string(field(record, "authorization_text", loc), loc + ".authorization_text", nonempty=True)
+            if (len(text) > 4000 or text.strip().lower() not in {"yes", "yea", "authorized", "approved"}
+                    or record.get("original_sha256") != record["original"]["sha256"]):
+                fail(loc, "correction requires authorization text and the authorized original digest")
+            validate_validation_kind_correction(
+                load_json_object(record["original"]["path"], loc),
+                load_json_object(record["corrected"]["path"], loc),
+                field(record, "decision_index", loc),
+            )
 
     for action_id, ref in obj(data.get("interrupted_packet_recoveries", {}), "$.interrupted_packet_recoveries").items():
         loc = f"$.interrupted_packet_recoveries.{action_id}"

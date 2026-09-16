@@ -202,6 +202,16 @@ def _invoke_locked(args: argparse.Namespace, graph_input: Any) -> dict[str, Any]
         elif args.command == "retry-corrected-handoff":
             if not engine.retry_corrected_handoff(args.original_artifact):
                 raise WorkflowError("run is not eligible for corrected next_action recovery")
+        elif args.command == "retry-corrected-decision-kind":
+            if graph.get_state(config).next:
+                raise WorkflowError("decision-kind recovery requires a settled graph cursor")
+            if not engine.retry_corrected_decision_kind(
+                args.original_artifact, original_sha256=args.original_sha256,
+                decision_index=args.decision_index, text=args.text,
+            ):
+                raise WorkflowError("run is not eligible for corrected validation decision-kind recovery")
+            if args.no_drive:
+                return {**_result(engine), "recovery": "applied"}
         elif args.command == "recover-external-repair":
             request = json.loads(args.input.read_text(encoding="utf-8"))
             applied = any(json.loads(Path(ref["path"]).read_text())["request_sha256"] == args.request_sha256
@@ -326,6 +336,19 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_retry.add_argument("--original-artifact", type=Path, required=True)
     handoff_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
     handoff_retry.add_argument("--report-root", type=Path)
+
+    decision_retry = subparsers.add_parser(
+        "retry-corrected-decision-kind",
+        help="accept only an authorized validation-environment to validation metadata correction",
+    )
+    decision_retry.add_argument("run_dir", type=Path)
+    decision_retry.add_argument("--original-artifact", type=Path, required=True)
+    decision_retry.add_argument("--original-sha256", required=True, help="digest preserved before authorization")
+    decision_retry.add_argument("--decision-index", type=int, required=True)
+    decision_retry.add_argument("--text", required=True, help="exact explicit user authorization")
+    decision_retry.add_argument("--no-drive", action="store_true")
+    decision_retry.add_argument("--worker-runtime", choices=["auto", "codex", "pi"], default="auto")
+    decision_retry.add_argument("--report-root", type=Path)
 
     external = subparsers.add_parser(
         "recover-external-repair", help="verify a rejected blocked packet after an explicitly authorized test repair/forward rebase"
@@ -458,7 +481,7 @@ def main() -> int:
                     "last_transition": "retry-validation-evidence",
                 },
             )
-        elif args.command in {"retry-corrected-handoff", "recover-external-repair", "recover-writer-incident", "recover-interrupted-packet", "recover-generation-scope", "replan-decision", "amend"}:
+        elif args.command in {"retry-corrected-handoff", "retry-corrected-decision-kind", "recover-external-repair", "recover-writer-incident", "recover-interrupted-packet", "recover-generation-scope", "replan-decision", "amend"}:
             output = _invoke(
                 args,
                 {"run_dir": str(args.run_dir.resolve()), "last_transition": args.command},

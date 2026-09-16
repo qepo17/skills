@@ -479,6 +479,23 @@ class WorkflowEngine:
         differ; all semantic evidence and current canonical/Git bindings must pass
         before the rejection and accepted reference change in one projection write.
         """
+        return self._retry_corrected_result(original_artifact)
+
+    def retry_corrected_decision_kind(
+        self, original_artifact: Path, *, original_sha256: str, decision_index: int, text: str,
+    ) -> bool:
+        """Accept only an authorized validation-environment → validation correction."""
+        artifact_guard.integer(decision_index, "decision_index", minimum=0)
+        artifact_guard.string(text, "text", nonempty=True)
+        if len(text) > 4000 or text.strip().lower() not in {"yes", "yea", "authorized", "approved"}:
+            raise WorkflowError("requires an exact affirmative reply: yes, yea, authorized or approved")
+        return self._retry_corrected_result(original_artifact, decision_index=decision_index,
+                                            original_sha256=original_sha256, text=text)
+
+    def _retry_corrected_result(
+        self, original_artifact: Path, *, decision_index: int | None = None,
+        original_sha256: str | None = None, text: str = "",
+    ) -> bool:
         with RunLock(self.run_dir):
             run = self.load_run()
             if (run["status"] != "blocked" or run["phase"] != "implement"
@@ -486,7 +503,9 @@ class WorkflowEngine:
                     or run["retry_limits"].get("artifact_repairs_per_action", 0) != 1):
                 return False
             blocker = run["blockers"][0]
-            reason = "$.next_action: must be at most 300 characters"
+            error_path = "$.next_action" if decision_index is None else f"$.decisions[{decision_index}].kind"
+            reason = ("$.next_action: must be at most 300 characters" if decision_index is None
+                      else f"{error_path}: must be one of {sorted(artifact_guard.DECISION_KINDS)}")
             manifest_path = Path(blocker["evidence_path"]).resolve()
             if (blocker["kind"] != "decision"
                     or manifest_path.parent != self.run_dir / "supervisor"):
@@ -494,7 +513,7 @@ class WorkflowEngine:
             matches = [worker for worker in _load_json(manifest_path).get("workers", [])
                        if worker.get("status") == "rejected"
                        and worker.get("error_code") == "invalid-evidence"
-                       and worker.get("error_path") == "$.next_action"
+                       and worker.get("error_path") == error_path
                        and worker.get("reason") == reason
                        and worker.get("cleanup_status") == "complete"
                        and blocker["summary"] == f"Artifact evidence rejected for {worker['action_id']}: {reason}"]
@@ -540,14 +559,24 @@ class WorkflowEngine:
                 if path.stat().st_size > artifact_guard.MAX_BYTES["result"]:
                     raise WorkflowError("rejected result exceeds its size limit")
             original, corrected = _load_json(original_path), _load_json(output)
-            hint = original.get("next_action")
-            if (not isinstance(hint, str) or len(hint) <= 300
-                    or not isinstance(corrected.get("next_action"), str)
-                    or not 0 < len(corrected["next_action"]) <= 300):
-                raise WorkflowError("only an overlong next_action corrected to 1-300 characters is eligible")
-            comparison = dict(original, next_action=corrected["next_action"])
-            if comparison != corrected or corrected.get("status") != "complete":
-                raise WorkflowError("corrected handoff changed semantic evidence beyond next_action")
+            if decision_index is not None:
+                if _sha256(original_path) != original_sha256:
+                    raise WorkflowError("preserved original does not match the explicitly authorized SHA-256")
+                artifact_guard.validate_validation_kind_correction(original, corrected, decision_index)
+                if any(agent["status"] not in {"closed", "failed"} for agent in agents):
+                    raise WorkflowError("decision-kind recovery requires all workers closed")
+                if assignment.get("generation_recovery"):
+                    import generation_recovery
+                    generation_recovery.verify_source(assignment)
+            else:
+                hint = original.get("next_action")
+                if (not isinstance(hint, str) or len(hint) <= 300
+                        or not isinstance(corrected.get("next_action"), str)
+                        or not 0 < len(corrected["next_action"]) <= 300):
+                    raise WorkflowError("only an overlong next_action corrected to 1-300 characters is eligible")
+                comparison = dict(original, next_action=corrected["next_action"])
+                if comparison != corrected or corrected.get("status") != "complete":
+                    raise WorkflowError("corrected handoff changed semantic evidence beyond next_action")
             if corrected.get("assignment_path") != str(assignment_path):
                 raise WorkflowError("corrected handoff does not bind the rejected assignment")
             previous_path = artifact_guard.CURRENT_ARTIFACT_PATH
@@ -564,20 +593,31 @@ class WorkflowEngine:
                     or Path(corrected["git"]["status_short_path"]).read_text().strip()
                     != _git(Path(repo["worktree"]), "status", "--short").strip()):
                 raise WorkflowError("corrected handoff has stale repository/Git evidence")
+            if decision_index is not None:
+                # Old results have no index digest. Only an index known to equal
+                # the pinned HEAD can be proven unchanged; status alone is lossy.
+                status = Path(corrected["git"]["status_short_path"]).read_text()
+                if (any(line and line[0] not in {" ", "?"} for line in status.splitlines())
+                        or _git(Path(repo["worktree"]), "diff", "--cached", "--raw", "--no-ext-diff",
+                                "--no-renames", "--ita-visible-in-index", "--ignore-submodules=none", "HEAD", "--").strip()):
+                    raise WorkflowError("decision-kind recovery requires an unstaged-only handoff and an index equal to HEAD")
             record = {
                 "original": _reference(original_path), "corrected": _reference(output),
                 "assignment": _reference(assignment_path), "rejection": _reference(manifest_path),
                 "repository_state": state,
                 "evidence": [_reference(path) for path in sorted(workflow_tools.artifact_evidence_paths(corrected))],
             }
+            if decision_index is not None:
+                record.update(correction_kind="validation-kind", decision_index=decision_index,
+                              authorization_text=text, original_sha256=original_sha256)
             run.setdefault("corrected_handoff_recoveries", {})[action_id] = record
             self._record_accepted_reference(run, assignment, output)
             run["status"], run["blockers"], repo["status"] = "working", [], "pending"
             self._save_run(run)
         self._append_event("artifact-accepted", action_id=action_id, artifact=str(output),
                            recovery=True, next_action=None)
-        self._append_event("resumed", reason="retry-corrected-handoff", artifact=str(original_path),
-                           next_action="implement")
+        reason = "retry-corrected-handoff" if decision_index is None else "retry-corrected-decision-kind"
+        self._append_event("resumed", reason=reason, artifact=str(original_path), next_action="implement")
         return True
 
     def replan_decision(

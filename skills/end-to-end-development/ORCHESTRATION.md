@@ -193,6 +193,17 @@ For the exact implementation-result rejection `$.next_action: must be at most 30
 
 This opt-in transition accepts only an otherwise valid, complete implementation result whose only changed field is a 1–300-character `next_action`. It requires the exact rejection manifest, closed worker handles, unchanged current source/HEAD/branch/index-status evidence, matching assignment and current approved plan. It hash-pins both results and referenced evidence, atomically accepts the result once, and returns control to the graph. Failed validations remain failed. It does not reset retry limits, change approval, rewrite assignments or repair other blockers. Preserve the original file afterward; later reconciliation verifies its hash. Ordinary `resume` remains unchanged. Do not edit already accepted artifacts or coordinator state.
 
+For an implementation result rejected at exactly `$.decisions[N].kind` with an enum error, a separate guarded command permits only the metadata alias `validation-environment` → `validation`. Preserve and hash the original **before** obtaining explicit user authorization; change only that indexed `kind`, not its ID, summary, evidence, or any other field. Then use:
+
+```bash
+"$ORCHESTRATOR" retry-corrected-decision-kind "$RUN_DIR" \
+  --original-artifact /absolute/preserved-rejected-result.json \
+  --original-sha256 "$AUTHORIZED_ORIGINAL_SHA256" --decision-index "$N" \
+  --text "$EXACT_USER_REPLY" --no-drive --worker-runtime auto
+```
+
+The authorization reply must be exactly `yes`, `yea`, `authorized`, or `approved` (case/outer whitespace ignored, verbatim text retained; at most 4000 characters). This is not a generic enum fixer. It uses the existing corrected-handoff acceptance guards, additionally pins the authorized original digest, rechecks any generation-recovery producer source, requires all workers closed/failed and a settled graph cursor, and records the exact correction and authorization. `--no-drive` permits inspection before normal graph continuation. Since old results lack an index digest, this command additionally requires that the preserved handoff had no staged changes and that the current index equals the pinned HEAD (including intent-to-add visibility). It fails closed for partially staged results rather than inventing a historical index baseline. Do not stage, unstage or reset files to make recovery eligible. Failed checks, approval, assignments, runtime, source, and retry budgets remain unchanged; the source worker is not replayed. The original `retry-corrected-handoff` remains **next_action-only**, and ordinary resume does not repair this rejection. Keep the preserved original and evidence files after recovery.
+
 ### Incident recovery index
 
 Read the linked full contract before preparing or submitting its request; each requires explicit scoped authorization.
