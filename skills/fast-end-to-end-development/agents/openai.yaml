@@ -1,4 +1,0 @@
-interface:
-  display_name: "Fast End-to-End Development"
-  short_description: "A short plan, productive iteration, verified results"
-  default_prompt: "Use $fast-end-to-end-development to implement and verify this request."
