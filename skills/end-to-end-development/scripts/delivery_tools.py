@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Deterministic GitHub delivery. Canonical copy; mirrored into the fast skill.
+"""Internal deterministic GitHub adapter for EffectGuard.
 
-Standard library only. This module executes mechanical Git/forge operations;
-it does not decide workflow phases, approve changes, or repair source.
+Standard library only. This module executes and reconciles mechanical
+Git/forge operations; it does not authorize publication or repair source.
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
@@ -109,6 +108,7 @@ class Delivery:
         self._was_ready = False
         self.result: dict[str, Any] = {
             "schema_version": 1, "status": "blocked", "kind": None, "summary": "Delivery not started.",
+            "effect_state": "not-applied",
             "branch": spec.get("branch"), "base_branch": spec.get("base_branch"), "commits": [], "pr_url": None,
             "head_sha": None, "pushed_head_sha": None, "checked_head_sha": None,
             "pr_draft": None, "pr_owned": False, "reason_code": None, "creation_intent": None, "ownership_observation": None,
@@ -117,6 +117,11 @@ class Delivery:
         }
 
     def command(self, args: list[str], *, allow_failure: bool = False, redact_output: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
+        mutating = args[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]) or args[:3] in (
+            ["gh", "pr", "create"], ["gh", "pr", "edit"], ["gh", "pr", "ready"]
+        )
+        if mutating:
+            self.result["effect_state"] = "indeterminate"
         timeout = (self.spec.get("git_write_timeout_seconds", 30)
                    if args[:2] in (["git", "add"], ["git", "commit"], ["git", "push"]) else 30)
         try:
@@ -418,6 +423,7 @@ class Delivery:
                                 reason_code="draft-pr-creation-failed") from error
         url = output.stdout.strip()
         if not url.startswith(f"https://{self.repository}/pull/"):
+            self.result["effect_state"] = "indeterminate"
             raise DeliveryError("PR creation returned an unexpected identity; reconcile before retrying.",
                                 reason_code="unexpected-created-pr-identity")
         self.result["pr_url"] = url
@@ -435,8 +441,10 @@ class Delivery:
             self.command(["gh", "pr", "ready", self.result["pr_url"], "--repo", self.repository])
         except DeliveryError as error:
             self.result["pr_draft"] = None
+            self.result["effect_state"] = "indeterminate"
             try:
                 self.observe_pr()
+                self.result["effect_state"] = "settled"
             except DeliveryError:
                 pass
             raise DeliveryError("Owned draft publication failed; its readiness was not assumed to change.",
@@ -653,6 +661,8 @@ class Delivery:
                                                 if draft_wait else "Required CI checks are pending; delivery is not complete."))
                     break
                 self.sleep(min(10, max(0, deadline - self.clock())))
+            if self.result["status"] in {"complete", "pending"} and self.result["effect_state"] == "indeterminate":
+                self.result["effect_state"] = "settled"
         except DeliveryError as error:
             self.result.update(status="blocked", kind=error.kind, summary=str(error), reason_code=error.reason_code)
             if error.evidence_path:
@@ -662,35 +672,3 @@ class Delivery:
                                summary=f"Delivery evidence/configuration is indeterminate ({type(error).__name__}); inspect logs.")
         self.result["elapsed_seconds"] = round(self.clock() - start, 3)
         return self.result
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
-    fingerprint = sub.add_parser("fingerprint", help="print commit-independent content identity")
-    fingerprint.add_argument("worktree", type=Path)
-    deliver = sub.add_parser("deliver", help="reconcile a verified change through GitHub delivery")
-    deliver.add_argument("--input", type=Path, required=True)
-    deliver.add_argument("--output", type=Path, required=True)
-    deliver.add_argument("--verify-only", action="store_true", help="refresh delivered evidence without commit/push/PR writes")
-    args = parser.parse_args()
-    if args.command == "fingerprint":
-        print(content_fingerprint(args.worktree))
-        return 0
-    if args.output.exists():
-        parser.error("output exists; use a new evidence path when reconciling delivery")
-    spec = json.loads(args.input.read_text())
-    output = args.output.resolve()
-    if output.is_relative_to(Path(spec["worktree"]).resolve()):
-        parser.error("output must live outside the project worktree")
-    result = Delivery(spec).run(verify_only=args.verify_only)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(result, indent=2) + "\n")
-    temporary.replace(output)
-    print(json.dumps({"status": result["status"], "pr_url": result["pr_url"], "output": str(output)}))
-    return 0 if result["status"] == "complete" else 8 if result["status"] == "pending" else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

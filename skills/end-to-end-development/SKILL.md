@@ -1,19 +1,14 @@
 ---
 name: end-to-end-development
-description: Implement, verify, and deliver software requests. Supports explicit durable LangGraph orchestration and existing-run recovery.
-disable-model-invocation: true
+description: Implement, verify, and deliver software requests directly with the current agent across one or more repositories.
 ---
 
 # End-to-End Development
 
-For new work, follow [DEVELOPMENT.md](DEVELOPMENT.md). The current agent owns the development loop, including multiple repositories. Use the user's existing context and authorization; keep the process proportional to the change.
+Follow [DEVELOPMENT.md](DEVELOPMENT.md). The current agent owns understanding, planning, implementation, verification, review, and requested delivery. Scale the process to the actual change instead of selecting a workflow profile.
 
-## Select durable mode only when needed
+Use the agent runtime's native tools and collaboration facilities. Keep one source writer per repository; independent repositories may progress concurrently. When persistence helps, keep one concise task record with repository baselines, settled decisions, current checks, delivery receipts, and the next useful action.
 
-- For a supplied existing run directory, or a continuation of a LangGraph run, read [DURABLE.md](DURABLE.md) and resume the existing engine. Preserve its worktrees, artifacts, approvals, and policies.
-- For an explicit request for LangGraph orchestration, use [DURABLE.md](DURABLE.md). Explain its persistent worker and phase constraints before initializing.
-- Otherwise use coordinator-led development. A long task, multiple repositories, or a sensitive code path alone does not require durable mode. If the work needs independently supervised persistent workers, explain that trade-off before selecting it.
+Read [DELIVERY.md](DELIVERY.md) only when the requested outcome includes a GitHub pull request. Its `EffectGuard` persists external-effect intent and reconciles interrupted publication. It does not orchestrate development, supervise model workers, or authorize publication.
 
-Do not load the durable artifact contracts, worker schemas, or incident recovery instructions for ordinary development. Do not bypass an active durable run by switching its work into the coordinator workflow.
-
-Read [DELIVERY.md](DELIVERY.md) only when using the bundled GitHub helper. Use [DURABLE.md](DURABLE.md) for the optional durable report and recovery commands.
+There is no durable workflow mode, phase engine, packet protocol, or automatic migration of historical orchestration state. Treat any old LangGraph run as read-only evidence and recover useful context from its repositories and artifacts without modifying or replaying its engine state.

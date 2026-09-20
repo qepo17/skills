@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = ROOT / "skills"
 EXPECTED_SKILLS = {
     "end-to-end-development",
-    "fast-end-to-end-development",
     "idea-to-ticket",
     "simple-code",
 }

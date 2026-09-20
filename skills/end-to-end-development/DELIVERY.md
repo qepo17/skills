@@ -1,70 +1,99 @@
-# GitHub delivery
+# GitHub delivery effects
 
-Read this when the requested outcome includes a PR. The standard-library helper requires Python 3.11+, Git, and authenticated `gh`. Finish applicable local verification and review before pushing. Keep unrelated user changes intact.
+Read this only when the user requested a GitHub pull request. `EffectGuard` protects publication from duplicate or conflicting retries; it does not grant authorization, choose what to build, repair source, or orchestrate development.
 
-## Prepare the input
+The standard-library helper requires Python 3.11+, Git, and authenticated `gh`. Finish applicable local verification and review before publication. Keep unrelated user changes intact.
 
-Discover the intended GitHub repository, configured remote, task branch and base. The helper supports a same-repository PR where the selected remote's fetch and push URLs resolve to that repository. For forks or another forge, use its established CLI with equivalent checks; do not rewrite remotes to fit the helper.
+## Capture verified content
 
-Capture verified content with:
+Resolve `SKILL_DIR` to this skill directory and capture the exact content verified:
 
 ```bash
-python3 "$SKILL_DIR/scripts/delivery_tools.py" fingerprint "$WORKTREE"
+python3 "$SKILL_DIR/scripts/effect_guard.py" fingerprint "$WORKTREE"
 ```
 
-Write an input next to the task record, outside source:
+Write an effect proposal next to the task record, outside source:
 
 ```json
 {
-  "repository": "github.com/owner/repository",
-  "remote": "upstream",
-  "worktree": "/absolute/task/checkout",
-  "baseline": "<recorded baseline commit>",
-  "base_branch": "main",
-  "branch": "feat/request-slug",
-  "task_files": ["src/changed.py", "tests/test_changed.py"],
-  "expected_fingerprint": "<fingerprint captured after verification>",
-  "commit_message": "Fix the requested behavior",
-  "pr_title": "Fix the requested behavior",
-  "pr_body": "Describe the problem, change and actual verification.",
-  "log_dir": "/absolute/task-record/logs/delivery-1",
-  "git_write_timeout_seconds": 300,
-  "check_timeout_seconds": 1800
+  "kind": "github-pull-request",
+  "change_set": "request-slug",
+  "approval_required": false,
+  "delivery": {
+    "repository": "github.com/owner/repository",
+    "remote": "origin",
+    "worktree": "/absolute/task/checkout",
+    "baseline": "<recorded baseline commit>",
+    "base_branch": "main",
+    "branch": "feat/request-slug",
+    "task_files": ["src/changed.py", "tests/test_changed.py"],
+    "expected_fingerprint": "<fingerprint captured after verification>",
+    "commit_message": "Implement the requested behavior",
+    "pr_title": "Implement the requested behavior",
+    "pr_body": "Describe the problem, change, and actual verification.",
+    "git_write_timeout_seconds": 300,
+    "check_timeout_seconds": 1800
+  }
 }
 ```
 
-Use actual values. `task_files` includes every task change, including deleted/renamed paths. The helper refuses unrelated index/worktree changes, credential files, mismatched destinations, or changed verification fingerprints. Use an isolated checkout when necessary; never discard or stage unrelated work to satisfy this check. If the request is already satisfied, report the evidence without calling delivery on an empty diff.
+`task_files` includes every task change, including deleted and renamed paths. The helper refuses unrelated index/worktree changes, credential files, mismatched destinations, or changed verification fingerprints. Use an isolated checkout when necessary; never discard or stage unrelated work to satisfy delivery.
 
-`remote` is a configured remote name, not a URL. `git_write_timeout_seconds` bounds add/commit/push, including hooks (integer 1–1800). Read requests remain bounded at 30 seconds. Omitted fields preserve older inputs: `origin` and a 30-second Git write timeout. `check_timeout_seconds` is 0–1800; zero observes CI once and does not waive it. Keep the same remote and verified identity on retries.
+The selected remote's fetch and push destinations must resolve to the declared GitHub repository. For forks, GitLab, or another forge, use its established tooling with equivalent safety checks; do not rewrite remotes to fit this helper.
 
-## Choose the PR lifecycle
+## Ensure and reconcile
 
-For normal authorized publication, omit `pr_lifecycle`: the helper creates a ready PR and verifies CI. A ready PR is not a passing-check claim. This supports repositories whose required workflows run only on ready PRs.
-
-If the requested outcome is a draft that becomes ready after verified CI, add `pr_lifecycle: "draft-until-verified"`, `run_id`, and a stable absolute `pr_intent_path` outside source. Confirm required workflows run on drafts first. This optional lifecycle preserves nonce-bound ownership, human edits, and later human redrafting. Do not choose it for a draft-only deliverable: it publishes the owned draft after green CI. For a draft-only request, use the forge CLI and verify the requested draft state without promoting it.
-
-The optional managed validation section is engine-owned. A human edit inside it blocks that lifecycle; preserve the edit and resolve the conflict explicitly. Existing unowned PR bodies and readiness are preserved. Default delivery does not add a managed section.
-
-## Execute and reconcile
+Use one journal for the task or change set. The guard also maintains a shared target registry under `${XDG_STATE_HOME:-$HOME/.local/state}/end-to-end-development/` so separate tasks cannot concurrently own the same repository branch:
 
 ```bash
-python3 "$SKILL_DIR/scripts/delivery_tools.py" deliver \
-  --input "$TASK_DIR/delivery-input-1.json" \
-  --output "$TASK_DIR/delivery-output-1.json"
+python3 "$SKILL_DIR/scripts/effect_guard.py" ensure \
+  --journal "$TASK_DIR/effects.sqlite" \
+  --input "$TASK_DIR/api-pr-effect.json" \
+  --output "$TASK_DIR/api-pr-outcome.json"
 ```
 
-Use a new input/output and log directory for each attempt. Keep a draft lifecycle's `pr_intent_path` stable across retries. The helper audits effective remote destinations, stages exact task paths, preserves unrelated history, and reconciles existing commits/PRs. Hook-induced content changes require revalidation. It never force-pushes.
+The effect identity is derived from its kind, target, desired content, and requested pull-request state. Runtime timeouts do not change that identity. Before mutation, the guard records durable intent and locks the target repository branch. The delivery adapter then observes existing commits and pull requests before applying anything.
 
-After an interrupted attempt, inspect its evidence and current Git/forge state before retrying. Ordinary delivery reconciles incomplete side effects. To refresh a previously delivered unchanged revision, add `--verify-only`; it never commits, pushes, creates/edits a PR, or changes readiness. A green owned draft returns `publication-required` until a normal authorized delivery publishes it.
+Calling `ensure` again with the identical proposal is the resume mechanism. A completed effect returns its stored receipt without contacting GitHub. An interrupted effect is reconciled through the same delivery adapter. A different effect—or the same effect from another task journal—targeting a branch with an indeterminate prior effect stops with `target-conflict`; its outcome identifies the blocking effect and original journal to reconcile first.
 
-## Interpret the result
+The journal stores the bounded canonical proposal as well as its digest. `inspect` returns that proposal for incomplete effects, so recovery does not depend on preserving the original input file.
 
-- Exit **0 / complete**: local, pushed and checked heads match; required CI passed or positive policy discovery found none configured.
-- Exit **8 / pending**: keep the PR URL visible and inspect `reason_code`. Continue monitoring against the same verified content. A polling timeout is not a code failure.
-- Exit **1 / blocked**: inspect the actual failure and logs. Fix related code within scope, revalidate, capture the new fingerprint, and reconcile the same PR. Preserve unrelated failures and genuine access/scope blockers. There is no one-fix cap in coordinator-led development.
+Use read-only inspection when needed:
 
-Required-check discovery includes branch protection and applicable rulesets. Empty check output or permission errors do not establish that no checks are configured. Pending, missing, failed, skipped, cancelled, unknown, or changed-head/policy evidence cannot complete verified delivery. Report positive absence as “not configured.”
+```bash
+python3 "$SKILL_DIR/scripts/effect_guard.py" inspect \
+  --journal "$TASK_DIR/effects.sqlite" \
+  "$EFFECT_ID" \
+  --output "$TASK_DIR/api-pr-inspection.json"
+```
 
-Record the PR URL, commit, checked head, actual draft state, verification outcome and any warning in the task record. The machine output and logs are evidence; no separate delivery prose file is required.
+## Exact approval when required
 
-Existing LangGraph runs retain their recorded draft, retry, approval and validation policy. Their engine constructs helper inputs and owns recovery; the coordinator-led choices above do not amend an active run.
+Ordinary requested PR publication does not need a second approval. Set `approval_required` only when the user has not authorized the consequential effect or when repository instructions demand an exact publication decision.
+
+The first `ensure` returns `decision-required` with a proposal digest and performs no external work. After the user approves that exact proposal, write:
+
+```json
+{
+  "proposal_digest": "<digest returned by ensure>",
+  "actor": "user",
+  "text": "<the user's exact approval wording>"
+}
+```
+
+Then repeat `ensure` with `--approval "$TASK_DIR/approval.json"`. A stale digest is rejected. The accepted approval is stored with the intent, so identical retries and receipt reads do not require the approval file again.
+
+## Multi-repository delivery
+
+Use one effect per repository and the same `change_set` value. Repository effects settle independently; no tool can make separate Git repositories and pull requests atomic. Publish in dependency order when one pull request depends on another, and cross-link their bodies where helpful.
+
+If one effect completes and another stops, preserve the completed receipt and resolve or report only the remaining repository. Re-running the completed proposal never duplicates its pull request.
+
+## Outcomes
+
+- Exit **0 / `complete`**: local, pushed, pull-request, and checked revisions agree; required checks passed or positive policy evidence established that none are configured.
+- Exit **8 / `pending`**: the effect awaits external state or its prior outcome is indeterminate. Keep any PR URL visible. For an indeterminate outcome, recover the proposal through `inspect` if necessary and call `ensure` again with that exact proposal before attempting a revision.
+- Exit **9 / `decision-required`**: exact approval is needed before intent is recorded.
+- Exit **1 / `stopped`**: the attempt reached a known non-success state and released target ownership. Inspect `reason_code` and the receipt. Fix related source only after understanding the evidence, then revalidate and create a revised effect proposal if content changed.
+
+Pending, missing, failed, skipped, cancelled, unknown, or changed-head check evidence cannot complete verified delivery. Empty check output or permission errors do not prove that checks are absent. Human changes to pull-request ownership, content, destination, or readiness are preserved and surfaced as conflicts rather than overwritten.
