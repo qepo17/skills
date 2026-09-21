@@ -7,6 +7,11 @@ description: Implement, verify, and deliver software requests directly with the 
 
 Follow [DEVELOPMENT.md](DEVELOPMENT.md). The current agent owns understanding, planning, implementation, verification, review, and requested delivery. Scale the process to the actual change instead of selecting a workflow profile.
 
+When available, use the optional [decision-support guidance](DECISION_SUPPORT.md)
+to classify workflow and risk at intake and before delivery. Its results are
+advisory; repository checks, explicit authorization, and delivery safety rules
+remain authoritative.
+
 Use the agent runtime's native tools and collaboration facilities. Keep one source writer per repository; independent repositories may progress concurrently. When persistence helps, keep one concise task record with repository baselines, settled decisions, current checks, delivery receipts, and the next useful action.
 
 Read [DELIVERY.md](DELIVERY.md) only when the requested outcome includes a GitHub pull request. Its `EffectGuard` persists external-effect intent and reconciles interrupted publication. It does not orchestrate development, supervise model workers, or authorize publication.
