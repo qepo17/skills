@@ -23,6 +23,14 @@ Ask independent, atomic questions against the same sanitized state. Use
 TypeSafe's `Choice` for `workflow_kind` and `Score` for `impact` and
 `ambiguity`. Compose their answers with ordinary workflow policy.
 
+Use this shared prompt:
+
+```text
+Using the request, repository instructions, and a sanitized change summary,
+classify the workflow, impact, and ambiguity independently. Use confidence to
+signal uncertainty. Do not authorize actions or invent missing requirements.
+```
+
 ### `workflow_kind` — Choice
 
 Choose the kind that best describes the requested work:
