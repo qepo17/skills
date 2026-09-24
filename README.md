@@ -23,6 +23,7 @@ The current agent owns the loop. There is no workflow engine, prescribed phase g
 - Keep one concise task record when a persistent handoff is useful; tiny work needs no dossier.
 - Preserve existing changes and use an isolated worktree when needed.
 - Keep one source writer per repository. Independent repositories may progress concurrently, while dependent changes proceed in dependency order.
+- When TypeSafe and Herdr are available, an already-bounded delegated subtask may use an ephemeral worker profile to select its approved model and reasoning effort. The current agent still owns decomposition, supervision, and synthesis.
 - Treat multi-repository delivery as independently observable effects rather than a fictional atomic transaction.
 - Run meaningful acceptance and repository-required checks. Content changes invalidate affected evidence.
 - Use independent review for substantive changes and browser verification for UI changes.
@@ -65,7 +66,7 @@ npx skills update --global end-to-end-development idea-to-ticket simple-code
 
 ## Requirements
 
-Agent-led development uses the repository's normal tools and the current agent runtime. Independent review requires an available independent agent when the change or repository requires it.
+Agent-led development uses the repository's normal tools and the current agent runtime. Independent review requires an available independent agent when the change or repository requires it. Optional worker routing requires host-provided TypeSafe access and Herdr automation; neither is required for the normal development loop.
 
 GitHub delivery requires Python 3.11+, Git, and authenticated `gh`. `EffectGuard` otherwise uses only the Python standard library.
 
