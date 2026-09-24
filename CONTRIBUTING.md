@@ -25,6 +25,10 @@ npx skills add . --list
 
 The development skill is agent-led. Do not add phase routing, workflow profiles, worker packet schemas, or model-thought persistence. Keep task records concise and optional.
 
+Optional worker routing may select an ephemeral, host-defined launch profile
+for an already-bounded delegation. It must not decompose the task, become
+durable workflow state, or introduce a worker-packet protocol.
+
 `EffectGuard` is the only durable development module. Its public interface is `ensure` and `inspect`; test external behavior through that interface. Keep GitHub-specific execution and reconciliation inside the delivery adapter. Use temporary Git repositories and fake forge responses for automated tests; real GitHub smoke tests are opt-in against an authorized disposable repository.
 
 New effect kinds need:
