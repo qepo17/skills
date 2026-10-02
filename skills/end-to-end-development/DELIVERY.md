@@ -1,6 +1,8 @@
 # GitHub delivery effects
 
-Read this only when the user requested a GitHub pull request. `EffectGuard` protects publication from duplicate or conflicting retries; it does not grant authorization, choose what to build, repair source, or orchestrate development.
+Read this whenever using normal GitHub PR completion. Requesting the skill for a repository change includes ordinary task-scoped commit, push, and PR creation/update without a second invitation or approval, subject to explicit opt-outs, repository policy, exact-approval requirements, and tool/sandbox permissions. `EffectGuard` protects publication from duplicate or conflicting retries; it does not grant authorization, choose what to build, repair source, or orchestrate development.
+
+Establish the appropriate task branch, remote, repository, and base before mutation. Reuse and update an existing open task PR rather than duplicate it. No-change requests need evidence, not empty PRs; explicit local-only/no-push/no-PR instructions limit delivery to the actual permitted result. Missing authentication or remote, ambiguous destination, denied permission, or failed required verification/review must be reported as blocked or partial with the next needed action, not silently treated as local-only completion. Continue useful local work while remote delivery is blocked.
 
 The standard-library helper requires Python 3.11+, Git, and authenticated `gh`. Finish applicable local verification and review before publication. Keep unrelated user changes intact.
 
@@ -69,7 +71,7 @@ python3 "$SKILL_DIR/scripts/effect_guard.py" inspect \
 
 ## Exact approval when required
 
-Ordinary requested PR publication does not need a second approval. Set `approval_required` only when the user has not authorized the consequential effect or when repository instructions demand an exact publication decision.
+Ordinary PR-default task authorization covers scoped commit/push/PR delivery to an established, unambiguous destination; it does not require separate user confirmation. Set `approval_required` when repository instructions require an exact publication decision or a proposed external effect exceeds the authorized task scope. Obtain that approval before mutation; an explicit opt-out is not permission to publish. Tool/sandbox permissions remain enforced. Never infer authorization for merge, deployment, migrations, permissions changes, tracker writes, creating a remote repository, or destructive work.
 
 The first `ensure` returns `decision-required` with a proposal digest and performs no external work. After the user approves that exact proposal, write:
 
@@ -96,4 +98,4 @@ If one effect completes and another stops, preserve the completed receipt and re
 - Exit **9 / `decision-required`**: exact approval is needed before intent is recorded.
 - Exit **1 / `stopped`**: the attempt reached a known non-success state and released target ownership. Inspect `reason_code` and the receipt. Fix related source only after understanding the evidence, then revalidate and create a revised effect proposal if content changed.
 
-Pending, missing, failed, skipped, cancelled, unknown, or changed-head check evidence cannot complete verified delivery. Empty check output or permission errors do not prove that checks are absent. Human changes to pull-request ownership, content, destination, or readiness are preserved and surfaced as conflicts rather than overwritten.
+Return the PR URL(s) and actual check/review status, including blockers and the next needed action for incomplete delivery. A created PR alone does not prove verified success. Pending, missing, failed, skipped, cancelled, unknown, or changed-head check evidence cannot complete verified delivery. Empty check output or permission errors do not prove that checks are absent. Human changes to pull-request ownership, content, destination, or readiness are preserved and surfaced as conflicts rather than overwritten.

@@ -1,6 +1,6 @@
 # Development loop
 
-**Understand → coordinate implementation and iteration → verify → review → deliver as requested.**
+**Understand → coordinate implementation and iteration → locally verify → independently review as required → commit → push → create or update the task PR.**
 
 The current agent orchestrates the loop: it owns understanding, decomposition, consequential decisions, coordination, integration, final acceptance, and authorized delivery. There is no prescribed phase machine: revisit understanding, implementation, and verification whenever evidence changes.
 
@@ -62,10 +62,14 @@ Have workers implement through the repository's normal tools and conventions. Di
 
 ## Deliver and resume
 
-Finish the requested outcome: verified local changes, an evidenced no-change result, or authorized publication. The skill name never authorizes a push, pull request, merge, deployment, migration, or tracker write.
+For ordinary repository changes, the orchestrator owns completion through an open, up-to-date task PR: implement, locally verify, independently review as required, commit task-scoped changes, push to the established appropriate task branch and remote, and create or update the PR. Reuse an existing open task PR rather than create a duplicate. Worker completion, local changes, a commit, or a pushed branch alone does not finish this outcome.
 
-For GitHub pull-request delivery, read [DELIVERY.md](DELIVERY.md). Capture a new content fingerprint after the last relevant check. If source changes afterward, verify again before creating a new effect proposal.
+A request to use this skill for a repository change requests this workflow; ordinary scoped commit/push/PR delivery needs no further invitation or approval. Honor explicit local-only/no-push/no-PR instructions, repository policy or exact-approval requirements, and tool/sandbox permissions. Resolve an ambiguous destination before publication. Do not infer authority for merge, deployment, migrations, permissions changes, tracker writes, creating a remote repository, or destructive work.
+
+Read [DELIVERY.md](DELIVERY.md) whenever using normal GitHub PR completion, without waiting for a separate PR request. Capture a new content fingerprint after the last relevant check. If source changes afterward, verify again before creating a new effect proposal.
+
+If no changes are needed, report the evidence and create no empty PR. For explicit opt-outs, return the actual local result. Missing authentication or remote, ambiguous destination, denied permission, or failed required verification/review leaves delivery blocked or partial: state the result, blocker, and next needed action. Continue useful local development where possible; do not silently downgrade to local-only, bypass safety, or call the task complete.
 
 On continuation, inspect the task record, repositories, checks, collaboration resources, and external effects. Reconcile existing workers, their ownership and pending results before launching duplicates or taking over writes. Reconcile existing facts before repeating work. An old workflow-engine directory is historical evidence only; do not resume, mutate, or reinterpret its cursor.
 
-Finish with the actual outcome, checks performed, applicable links, partial repository results, and remaining warnings or blockers.
+Finish with the PR URL(s), actual check and review status, partial repository results, and remaining warnings or blockers. For no-change or explicit local-only outcomes, state that outcome and its evidence. CI pending or failing is not verified success even when a PR exists.
