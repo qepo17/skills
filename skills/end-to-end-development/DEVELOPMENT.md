@@ -17,7 +17,7 @@ The current agent owns the semantic loop. There is no prescribed phase machine: 
 - Record each repository's root, baseline, branch, existing edits, requested outcome, and relevant checks.
 - Write down any shared interface decision in the task record before dependent implementations diverge. Keep this concise; it is context, not a schema-controlled artifact.
 - Keep one source writer per repository. Writers for independent repositories may run concurrently; dependent changes proceed in dependency order. Read-only inspection and review may run concurrently with writers when the runtime makes that safe.
-- The current agent decides whether a subtask is independently delegable and remains responsible for its context and result. When TypeSafe and Herdr are available, [WORKER_ROUTING.md](WORKER_ROUTING.md) may select the launch profile for an already-bounded coding-agent worker. Routing is optional and never replaces reasoning, ownership, or supervision.
+- The current agent decides whether a subtask is independently delegable and remains responsible for its context and result. Use the runtime's configured workers, honor explicit model requirements, and preserve authorization and write ownership. Give each worker a bounded subtask and inspect and validate its result before using it.
 - Do not pretend a multi-repository change is atomic. Track each repository's local, validation, and delivery outcome independently, then verify the combined behavior against the exact repository revisions involved.
 - If one repository is blocked, continue unaffected repositories and report the partial outcome explicitly.
 
