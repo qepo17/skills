@@ -24,7 +24,7 @@ The current agent owns understanding, decomposition, consequential decisions, co
 - Keep one concise optional task record with active worker targets, scopes, ownership, dependencies and pending results when useful. Reconcile existing workers before launching duplicates.
 - Preserve existing changes and use an isolated worktree when needed.
 - Keep one active source writer per repository across all worktrees, including the orchestrator. Settle and release ownership before integration or repair. Independent repositories and safe read-only investigations may progress concurrently; dependent changes proceed in dependency order.
-- Use native runtime collaboration or launch facilities. Optional TypeSafe routing selects an approved model and effort for an already-bounded worker; TypeSafe and Herdr are not prerequisites for delegation. Execute directly for tiny reversible tasks, unavailable workers, or genuinely inseparable integration and decisions.
+- Use native runtime collaboration or launch facilities with the runtime's configured workers and honor explicit model requirements. Execute directly for tiny reversible tasks, unavailable workers, or genuinely inseparable integration and decisions.
 - Treat multi-repository delivery as independently observable effects rather than a fictional atomic transaction.
 - Run meaningful acceptance and repository-required checks. Bind checks and independent review to stable exact content; content changes invalidate affected evidence.
 - Use independent review for substantive changes and browser verification for UI changes. Report unavailable independent review honestly and preserve repository-required review gates.
@@ -71,7 +71,7 @@ npx skills update --global end-to-end-development idea-to-ticket simple-code
 
 ## Requirements
 
-Orchestrator-first development uses the repository's normal tools and available native runtime collaboration or worker launch facilities. When workers are unavailable, direct execution remains possible, with any independent review gap reported. Independent review requires an available independent reviewer when the change or repository requires it. Optional worker routing requires host-provided TypeSafe access and a launcher that supports approved model and effort selection; Herdr is one option. Neither TypeSafe nor Herdr is required for ordinary delegation or the development loop.
+Orchestrator-first development uses the repository's normal tools and available native runtime collaboration or worker launch facilities. When workers are unavailable, direct execution remains possible, with any independent review gap reported. Independent review requires an available independent reviewer when the change or repository requires it.
 
 GitHub delivery requires Python 3.11+, Git, and authenticated `gh`. `EffectGuard` otherwise uses only the Python standard library.
 

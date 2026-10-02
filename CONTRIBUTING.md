@@ -33,13 +33,6 @@ Keep one active source writer per repository across all worktrees, including the
 
 Use compact assignments covering goal/acceptance, repository/worktree/baseline, exact scope and owner, constraints/interfaces/dependencies, evidence/checks, and expected changed files or revisions, actual checks and unresolved issues. Do not add phase routing, workflow profiles, worker packet schemas, model-thought persistence, runtime dependencies, automatic retries or needless artifacts. Keep task records concise and optional, including active worker targets, scopes, ownership, dependencies and pending results; reconcile existing workers before launching duplicates.
 
-Optional worker routing may select an ephemeral, host-defined launch profile
-for an already-bounded delegation. TypeSafe and Herdr are optional; their absence
-must not force root execution when another worker launcher is available. Safely
-delegable work may use a conservative ordinary worker after routing uncertainty
-or failure. Routing must not decompose the task, become durable workflow state,
-or introduce a worker-packet protocol.
-
 `EffectGuard` is the only durable development module. Its public interface is `ensure` and `inspect`; test external behavior through that interface. Keep GitHub-specific execution and reconciliation inside the delivery adapter. Use temporary Git repositories and fake forge responses for automated tests; real GitHub smoke tests are opt-in against an authorized disposable repository.
 
 New effect kinds need:
@@ -51,7 +44,7 @@ New effect kinds need:
 - Fail-closed handling of indeterminate outcomes.
 - Focused interface tests covering interruption and conflicting retries.
 
-Substantial prompt changes should be checked with an independent, isolated development scenario. Verify that the agent delegates coherent bounded work through native facilities without TypeSafe or Herdr, supervises and accepts inspected results, reconciles workers on resume, completes useful local work, preserves pre-existing changes, handles multiple repositories and worktrees without conflicting writers, reports partial outcomes and unavailable review truthfully, and avoids unnecessary questions or artifacts. Also check default PR completion with no reminder, existing open PR reuse, explicit local-only behavior, and truthful delivery blockers and pending/failing checks. Use isolated Git repositories and fake forge fixtures, or explicitly authorized disposable repositories; never publish to unintended live destinations. Prose substring assertions are not behavioral validation.
+Substantial prompt changes should be checked with an independent, isolated development scenario. Verify that the agent delegates coherent bounded work through native facilities with the runtime's configured workers, supervises and accepts inspected results, reconciles workers on resume, completes useful local work, preserves pre-existing changes, handles multiple repositories and worktrees without conflicting writers, reports partial outcomes and unavailable review truthfully, and avoids unnecessary questions or artifacts. Also check default PR completion with no reminder, existing open PR reuse, explicit local-only behavior, and truthful delivery blockers and pending/failing checks. Use isolated Git repositories and fake forge fixtures, or explicitly authorized disposable repositories; never publish to unintended live destinations. Prose substring assertions are not behavioral validation.
 
 ## Pull requests
 

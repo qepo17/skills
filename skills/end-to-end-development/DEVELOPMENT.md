@@ -14,8 +14,8 @@ The current agent orchestrates the loop: it owns understanding, decomposition, c
 
 ## Coordinate workers
 
-- Default to bounded workers for substantive independently executable implementation, useful tests, research or inspection, and independent review. Let a worker own a coherent change through its relevant checks rather than directing every edit.
-- Use native runtime collaboration or worker launch facilities. TypeSafe and Herdr are optional; their absence does not prevent delegation through other available facilities. [WORKER_ROUTING.md](WORKER_ROUTING.md) only selects an approved model and effort for an already-bounded worker.
+- Default to bounded workers for substantive independently executable implementation, useful tests, research or inspection, and independent review. The current agent decides whether a subtask is independently delegable and remains responsible for its context and result. Let a worker own a coherent change through its relevant checks rather than directing every edit.
+- Use native runtime collaboration or worker launch facilities with the runtime's configured workers. Honor explicit model requirements and preserve authorization and write ownership.
 - Give each worker a compact assignment: goal and acceptance criteria; repository, worktree and baseline; exact write scope and its owner (or read-only scope); constraints, shared interfaces and dependencies; supplied evidence and relevant checks; and the expected result of changed files or revisions, actual checks and unresolved issues. No packet schema or mandatory handoff artifact is needed.
 - Keep one active source writer per repository across all worktrees, including the orchestrator. Assign exclusive writer ownership before implementation. Settle the worker's state and release its ownership before another worker or the orchestrator takes over integration or repair. Safe read-only investigations and writers in independent repositories may run concurrently.
 - Workers stop and report consequential unresolved choices, broader scope, unavailable evidence or ownership conflicts. They do not delegate recursively unless the parent explicitly authorizes it.
