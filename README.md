@@ -3,30 +3,36 @@
 [![skills.sh](https://skills.sh/b/qepo17/skills)](https://skills.sh/qepo17/skills)
 [![CI](https://github.com/qepo17/skills/actions/workflows/ci.yml/badge.svg)](https://github.com/qepo17/skills/actions/workflows/ci.yml)
 
-Agent Skills for taking a software request through implementation, verification, and requested delivery.
+Agent Skills for taking a software request through implementation, verification, and an open, up-to-date task PR by default with `end-to-end-development`.
 
 | Skill | Use it for |
 | --- | --- |
 | `simple-code` | Minimal, readable code. |
 | `idea-to-ticket` | Optional research and a ticket draft for an unticketed idea; publish only when authorized. |
-| `end-to-end-development` | Agent-led development across one or more repositories, with restart-safe GitHub delivery effects. |
+| `end-to-end-development` | Orchestrator-first development with bounded workers across repositories, through verified changes and open, up-to-date task PRs by default. |
 
 ## Development model
 
 ```text
-Understand → implement and iterate → verify → review → deliver as requested
+Understand → coordinate implementation and iteration → locally verify → review → commit → push → create or update task PR
 ```
 
-The current agent owns the loop. There is no workflow engine, prescribed phase graph, worker packet protocol, or automatic retry state machine.
+The current agent owns understanding, decomposition, consequential decisions, coordination, integration, final acceptance, and authorized delivery. It defaults to bounded workers for substantive independently executable implementation, useful tests, research or inspection, and independent review. There is no workflow engine, prescribed phase graph, worker packet protocol, or automatic retry state machine.
 
 - Reuse the request, repository evidence, and settled decisions. Ask only consequential unresolved questions.
-- Keep one concise task record when a persistent handoff is useful; tiny work needs no dossier.
+- Let each worker own a coherent change with a compact assignment covering goal and acceptance, repository/worktree/baseline, exact scope and owner, constraints and dependencies, evidence and checks, and expected files or revisions, actual checks and unresolved issues. Inspect results before acceptance; workers report consequential choices, scope expansion, missing evidence or ownership conflicts and avoid recursive delegation unless explicitly authorized.
+- Keep one concise optional task record with active worker targets, scopes, ownership, dependencies and pending results when useful. Reconcile existing workers before launching duplicates.
 - Preserve existing changes and use an isolated worktree when needed.
-- Keep one source writer per repository. Independent repositories may progress concurrently, while dependent changes proceed in dependency order.
+- Keep one active source writer per repository across all worktrees, including the orchestrator. Settle and release ownership before integration or repair. Independent repositories and safe read-only investigations may progress concurrently; dependent changes proceed in dependency order.
+- Use native runtime collaboration or launch facilities with the runtime's configured workers and honor explicit model requirements. Execute directly for tiny reversible tasks, unavailable workers, or genuinely inseparable integration and decisions.
 - Treat multi-repository delivery as independently observable effects rather than a fictional atomic transaction.
-- Run meaningful acceptance and repository-required checks. Content changes invalidate affected evidence.
-- Use independent review for substantive changes and browser verification for UI changes.
-- Finish the requested outcome: local work, an evidenced no-change result, or authorized publication.
+- Run meaningful acceptance and repository-required checks. Bind checks and independent review to stable exact content; content changes invalidate affected evidence.
+- Use independent review for substantive changes and browser verification for UI changes. Report unavailable independent review honestly and preserve repository-required review gates.
+- The orchestrator owns default completion: locally verify, independently review as required, commit task-scoped changes, push to the established appropriate task branch/remote, create or update an open task PR, and return its URL with actual check/review status. Reuse an existing open task PR. Worker completion, local edits, a commit, or a pushed branch alone is not normal completion.
+
+Using `end-to-end-development` for a repository change requests the full PR workflow without a separate reminder or invitation. Read its [delivery guidance](skills/end-to-end-development/DELIVERY.md) for normal GitHub PR completion. Honor explicit local-only/no-push/no-PR instructions, repository policy, exact-approval requirements, and tool/sandbox permissions; publication must be task-scoped with an unambiguous destination. This does not authorize merge, deployment, migrations, permissions changes, tracker writes, creating remote repositories, or destructive work.
+
+No-change requests end with evidence and no empty PR; explicit opt-outs end with the actual local result. Missing authentication or remote, ambiguous destinations, denied permissions, or failed required verification/review yield explicit blocked or partial results with the next needed action. Continue useful local development when remote access is missing, without silently downgrading delivery or claiming completion. Pending or failing CI is not verified success even if a PR exists.
 
 ## Durable external effects
 
@@ -65,7 +71,7 @@ npx skills update --global end-to-end-development idea-to-ticket simple-code
 
 ## Requirements
 
-Agent-led development uses the repository's normal tools and the current agent runtime. Independent review requires an available independent agent when the change or repository requires it.
+Orchestrator-first development uses the repository's normal tools and available native runtime collaboration or worker launch facilities. When workers are unavailable, direct execution remains possible, with any independent review gap reported. Independent review requires an available independent reviewer when the change or repository requires it.
 
 GitHub delivery requires Python 3.11+, Git, and authenticated `gh`. `EffectGuard` otherwise uses only the Python standard library.
 
