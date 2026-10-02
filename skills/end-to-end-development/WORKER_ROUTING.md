@@ -1,14 +1,16 @@
 # Optional worker routing
 
 Use this guidance only after the current agent has understood the request and
-decided that an independent, bounded subtask is worth delegating. It requires a
-System One model such as Jev and a launcher such as Herdr that can start a fresh
-coding agent with its own model and reasoning configuration.
+determined that a bounded subtask is independently executable. This optional
+step uses a System One model such as Jev to select an approved execution profile;
+the host resolves it to a model and reasoning effort. Native runtime collaboration
+or launch facilities work without TypeSafe or Herdr; if routing or Herdr is
+unavailable, use an available ordinary worker launcher with an approved configuration.
 
 The current agent still owns decomposition, repository understanding, risk,
-authorization, write ownership, validation, and final synthesis. Jev does not
-plan the work, inspect a codebase, judge the overall task, or review the final
-result.
+authorization, write ownership, integration, validation, and final acceptance.
+Jev does not plan the work, inspect a codebase, judge the overall task, or review
+the final result.
 
 ## Route one bounded subtask
 
@@ -33,12 +35,14 @@ Use these criteria:
 | `fast` | One known target and explicit output; narrow lookup, extraction, formatting, or mechanical inspection with little inference. |
 | `standard` | Independently executable implementation, test, documentation, or review work with clear boundaries and ordinary cross-file reasoning. |
 | `deep` | Independently executable but requires difficult debugging, architecture, security analysis, or synthesis across many interdependent artifacts. |
-| `root_only` | Not independently executable because it depends on unresolved decisions, shared write ownership, final integration, authorization, or continuing context held by the current agent. |
+| `root_only` | Not independently executable because it requires unresolved consequential decisions, resolution of conflicting ownership, genuinely inseparable integration or continuing context, final acceptance, or authorization. Ordinary implementation that can receive exclusive writer ownership remains delegable. |
 
 These labels are ephemeral launch choices, not workflow modes or persisted task
-state. Use a calibrated confidence threshold. When the answer is uncertain,
-keep the work with the current agent or fall back to a conservative host
-default; never choose a cheaper worker merely because routing failed.
+state. Use a calibrated confidence threshold. Uncertainty or routing failure may
+use a conservative approved ordinary worker when the work remains safely
+delegable. Return unresolved decisions or ownership conflicts to the current
+agent to re-bound the work; routing failure alone does not require root execution.
+Never choose a cheaper worker merely because routing failed.
 
 ## Resolve with deterministic policy
 
@@ -51,35 +55,47 @@ code or the current agent must:
 - Verify that the selected model supports the resolved reasoning effort.
 - Apply any configured minimum for security, data, migration, destructive, or
   otherwise consequential work.
-- Refuse delegation that would violate one-source-writer ownership.
-- Use the normal configured worker when TypeSafe is unavailable or unusable.
+- Refuse delegation that would violate one active source writer per repository
+  across all worktrees, including the orchestrator.
+- Use the normal configured worker and available launch facilities when
+  TypeSafe or Herdr is unavailable or unusable.
 
 The profile never grants permission, changes scope, or relaxes review,
 verification, delivery, or sandbox policy.
 
-## Launch and supervise with Herdr
+## Launch and supervise
+
+Follow [DEVELOPMENT.md](DEVELOPMENT.md) for the compact assignment, ownership,
+supervision and acceptance rules regardless of launcher. Do not make a packet
+schema, handoff artifact or durable routing state. Record active targets, scopes,
+ownership, dependencies and pending results in the existing optional task record;
+reconcile them before launching duplicate workers. Workers do not delegate
+recursively without explicit parent authorization.
+
+When using Herdr:
 
 Use the current Herdr named session by default. Create a workspace for a
-separate task, or an isolated worktree workspace for an independent source
-writer. A new named Herdr session is appropriate only when the worker needs a
+separate task, or an isolated worktree workspace for the repository's exclusive
+source writer. Worktree isolation does not allow concurrent writers in the same
+repository. A new named Herdr session is appropriate only when the worker needs a
 separate server namespace, socket, and persisted runtime state.
 
 Create or select an available shell pane, then use Herdr's agent launcher with
 the resolved coding-agent kind and pass the approved model and reasoning
-arguments to that agent. Give the worker the bounded subtask, repository
-baseline, exact write scope, relevant evidence, and expected result. For a
-persistent handoff, record only the Herdr target and write ownership in the
-ordinary task record rather than persisting routing metadata or creating a
-worker-packet artifact.
+arguments to that agent.
 
-Wait for the worker, inspect its actual result, and validate its work before
-using it. Herdr lifecycle state reports readiness or attention; it does not
-prove task success. The worker should stop and report when it discovers broader
-scope, missing evidence, conflicting ownership, or a consequential unresolved
-decision. The current agent may continue itself or launch a fresh worker with a
-stronger approved profile after it re-bounds the subtask and repeats Jev routing
-and deterministic policy resolution. Retry only when new evidence or a changed
-approach makes another attempt useful.
+For any launcher, inspect the worker's actual code and checks before accepting
+its result. Checks and independent reviews must bind to stable, exact content;
+later source mutations invalidate related evidence. Lifecycle state reports
+readiness or attention; it does not prove task success. The worker should stop
+and report when it discovers broader scope, missing evidence, conflicting
+ownership, or a consequential unresolved decision. The current agent re-bounds
+the work and directs fixes or selects an
+appropriate worker, using optional routing when useful. Before taking over
+integration or repair, settle and release the worker's writer ownership.
+If workers are unavailable, explain direct execution and any missing independent
+review honestly; repository-required independent review remains required. Retry
+only when new evidence or a changed approach makes another attempt useful.
 
 References: [TypeSafe primitives](https://docs.typesafe.ai/primitives),
 [TypeSafe function calling](https://docs.typesafe.ai/cookbooks/function_calling),

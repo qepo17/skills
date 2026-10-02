@@ -1,19 +1,15 @@
 ---
 name: end-to-end-development
-description: Implement, verify, and deliver software requests directly with the current agent across one or more repositories.
+description: Orchestrate bounded workers to implement, verify, and deliver software requests across one or more repositories.
 ---
 
 # End-to-End Development
 
-Follow [DEVELOPMENT.md](DEVELOPMENT.md). The current agent owns understanding, planning, implementation, verification, review, and requested delivery. Scale the process to the actual change instead of selecting a workflow profile.
+Follow [DEVELOPMENT.md](DEVELOPMENT.md). The current agent owns understanding, decomposition, consequential decisions, coordination, integration, final acceptance, and authorized delivery. Default to bounded workers for substantive independently executable implementation, useful tests, research or inspection, and independent review. Give a worker a coherent change to own; supervise its result rather than every edit. Scale the process to the actual change.
 
-When an independent coding-agent worker is useful and TypeSafe plus Herdr are
-available, read the optional [worker-routing guidance](WORKER_ROUTING.md) before
-launch. The current agent must understand and bound the subtask first; Jev may
-only select an approved execution profile, while host policy resolves the
-profile to a model and reasoning effort.
+Use native runtime collaboration or launch facilities without requiring TypeSafe or Herdr. When available, optional [worker-routing guidance](WORKER_ROUTING.md) selects an approved model and effort for an already-bounded worker; it does not decide decomposition or whether to delegate. Direct execution is sensible for tiny reversible tasks, unavailable workers, or genuinely inseparable integration and decisions. Report unavailable independent review honestly and respect repository-required review.
 
-Use the agent runtime's native tools and collaboration facilities. Keep one source writer per repository; independent repositories may progress concurrently. When persistence helps, keep one concise task record with repository baselines, settled decisions, current checks, delivery receipts, and the next useful action.
+Keep one active source writer per repository across all worktrees, including the orchestrator. Settle and release writer ownership before taking over integration or repair. Independent repositories and safe read-only investigations may progress concurrently. When persistence helps, reuse one concise optional task record with repository baselines, settled decisions, worker targets, scopes, ownership, dependencies, pending results, checks, delivery receipts, and the next useful action. Reconcile existing workers before launching duplicates.
 
 Read [DELIVERY.md](DELIVERY.md) only when the requested outcome includes a GitHub pull request. Its `EffectGuard` persists external-effect intent and reconciles interrupted publication. It does not orchestrate development, supervise model workers, or authorize publication.
 

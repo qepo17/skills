@@ -1,6 +1,6 @@
 interface:
   display_name: "End-to-End Development"
-  short_description: "Implement, verify, and deliver with less ceremony"
-  default_prompt: "Use $end-to-end-development to implement, verify, and deliver this request."
+  short_description: "Orchestrate workers, verify, and deliver"
+  default_prompt: "Use $end-to-end-development to orchestrate bounded workers, verify their results, and deliver this request as authorized."
 policy:
   allow_implicit_invocation: false

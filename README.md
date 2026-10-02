@@ -9,25 +9,26 @@ Agent Skills for taking a software request through implementation, verification,
 | --- | --- |
 | `simple-code` | Minimal, readable code. |
 | `idea-to-ticket` | Optional research and a ticket draft for an unticketed idea; publish only when authorized. |
-| `end-to-end-development` | Agent-led development across one or more repositories, with restart-safe GitHub delivery effects. |
+| `end-to-end-development` | Orchestrator-first development with bounded workers across one or more repositories and restart-safe GitHub delivery effects. |
 
 ## Development model
 
 ```text
-Understand → implement and iterate → verify → review → deliver as requested
+Understand → coordinate implementation and iteration → verify → review → deliver as requested
 ```
 
-The current agent owns the loop. There is no workflow engine, prescribed phase graph, worker packet protocol, or automatic retry state machine.
+The current agent owns understanding, decomposition, consequential decisions, coordination, integration, final acceptance, and authorized delivery. It defaults to bounded workers for substantive independently executable implementation, useful tests, research or inspection, and independent review. There is no workflow engine, prescribed phase graph, worker packet protocol, or automatic retry state machine.
 
 - Reuse the request, repository evidence, and settled decisions. Ask only consequential unresolved questions.
-- Keep one concise task record when a persistent handoff is useful; tiny work needs no dossier.
+- Let each worker own a coherent change with a compact assignment covering goal and acceptance, repository/worktree/baseline, exact scope and owner, constraints and dependencies, evidence and checks, and expected files or revisions, actual checks and unresolved issues. Inspect results before acceptance; workers report consequential choices, scope expansion, missing evidence or ownership conflicts and avoid recursive delegation unless explicitly authorized.
+- Keep one concise optional task record with active worker targets, scopes, ownership, dependencies and pending results when useful. Reconcile existing workers before launching duplicates.
 - Preserve existing changes and use an isolated worktree when needed.
-- Keep one source writer per repository. Independent repositories may progress concurrently, while dependent changes proceed in dependency order.
-- When TypeSafe and Herdr are available, an already-bounded delegated subtask may use an ephemeral worker profile to select its approved model and reasoning effort. The current agent still owns decomposition, supervision, and synthesis.
+- Keep one active source writer per repository across all worktrees, including the orchestrator. Settle and release ownership before integration or repair. Independent repositories and safe read-only investigations may progress concurrently; dependent changes proceed in dependency order.
+- Use native runtime collaboration or launch facilities. Optional TypeSafe routing selects an approved model and effort for an already-bounded worker; TypeSafe and Herdr are not prerequisites for delegation. Execute directly for tiny reversible tasks, unavailable workers, or genuinely inseparable integration and decisions.
 - Treat multi-repository delivery as independently observable effects rather than a fictional atomic transaction.
-- Run meaningful acceptance and repository-required checks. Content changes invalidate affected evidence.
-- Use independent review for substantive changes and browser verification for UI changes.
-- Finish the requested outcome: local work, an evidenced no-change result, or authorized publication.
+- Run meaningful acceptance and repository-required checks. Bind checks and independent review to stable exact content; content changes invalidate affected evidence.
+- Use independent review for substantive changes and browser verification for UI changes. Report unavailable independent review honestly and preserve repository-required review gates.
+- Finish the requested outcome: local work, an evidenced no-change result, or authorized publication. The skill name does not authorize publication.
 
 ## Durable external effects
 
@@ -66,7 +67,7 @@ npx skills update --global end-to-end-development idea-to-ticket simple-code
 
 ## Requirements
 
-Agent-led development uses the repository's normal tools and the current agent runtime. Independent review requires an available independent agent when the change or repository requires it. Optional worker routing requires host-provided TypeSafe access and Herdr automation; neither is required for the normal development loop.
+Orchestrator-first development uses the repository's normal tools and available native runtime collaboration or worker launch facilities. When workers are unavailable, direct execution remains possible, with any independent review gap reported. Independent review requires an available independent reviewer when the change or repository requires it. Optional worker routing requires host-provided TypeSafe access and a launcher that supports approved model and effort selection; Herdr is one option. Neither TypeSafe nor Herdr is required for ordinary delegation or the development loop.
 
 GitHub delivery requires Python 3.11+, Git, and authenticated `gh`. `EffectGuard` otherwise uses only the Python standard library.
 
