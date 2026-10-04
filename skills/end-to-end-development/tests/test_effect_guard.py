@@ -85,6 +85,57 @@ class EffectGuardTests(unittest.TestCase):
             },
         }
 
+    def real_delivery(self, name):
+        repository = self.root / name
+        repository.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(
+                ["git", *args],
+                cwd=repository,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Tests")
+        git("config", "user.email", "tests@example.test")
+        (repository / "README.md").write_text("baseline\n")
+        git("add", "README.md")
+        git("commit", "-qm", "initial")
+        baseline = git("rev-parse", "HEAD")
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+        git("remote", "add", "origin", "git@github.com:example/task.git")
+        git("push", "-q", str(remote), "main")
+        git("switch", "-qc", "feat/test")
+        (repository / "feature.txt").write_text("implemented\n")
+
+        forge = FakeGitHub(repository)
+        guard = EffectGuard(
+            self.journal,
+            registry=self.registry,
+            delivery_factory=lambda spec: delivery_tools.Delivery(spec, run_process=forge),
+        )
+        effect = {
+            "kind": "github-pull-request",
+            "delivery": {
+                "repository": "github.com/example/task",
+                "remote": "origin",
+                "worktree": str(repository),
+                "baseline": baseline,
+                "base_branch": "main",
+                "branch": "feat/test",
+                "task_files": ["feature.txt"],
+                "expected_fingerprint": delivery_tools.content_fingerprint(repository),
+                "commit_message": "feat: implement task",
+                "pr_title": "Implement task",
+                "pr_body": "Tested change.",
+                "check_timeout_seconds": 0,
+            },
+        }
+        return repository, git, forge, guard, effect
+
     def test_completed_effect_is_returned_without_repeating_the_adapter(self):
         factory = DeliveryFactory([delivery_result(pr_url="https://github.com/example/api/pull/1")])
         guard = EffectGuard(self.journal, registry=self.registry, delivery_factory=factory)
@@ -515,6 +566,54 @@ class EffectGuardTests(unittest.TestCase):
 
         self.assertEqual("stopped", stopped["status"])
         self.assertEqual("complete", revised["status"])
+
+    def test_red_ci_fix_is_published_to_the_same_pr_after_the_failure_settles(self):
+        repository, git, forge, guard, effect = self.real_delivery("red-ci-repository")
+        forge.check_state = "failure"
+
+        red = guard.ensure(effect)
+        settled = guard.ensure(effect)
+        (repository / "feature.txt").write_text("implemented and fixed\n")
+        (repository / "regression.txt").write_text("covers the failure\n")
+        forge.check_state = "success"
+        fix = copy.deepcopy(effect)
+        fix["delivery"]["task_files"].append("regression.txt")
+        fix["delivery"]["expected_fingerprint"] = delivery_tools.content_fingerprint(repository)
+        fix["delivery"]["commit_message"] = "fix: repair the failing check"
+        fixed = guard.ensure(fix)
+
+        self.assertEqual("effect-outcome-indeterminate", red["reason_code"])
+        self.assertEqual("required-ci-failed", settled["reason_code"])
+        self.assertEqual("stopped", settled["status"])
+        self.assertEqual("complete", fixed["status"], fixed)
+        self.assertEqual(1, forge.create_count)
+        self.assertEqual(red["receipt"]["head_sha"], git("rev-parse", "HEAD~1"))
+        self.assertEqual(git("rev-parse", "HEAD"), fixed["receipt"]["pushed_head_sha"])
+
+    def test_base_merge_is_published_with_the_merged_base_as_baseline(self):
+        repository, git, forge, guard, effect = self.real_delivery("base-merge-repository")
+        published = guard.ensure(effect)
+        git("switch", "-q", "main")
+        (repository / "README.md").write_text("base moved on\n")
+        git("commit", "-qam", "advance base")
+        base = git("rev-parse", "HEAD")
+        git("switch", "-q", "feat/test")
+        git("merge", "-q", "--no-edit", "main")
+        stale = copy.deepcopy(effect)
+        stale["delivery"]["expected_fingerprint"] = delivery_tools.content_fingerprint(repository)
+        stale["delivery"]["commit_message"] = "Merge main into feat/test"
+        merged = copy.deepcopy(stale)
+        merged["delivery"]["baseline"] = base
+
+        refused = guard.ensure(stale)
+        updated = guard.ensure(merged)
+
+        self.assertEqual("complete", published["status"], published)
+        self.assertEqual("unrelated-changes-present", refused["reason_code"])
+        self.assertEqual("complete", updated["status"], updated)
+        self.assertEqual(1, forge.create_count)
+        self.assertEqual(base, git("rev-parse", "HEAD^2"))
+        self.assertEqual(git("rev-parse", "HEAD"), updated["receipt"]["pushed_head_sha"])
 
     def test_multi_repository_change_set_settles_each_repository_independently(self):
         factory = DeliveryFactory([

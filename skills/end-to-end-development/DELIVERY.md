@@ -93,9 +93,32 @@ If one effect completes and another stops, preserve the completed receipt and re
 
 ## Outcomes
 
-- Exit **0 / `complete`**: local, pushed, pull-request, and checked revisions agree; required checks passed or positive policy evidence established that none are configured.
+- Exit **0 / `complete`**: local, pushed, pull-request, and checked revisions agree; required checks passed or positive policy evidence established that none are configured. This proves publication, not mergeability; the watch below still applies.
 - Exit **8 / `pending`**: the effect awaits external state or its prior outcome is indeterminate. Keep any PR URL visible. For an indeterminate outcome, recover the proposal through `inspect` if necessary and call `ensure` again with that exact proposal before attempting a revision.
 - Exit **9 / `decision-required`**: exact approval is needed before intent is recorded.
 - Exit **1 / `stopped`**: the attempt reached a known non-success state and released target ownership. Inspect `reason_code` and the receipt. Fix related source only after understanding the evidence, then revalidate and create a revised effect proposal if content changed.
 
-Return the PR URL(s) and actual check/review status, including blockers and the next needed action for incomplete delivery. A created PR alone does not prove verified success. Pending, missing, failed, skipped, cancelled, unknown, or changed-head check evidence cannot complete verified delivery. Empty check output or permission errors do not prove that checks are absent. Human changes to pull-request ownership, content, destination, or readiness are preserved and surfaced as conflicts rather than overwritten.
+A created PR alone does not prove verified success. Pending, missing, failed, skipped, cancelled, unknown, or changed-head check evidence cannot complete verified delivery. Empty check output or permission errors do not prove that checks are absent. Human changes to pull-request ownership, content, destination, or readiness are preserved and surfaced as conflicts rather than overwritten.
+
+## Watch until mergeable
+
+`ensure` gates only on required checks, and with none configured it completes as soon as the PR exists. It does not wait for other checks or observe conflicts and merge requirements, so the PR watcher from [DEVELOPMENT.md](DEVELOPMENT.md) takes over once the PR exists. A short `check_timeout_seconds` keeps publication from delaying that handoff.
+
+Observe the PR on its current head:
+
+```bash
+gh pr checks "$PR_URL" --watch --interval 30
+gh pr checks "$PR_URL" --json name,bucket,link
+gh pr view "$PR_URL" --json state,isDraft,headRefOid,mergeable,mergeStateStatus,reviewDecision
+```
+
+It is mergeable when `state` is `OPEN`, `isDraft` is `false`, `headRefOid` is the verified head, every check's `bucket` is `pass` or `skipping`, `mergeable` is `MERGEABLE`, and `mergeStateStatus` is `CLEAN` or `HAS_HOOKS`. `UNKNOWN` means GitHub is still computing; observe again. No checks right after a push usually means they have not registered yet; treat absence as evidence only when the repository defines no checks that run for the PR.
+
+- A `fail` or `cancel` bucket, or `UNSTABLE`: read the failed steps with `gh run view "$RUN_ID" --log-failed`, taking the run ID from the check's `link`, and fix the cause. Use `gh run rerun "$RUN_ID" --failed` only for an infrastructure flake unrelated to the change.
+- `CONFLICTING`, `DIRTY` or `BEHIND`: fetch the base, merge it into the task branch, resolve conflicts, commit the merge, and verify again.
+- `BLOCKED` after checks finish: identify the unmet requirement. Address `CHANGES_REQUESTED` feedback within scope; report `REVIEW_REQUIRED` and any other requirement only a human can satisfy as the remaining gate.
+- A draft: `ensure` publishes an owned draft once its required checks pass; report a human-drafted PR rather than marking it ready.
+
+Publish each fix as a revised effect proposal: verify locally, capture a new fingerprint, add newly touched paths to `task_files`, and give the fix its own commit message. After merging the base, use the merged base commit as `baseline`. The previous effect must be settled first: one that published and then saw red CI in the same run stays indeterminate, so re-run its identical proposal until it settles. `ensure` then reuses the open PR, commits the fix, and fast-forwards the branch. Task authorization covers these scoped fixes and flake reruns; never merge, enable auto-merge, approve, dismiss reviews, rebase, or force-push.
+
+Return each PR URL with its final head, check results and merge state, the fixes made, and any blocker with the next needed action. A pending, red, conflicting or blocked PR is reported as such, never as complete.
