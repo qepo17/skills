@@ -5,6 +5,10 @@
 
 Agent Skills for taking a software request through implementation, verification, and an open, up-to-date task PR by default with `end-to-end-development`.
 
+![end-to-end-development: one request from a workspace root with web, api and contracts repositories becomes three green, mergeable pull requests](docs/media/end-to-end-development-intro.gif)
+
+A typical run: trigger `end-to-end-development` from a workspace root that holds several repositories, such as a UI, a backend and contracts. The orchestrator gives each repository its own worker and worktree, then returns one verified, reviewed pull request per repository, watched until CI is green. [Watch the MP4](docs/media/end-to-end-development-intro.mp4).
+
 | Skill | Use it for |
 | --- | --- |
 | `simple-code` | Minimal, readable code. |
