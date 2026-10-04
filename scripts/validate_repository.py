@@ -14,7 +14,6 @@ SKILLS_ROOT = ROOT / "skills"
 EXPECTED_SKILLS = {
     "end-to-end-development",
     "idea-to-ticket",
-    "simple-code",
 }
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 LINK_PATTERN = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
