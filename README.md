@@ -7,7 +7,6 @@ Agent Skills for taking a software request through implementation, verification,
 
 | Skill | Use it for |
 | --- | --- |
-| `simple-code` | Minimal, readable code. |
 | `idea-to-ticket` | Optional research and a ticket draft for an unticketed idea; publish only when authorized. |
 | `end-to-end-development` | Orchestrator-first development with bounded workers across repositories, through verified changes and open task PRs watched until mergeable by default. |
 
@@ -67,7 +66,7 @@ npx skills add qepo17/skills --global --agent codex --skill end-to-end-developme
 Update installed skills:
 
 ```bash
-npx skills update --global end-to-end-development idea-to-ticket simple-code
+npx skills update --global end-to-end-development idea-to-ticket
 ```
 
 ## Requirements

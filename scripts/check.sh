@@ -34,7 +34,7 @@ PYTHONDONTWRITEBYTECODE=1 \
 npx --yes skills@1.5.23 add . --list >"$TMP_DIR/skills-list.txt"
 grep -Fq 'end-to-end-development' "$TMP_DIR/skills-list.txt"
 ! grep -Fq 'fast-end-to-end-development' "$TMP_DIR/skills-list.txt"
-grep -Fq 'simple-code' "$TMP_DIR/skills-list.txt"
+! grep -Fq 'simple-code' "$TMP_DIR/skills-list.txt"
 grep -Fq 'idea-to-ticket' "$TMP_DIR/skills-list.txt"
 
 # Validate the idea skill with no sibling skills available.
@@ -56,6 +56,6 @@ print("Validated standalone idea-to-ticket skill.")
 PY
 npx --yes skills@1.5.23 add "$TMP_DIR/idea-to-ticket" --list >"$TMP_DIR/idea-skills-list.txt"
 grep -Fq 'idea-to-ticket' "$TMP_DIR/idea-skills-list.txt"
-! grep -Eq 'end-to-end-development|simple-code' "$TMP_DIR/idea-skills-list.txt"
+! grep -Eq 'end-to-end-development' "$TMP_DIR/idea-skills-list.txt"
 
 printf 'All repository checks passed.\n'
