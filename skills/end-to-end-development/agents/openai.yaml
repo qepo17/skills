@@ -1,6 +1,6 @@
 interface:
   display_name: "End-to-End Development"
-  short_description: "Orchestrate workers and verify through an open PR"
-  default_prompt: "Use $end-to-end-development to orchestrate bounded workers, implement, verify and review this repository change, then commit, push, create or update its PR, and return the URL with actual check/review status; honor explicit local-only or publication opt-outs and required approvals."
+  short_description: "Orchestrate workers through a green, mergeable PR"
+  default_prompt: "Use $end-to-end-development to orchestrate bounded workers, implement, verify and review this repository change, then commit, push, create or update its PR, have a PR watcher fix failures until it is mergeable, and return the URL with its actual merge state; honor explicit local-only or publication opt-outs and required approvals."
 policy:
   allow_implicit_invocation: false
