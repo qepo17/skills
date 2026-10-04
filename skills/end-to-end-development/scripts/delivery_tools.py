@@ -32,41 +32,55 @@ class DeliveryError(Exception):
 
 def run_process(command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1"})
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1",
+                               "GIT_NO_REPLACE_OBJECTS": "1"})
 
 
-def _git(worktree: Path, *args: str, env: dict[str, str] | None = None) -> bytes:
-    result = subprocess.run(["git", "-C", str(worktree), *args], capture_output=True, env=env)
+def _git(worktree: Path, *args: str, env: dict[str, str] | None = None, input: bytes | None = None) -> bytes:
+    result = subprocess.run(["git", "-C", str(worktree), "-c", "core.fsmonitor=false", *args],
+                            capture_output=True, input=input,
+                            env={**(os.environ if env is None else env), "GIT_NO_REPLACE_OBJECTS": "1"})
     if result.returncode:
         raise DeliveryError(f"Git content inspection failed: {result.stderr.decode(errors='replace').strip()}",
                             reason_code="git-content-inspection-failed")
     return result.stdout
 
 
-def content_fingerprint(worktree: Path) -> str:
-    """The existing v3 content identity, independent of commit and index stat cache."""
+def content_fingerprint(worktree: Path, *, require_clean: bool = False) -> str:
+    """Fingerprint current files without trusting index flags or cached file stats."""
     root = Path(_git(worktree, "rev-parse", "--show-toplevel").decode().strip()).resolve()
-    source_index = Path(_git(root, "rev-parse", "--git-path", "index").decode().strip())
-    if not source_index.is_absolute():
-        source_index = root / source_index
+    entries = _git(root, "ls-files", "--stage", "-z")
+    flags = _git(root, "ls-files", "-v", "-z").split(b"\0")
+    sparse_enabled = _git(root, "config", "--type=bool", "--default=false", "--get",
+                          "core.sparseCheckout").strip() == b"true"
     descriptor, name = tempfile.mkstemp(prefix="e2e-content-index-")
     os.close(descriptor)
     temporary = Path(name)
     try:
-        if source_index.is_file():
-            temporary.write_bytes(source_index.read_bytes())
-        else:
-            temporary.unlink()
+        temporary.unlink()
         env = {**os.environ, "GIT_INDEX_FILE": str(temporary), "GIT_OPTIONAL_LOCKS": "0"}
+        _git(root, "-c", "core.splitIndex=false", "read-tree", "--empty", env=env)
+        _git(root, "update-index", "-z", "--index-info", env=env, input=entries)
+        # Only intentionally absent sparse paths may keep their recorded blobs.
+        absent = [row[2:] for row in flags if row[:1].upper() == b"S" and sparse_enabled
+                  and not os.path.lexists(root / os.fsdecode(row[2:]))]
+        if absent:
+            _git(root, "update-index", "--skip-worktree", "-z", "--stdin", env=env,
+                 input=b"\0".join(absent) + b"\0")
         _git(root, "add", "--all", "--", env=env)
         tree = _git(root, "write-tree", env=env).strip()
+        if require_clean and (tree != _git(root, "rev-parse", "HEAD^{tree}").strip()
+                              or _git(root, "diff", "--cached", "--name-only", "-z", "HEAD", "--")):
+            raise DeliveryError("Commit and review the exact task content before publication; local changes were preserved.",
+                                kind="decision", reason_code="uncommitted-content")
         digest = hashlib.sha256(b"end-to-end-development-content-v3\0" + tree)
         for record in sorted(_git(root, "ls-files", "--stage", "-z", env=env).split(b"\0")):
             metadata, separator, relative = record.partition(b"\t")
             if separator and metadata.startswith(b"160000 "):
                 submodule = root / relative.decode(errors="surrogateescape")
                 if (submodule / ".git").exists():
-                    digest.update(b"\0submodule\0" + relative + b"\0" + content_fingerprint(submodule).encode())
+                    digest.update(b"\0submodule\0" + relative + b"\0" + content_fingerprint(
+                        submodule, require_clean=require_clean).encode())
         return digest.hexdigest()
     finally:
         temporary.unlink(missing_ok=True)
@@ -197,10 +211,22 @@ class Delivery:
         if self.spec["branch"] == self.spec["base_branch"]:
             raise DeliveryError("Delivery must use a dedicated task branch.",
                                 kind="decision", reason_code="task-branch-required")
-        for key, pattern in (("baseline", r"[0-9a-f]{40}(?:[0-9a-f]{24})?"), ("expected_fingerprint", r"[0-9a-f]{64}")):
+        oid = r"[0-9a-f]{40}(?:[0-9a-f]{24})?"
+        for key, pattern in (("baseline", oid), ("reviewed_head", oid), ("expected_base_head", oid),
+                             ("expected_fingerprint", r"[0-9a-f]{64}")):
             if not isinstance(self.spec.get(key), str) or not re.fullmatch(pattern, self.spec[key]):
                 raise DeliveryError(f"Missing or invalid {key}.",
                                     kind="decision", reason_code=f"invalid-{key.replace('_', '-')}")
+        if "expected_remote_head" not in self.spec or (self.spec["expected_remote_head"] is not None
+                and (not isinstance(self.spec["expected_remote_head"], str)
+                     or not re.fullmatch(oid, self.spec["expected_remote_head"]))):
+            raise DeliveryError("Record the expected task branch head, or null for a new branch.",
+                                kind="decision", reason_code="invalid-expected-remote-head")
+        commits = self.spec.get("reviewed_commits")
+        if (not isinstance(commits, list) or any(not isinstance(commit, str) or not re.fullmatch(oid, commit)
+                                                for commit in commits) or len(set(commits)) != len(commits)):
+            raise DeliveryError("An explicit list of reviewed outgoing commits is required.",
+                                kind="decision", reason_code="invalid-reviewed-commits")
         files = self.spec.get("task_files")
         if not isinstance(files, list) or not files or len(set(files)) != len(files):
             raise DeliveryError("An explicit, unique task-file inventory is required.",
@@ -214,7 +240,7 @@ class Delivery:
             if path.name == ".env" or (path.name.startswith(".env.") and path.name != ".env.example"):
                 raise DeliveryError("Refusing to stage environment credentials.",
                                     kind="decision", reason_code="credential-file-refused")
-        for key in ("commit_message", "pr_title", "pr_body"):
+        for key in ("pr_title", "pr_body"):
             if not isinstance(self.spec.get(key), str) or not self.spec[key].strip():
                 raise DeliveryError(f"Pre-approved {key} is required.",
                                     kind="decision", reason_code=f"missing-{key.replace('_', '-')}")
@@ -223,13 +249,21 @@ class Delivery:
             raise DeliveryError("Check timeout must be between 0 and 1800 seconds.",
                                 kind="decision", reason_code="invalid-check-timeout")
 
-    def audit(self) -> set[str]:
+    def audit(self) -> None:
         self.validate_spec()
         if Path(self.git("rev-parse", "--show-toplevel")).resolve() != self.worktree:
             raise DeliveryError("Worktree must identify the Git root.",
                                 kind="decision", reason_code="invalid-worktree-root")
+        grafts = Path(self.git("rev-parse", "--git-path", "info/grafts"))
+        if not grafts.is_absolute():
+            grafts = self.worktree / grafts
+        if (self.git("rev-parse", "--is-shallow-repository") != "false"
+                or self.git("for-each-ref", "--format=%(refname)", "refs/replace/")
+                or (grafts.is_file() and grafts.stat().st_size)):
+            raise DeliveryError("Publication requires full commit ancestry without replacement refs or grafts; review from an unmodified checkout.",
+                                kind="decision", reason_code="incomplete-publication-history")
         # get-url expands insteadOf/pushInsteadOf and explicit pushurl entries.
-        # Audit every effective destination before even staging task content.
+        # Audit every effective destination before publication.
         for options in (("--all",), ("--push", "--all")):
             remotes = self.git("remote", "get-url", *options, self.remote, redact_output=True).splitlines()
             if not remotes or any(github_repository(remote) != self.repository for remote in remotes):
@@ -238,6 +272,9 @@ class Delivery:
         if self.git("branch", "--show-current") != self.spec["branch"]:
             raise DeliveryError("Task branch changed before delivery.",
                                 kind="decision", reason_code="task-branch-changed")
+        if self.git("rev-parse", "HEAD") != self.spec["reviewed_head"]:
+            raise DeliveryError("The local head differs from the reviewed publication proposal.",
+                                kind="decision", reason_code="reviewed-head-changed")
         if self.command(["git", "merge-base", "--is-ancestor", self.spec["baseline"], "HEAD"], allow_failure=True)[0].returncode:
             raise DeliveryError("Baseline is not an ancestor of the current head.",
                                 kind="decision", reason_code="baseline-not-ancestor")
@@ -253,18 +290,48 @@ class Delivery:
         if not changed:
             raise DeliveryError("No task diff exists against the recorded baseline.",
                                 kind="decision", reason_code="task-diff-missing")
-        return dirty | staged
+        self.verify_committed_content()
+
+    def audit_publication(self) -> str | None:
+        base = self.remote_head(self.spec["base_branch"])
+        head = self.remote_head()
+        if base != self.spec["expected_base_head"]:
+            raise DeliveryError("The remote base changed; review a fresh publication proposal.",
+                                kind="dependency", reason_code="remote-base-changed")
+        if head not in {self.spec["expected_remote_head"], self.spec["reviewed_head"]}:
+            raise DeliveryError("The remote task branch changed; preserve it and review a fresh proposal.",
+                                kind="dependency", reason_code="remote-head-changed")
+        anchors = [base]
+        if self.spec["expected_remote_head"]:
+            anchors.append(self.spec["expected_remote_head"])
+            if self.command(["git", "merge-base", "--is-ancestor", self.spec["expected_remote_head"],
+                             self.spec["reviewed_head"]], allow_failure=True)[0].returncode:
+                raise DeliveryError("Publication must fast-forward the recorded task branch head.",
+                                    kind="decision", reason_code="non-fast-forward-publication")
+        outgoing = set(self.git("rev-list", self.spec["reviewed_head"], "--not", *anchors, "--").splitlines())
+        if outgoing != set(self.spec["reviewed_commits"]):
+            raise DeliveryError("Outgoing commits differ from the reviewed set; inspect every outgoing commit before revising it.",
+                                kind="decision", reason_code="unreviewed-outgoing-commits")
+        # Net diffs can hide credentials introduced and removed in earlier commits.
+        for commit in sorted(outgoing):
+            paths = self.names("diff-tree", "--root", "-m", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", commit, "--")
+            if any(PurePosixPath(path).name == ".env" or (PurePosixPath(path).name.startswith(".env.")
+                   and PurePosixPath(path).name != ".env.example") for path in paths):
+                raise DeliveryError("An outgoing commit changes an environment credential file, even if later deleted.",
+                                    kind="decision", reason_code="credential-file-in-history")
+        return head
 
     def verify_committed_content(self) -> None:
         dirty = self.names("diff", "--name-only", "-z", "HEAD", "--")
         staged = self.names("diff", "--cached", "--name-only", "-z", "HEAD", "--")
         untracked = self.names("ls-files", "--others", "--exclude-standard", "-z")
-        if dirty or staged or untracked or content_fingerprint(self.worktree) != self.spec["expected_fingerprint"]:
+        fingerprint = content_fingerprint(self.worktree, require_clean=True)
+        if dirty or staged or untracked or fingerprint != self.spec["expected_fingerprint"]:
             raise DeliveryError("Committed/index content differs from validated files, possibly due to a Git hook; nothing further was pushed.",
                                 kind="decision", reason_code="committed-content-changed")
 
-    def remote_head(self) -> str | None:
-        output = self.git("ls-remote", "--refs", self.remote, f"refs/heads/{self.spec['branch']}")
+    def remote_head(self, branch: str | None = None) -> str | None:
+        output = self.git("ls-remote", "--refs", self.remote, f"refs/heads/{branch or self.spec['branch']}")
         rows = output.splitlines()
         if not rows:
             return None
@@ -392,13 +459,18 @@ class Delivery:
         self.record_pr(value)
         return value
 
-    def ensure_pr(self, *, verify_only: bool = False) -> None:
+    def ensure_pr(self, *, verify_only: bool = False, preflight: bool = False, remote_head: str | None = None) -> None:
         prs, _ = self.gh_json(["pr", "list", "--repo", self.repository, "--head", self.spec["branch"], "--state", "all",
                               "--json", "number,url,body,isDraft,baseRefName,headRefName,state,headRefOid"])
         if not isinstance(prs, list) or len(prs) > 1:
             raise DeliveryError("Task branch PR identity is ambiguous.", kind="decision", reason_code="ambiguous-pr-identity")
         if prs:
             self.record_pr(prs[0])
+            if preflight and prs[0].get("headRefOid") != remote_head:
+                raise DeliveryError("The existing PR head differs from the observed task branch.",
+                                    kind="dependency", reason_code="pr-head-changed")
+            return
+        if preflight:
             return
         if verify_only:
             raise DeliveryError("The delivered PR no longer exists; verification cannot recreate it.",
@@ -566,6 +638,63 @@ class Delivery:
                 record["required"] = True
         return sorted(observed, key=lambda check: (check["name"], check.get("app_id") or 0, check["url"]))
 
+    def observe_mergeability(self, *, no_checks_expected: bool = False) -> dict[str, Any]:
+        """Observe watcher acceptance without publishing, repairing, or changing a PR."""
+        try:
+            if self.logs.is_relative_to(self.worktree):
+                raise DeliveryError("Observation evidence must live outside the worktree.",
+                                    kind="decision", reason_code="unsafe-evidence-location")
+            self.logs.mkdir(parents=True, exist_ok=True)
+            self.audit()
+            self.ensure_pr(verify_only=True)
+            head = self.spec["reviewed_head"]
+            self.result["head_sha"] = head
+            if self.pr_head() != head:
+                raise DeliveryError("PR head changed before observing checks.", reason_code="pr-head-changed")
+            policy = self.required_policy()
+            checks = self.check_records(head, policy)
+            value, _ = self.gh_json(["pr", "view", self.result["pr_url"], "--repo", self.repository,
+                "--json", "url,body,isDraft,headRefOid,headRefName,baseRefName,state,mergeable,mergeStateStatus,reviewDecision"])
+            self.record_pr(value)
+            final_policy = self.required_policy()
+            if (policy["required_checks"] != final_policy["required_checks"]
+                    or policy["status"] != final_policy["status"]):
+                raise DeliveryError("Required-check policy changed during observation.", reason_code="required-policy-changed")
+            if (value.get("headRefOid") != head or self.remote_head() != head
+                    or self.git("rev-parse", "HEAD") != head):
+                raise DeliveryError("Head drift invalidated watcher evidence.", reason_code="pr-head-changed")
+            self.verify_committed_content()
+            self.result.update(checks=checks, check_policy=final_policy, checked_head_sha=head,
+                               merge_state=value.get("mergeStateStatus"), review_decision=value.get("reviewDecision"))
+            if self.result["pr_draft"]:
+                status, reason = "blocked", "pr-draft"
+            elif any(check["required"] and check["state"] in {"failed", "cancelled", "skipped"} for check in checks):
+                status, reason = "blocked", "required-ci-failed"
+            elif any(check["state"] in {"failed", "cancelled"} for check in checks):
+                status, reason = "blocked", "ci-failed"
+            elif any(check["state"] == "pending" for check in checks):
+                status, reason = "pending", "checks-pending"
+            elif not checks and not no_checks_expected:
+                status, reason = "pending", "checks-not-observed"
+            elif value.get("reviewDecision") in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}:
+                status, reason = "blocked", "review-required"
+            elif value.get("reviewDecision") not in {"", "APPROVED"}:
+                status, reason = "blocked", "indeterminate-review-state"
+            elif value.get("mergeable") == "UNKNOWN" or value.get("mergeStateStatus") == "UNKNOWN":
+                status, reason = "pending", "merge-state-pending"
+            elif value.get("mergeable") == "MERGEABLE" and value.get("mergeStateStatus") in {"CLEAN", "HAS_HOOKS"}:
+                status, reason = "mergeable", None
+            else:
+                status, reason = "blocked", "merge-requirements-unmet"
+            self.result.update(status=status, reason_code=reason,
+                               summary="PR is mergeable on the verified head." if status == "mergeable" else reason)
+        except DeliveryError as error:
+            self.result.update(status="blocked", reason_code=error.reason_code, summary=str(error))
+        except (KeyError, TypeError, ValueError, OSError) as error:
+            self.result.update(status="blocked", reason_code="indeterminate-delivery-evidence",
+                               summary=f"Watcher evidence is indeterminate ({type(error).__name__}).")
+        return self.result
+
     def run(self, *, verify_only: bool = False) -> dict[str, Any]:
         self.result["verify_only"] = verify_only
         start = self.clock()
@@ -574,24 +703,24 @@ class Delivery:
                 raise DeliveryError("Delivery evidence must live outside the project worktree.",
                                     kind="decision", reason_code="unsafe-evidence-location")
             self.logs.mkdir(parents=True, exist_ok=True)
-            dirty = self.audit()
+            self.audit()
             if self.draft_lifecycle():
                 self.load_creation_intent()
-            if dirty:
-                if verify_only:
-                    raise DeliveryError("Verification found uncommitted content; it cannot write Git state.",
-                                        kind="decision", reason_code="verify-only-uncommitted-content")
-                paths = [f":(literal){name}" for name in sorted(dirty)]
-                self.git("add", "--", *paths)
-                self.git("commit", "--only", "--message", self.spec["commit_message"], "--", *paths)
-            head = self.git("rev-parse", "HEAD")
-            self.result.update(head_sha=head, commits=[head])
+            head = self.spec["reviewed_head"]
+            self.result.update(head_sha=head, commits=self.spec["reviewed_commits"])
+            remote_head = self.audit_publication()
+            self.ensure_pr(preflight=True, remote_head=remote_head)
             self.verify_committed_content()
-            if self.remote_head() != head:
+            if self.git("rev-parse", "HEAD") != head:
+                raise DeliveryError("Local head changed during publication preflight.",
+                                    kind="dependency", reason_code="reviewed-head-changed")
+            remote_head = self.audit_publication()
+            if remote_head != head:
                 if verify_only:
                     raise DeliveryError("Pushed head changed; verification cannot push over it.",
                                         kind="dependency", reason_code="pushed-head-mismatch")
-                self.git("push", "--set-upstream", self.remote, f"refs/heads/{self.spec['branch']}:refs/heads/{self.spec['branch']}")
+                self.git("push", "--no-follow-tags", "--recurse-submodules=no", self.remote,
+                         f"{head}:refs/heads/{self.spec['branch']}")
             self.result["pushed_head_sha"] = self.remote_head()
             if self.result["pushed_head_sha"] != head:
                 raise DeliveryError("Pushed head does not match the validated local head.",

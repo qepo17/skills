@@ -43,8 +43,12 @@ DELIVERY_FIELDS = {
     "baseline",
     "branch",
     "check_timeout_seconds",
-    "commit_message",
+    "commit_message",  # Retained for historical journal identities; publication no longer creates commits.
     "expected_fingerprint",
+    "reviewed_head",
+    "reviewed_commits",
+    "expected_remote_head",
+    "expected_base_head",
     "git_write_timeout_seconds",
     "local_validation_summary",
     "pr_body",
@@ -245,8 +249,9 @@ class EffectGuard:
             for key, value in delivery.items()
             if key not in RUNTIME_DELIVERY_FIELDS
         }
-        if isinstance(identity_delivery.get("task_files"), list):
-            identity_delivery["task_files"] = sorted(identity_delivery["task_files"])
+        for field in ("task_files", "reviewed_commits"):
+            if isinstance(identity_delivery.get(field), list):
+                identity_delivery[field] = sorted(identity_delivery[field])
         identity = {
             "kind": kind,
             "change_set": change_set,
@@ -590,6 +595,12 @@ def main() -> int:
     fingerprint = subparsers.add_parser("fingerprint", help="print the current Git content fingerprint")
     fingerprint.add_argument("worktree", type=Path)
 
+    observe = subparsers.add_parser("observe-pr", help="read current PR mergeability without Git or forge writes")
+    observe.add_argument("--input", required=True, type=Path)
+    observe.add_argument("--output", required=True, type=Path)
+    observe.add_argument("--no-checks-expected", action="store_true",
+                         help="assert that repository workflow inspection established no PR checks are expected")
+
     ensure = subparsers.add_parser("ensure", help="ensure and durably observe an external effect")
     ensure.add_argument("--journal", required=True, type=Path)
     ensure.add_argument("--input", required=True, type=Path)
@@ -605,6 +616,16 @@ def main() -> int:
     if args.command == "fingerprint":
         print(delivery_tools.content_fingerprint(args.worktree.resolve()))
         return 0
+
+    if args.command == "observe-pr":
+        proposal, effect_id, _, _ = EffectGuard._normalise(_load_object(args.input))
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        spec = {**proposal["delivery"], "run_id": effect_id,
+                "log_dir": tempfile.mkdtemp(prefix="pr-observation-", dir=args.output.parent)}
+        outcome = delivery_tools.Delivery(spec).observe_mergeability(no_checks_expected=args.no_checks_expected)
+        _write_json(args.output, outcome)
+        print(json.dumps(outcome, sort_keys=True))
+        return {"mergeable": 0, "pending": 8}.get(outcome["status"], 1)
 
     guard = EffectGuard(args.journal)
     if args.command == "ensure":

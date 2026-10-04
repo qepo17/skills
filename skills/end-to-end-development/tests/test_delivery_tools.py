@@ -13,6 +13,20 @@ sys.path.insert(0, str(SCRIPTS))
 import delivery_tools
 
 
+def record_publication(spec, git, remote):
+    """Fixture data standing in for an agent's explicit review of these commits."""
+    def remote_head(branch):
+        rows = subprocess.check_output(["git", "ls-remote", str(remote), f"refs/heads/{branch}"], text=True).splitlines()
+        return rows[0].split()[0] if rows else None
+
+    base = remote_head(spec["base_branch"])
+    previous = remote_head(spec["branch"])
+    head = git("rev-parse", "HEAD")
+    spec.update(reviewed_head=head, expected_base_head=base, expected_remote_head=previous,
+                reviewed_commits=git("rev-list", head, "--not", *([base, previous] if previous else [base]), "--").splitlines(),
+                expected_fingerprint=delivery_tools.content_fingerprint(Path(spec["worktree"])))
+
+
 class FakeGitHub:
     """Real local Git with a fake external GitHub CLI seam."""
 
@@ -40,6 +54,9 @@ class FakeGitHub:
         self.ready_failure = False
         self.crash_after: str | None = None
         self.commands: list[list[str]] = []
+        self.merge_state = "CLEAN"
+        self.mergeable = "MERGEABLE"
+        self.review_decision = ""
 
     def __call__(self, command: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
@@ -52,6 +69,10 @@ class FakeGitHub:
             return result
         assert command[0] == "gh", command
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, text=True).strip()
+        if self.pr:
+            head = subprocess.check_output(["git", "--git-dir", str(self.remote), "rev-parse",
+                                            f"refs/heads/{self.pr['headRefName']}"], text=True).strip()
+            self.pr["headRefOid"] = head
         if command[1:3] == ["pr", "list"]:
             value = [self.pr] if self.pr else []
         elif command[1:3] == ["pr", "create"]:
@@ -91,7 +112,9 @@ class FakeGitHub:
                 self.crash_after = None
                 raise KeyboardInterrupt("simulated interruption after checks")
             drift = (self.drift_on_final_read and self.view_count > 1) or (self.head_drift_after_ready and self.ready_count)
-            value = {**(self.pr or {}), "headRefOid": "b" * 40 if drift else head}
+            value = {**(self.pr or {}), "headRefOid": "b" * 40 if drift else head,
+                     "mergeStateStatus": self.merge_state, "mergeable": self.mergeable,
+                     "reviewDecision": self.review_decision}
         elif command[1] == "api":
             if self.api_failure:
                 error = self.api_failure if isinstance(self.api_failure, str) else "HTTP 403: permission denied"
@@ -142,12 +165,15 @@ class DeliveryTests(unittest.TestCase):
         self.git("push", "-q", str(remote), "main")
         self.git("switch", "-qc", "feat/test")
         (self.repo / "feature.txt").write_text("implemented\n")
+        self.git("add", "feature.txt")
+        self.git("commit", "-qm", "feat: implement task")
         self.forge = FakeGitHub(self.repo)
         self.spec = {"repository": "github.com/example/task", "worktree": str(self.repo),
                      "baseline": baseline, "base_branch": "main", "branch": "feat/test",
                      "task_files": ["feature.txt"], "expected_fingerprint": delivery_tools.content_fingerprint(self.repo),
                      "commit_message": "feat: implement task", "pr_title": "Implement task", "pr_body": "Tested change.",
                      "log_dir": str(self.root / "logs"), "check_timeout_seconds": 0}
+        record_publication(self.spec, self.git, remote)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -187,12 +213,12 @@ class DeliveryTests(unittest.TestCase):
         self.git("config", "remote.upstream.pushurl", "git@github.com:other/private.git")
         result = self.deliver()
         self.assertEqual("remote-identity-mismatch", result["reason_code"])
-        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
         self.assertEqual(0, self.forge.create_count)
 
-    def test_slow_git_hooks_can_finish_with_a_scoped_timeout(self) -> None:
+    def test_slow_git_push_can_finish_with_a_scoped_timeout(self) -> None:
         def slow_commit(command, cwd, timeout):
-            if command[:2] == ["git", "commit"] and timeout < 60:
+            if command[:2] == ["git", "push"] and timeout < 60:
                 raise subprocess.TimeoutExpired(command, timeout)
             if command[0] == "gh":
                 self.assertEqual(30, timeout)
@@ -200,7 +226,7 @@ class DeliveryTests(unittest.TestCase):
 
         old_result = delivery_tools.Delivery(self.spec, run_process=slow_commit).run()
         self.assertEqual("git-operation-unavailable", old_result["reason_code"])
-        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
         self.spec["git_write_timeout_seconds"] = 300
         result = delivery_tools.Delivery(self.spec, run_process=slow_commit).run()
         self.assertEqual("complete", result["status"], result)
@@ -214,7 +240,7 @@ class DeliveryTests(unittest.TestCase):
                 result = delivery_tools.Delivery({**self.spec, **change}, run_process=self.forge).run()
                 self.assertEqual("blocked", result["status"])
                 self.assertEqual("decision", result["kind"])
-                self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+                self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
         self.assertEqual([], self.forge.commands)
 
     def test_draft_lifecycle_requires_a_run_identity_before_delivery(self) -> None:
@@ -418,6 +444,8 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(0, self.forge.ready_count)
 
     def test_preexisting_public_marker_without_local_creation_intent_is_not_ownership(self) -> None:
+        self.git("push", "-q", str(self.forge.remote), "feat/test")
+        record_publication(self.spec, self.git, self.forge.remote)
         self.spec.update(pr_lifecycle='draft-until-verified', run_id='run-123')
         helper = delivery_tools.Delivery(self.spec, run_process=self.forge)
         body = helper.body_with_managed_section('Human-owned PR', 'Required CI has not yet been observed.')
@@ -454,11 +482,8 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(1, self.forge.create_count)
         self.assertEqual(1, self.forge.ready_count)
 
-    def test_commit_crash_recovery_reuses_the_validated_commit(self) -> None:
+    def test_publication_never_creates_an_unreviewed_commit(self) -> None:
         self.spec.update(pr_lifecycle="draft-until-verified", run_id="run-123")
-        self.forge.crash_after = "commit"
-        with self.assertRaises(KeyboardInterrupt):
-            self.deliver()
         committed = self.git("rev-parse", "HEAD")
         result = self.deliver()
         self.assertEqual("complete", result["status"], result)
@@ -466,6 +491,8 @@ class DeliveryTests(unittest.TestCase):
         pushes = [command for command in self.forge.commands if command[:2] == ["git", "push"]]
         self.assertEqual(1, len(pushes))
         self.assertNotIn("--force", pushes[0])
+        self.assertFalse(any(command[:2] in (["git", "add"], ["git", "commit"])
+                             for command in self.forge.commands))
 
     def test_push_crash_recovery_does_not_push_the_same_head_twice(self) -> None:
         self.spec.update(pr_lifecycle="draft-until-verified", run_id="run-123")
@@ -530,10 +557,12 @@ class DeliveryTests(unittest.TestCase):
         self.forge.rules[0]["parameters"]["required_status_checks"][0]["integration_id"] = 123
         self.assertEqual("complete", self.deliver()["status"])
 
-    def test_argument_like_filename_is_staged_as_a_path_not_an_option(self) -> None:
+    def test_argument_like_filename_is_inspected_as_a_path_not_an_option(self) -> None:
         (self.repo / "--argument.txt").write_text("safe path\n")
         self.spec["task_files"].append("--argument.txt")
-        self.spec["expected_fingerprint"] = delivery_tools.content_fingerprint(self.repo)
+        self.git("add", "--", "--argument.txt")
+        self.git("commit", "-qm", "Add argument-like path")
+        record_publication(self.spec, self.git, self.forge.remote)
         result = self.deliver()
         self.assertEqual("complete", result["status"], result)
         self.assertEqual("safe path", self.git("show", "HEAD:--argument.txt"))
@@ -597,7 +626,7 @@ class DeliveryTests(unittest.TestCase):
         result = self.deliver()
         self.assertEqual("blocked", result["status"])
         self.assertEqual(before, self.git("diff", "--cached"))
-        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
 
     def test_unrelated_staged_version_hidden_by_worktree_is_rejected(self) -> None:
         (self.repo / "README.md").write_text("unrelated staged version\n")
@@ -608,7 +637,7 @@ class DeliveryTests(unittest.TestCase):
         result = self.deliver()
         self.assertEqual("blocked", result["status"], result)
         self.assertEqual(before, self.git("diff", "--cached"))
-        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
 
     def test_push_url_and_push_rewrites_are_audited_before_side_effects(self) -> None:
         for key, value in (("remote.origin.pushurl", "git@github.com:other/private.git"),
@@ -618,7 +647,7 @@ class DeliveryTests(unittest.TestCase):
                 try:
                     result = self.deliver()
                     self.assertEqual("blocked", result["status"], result)
-                    self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+                    self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
                     self.assertFalse(any(c[1] == "push" for c in self.forge.commands))
                 finally:
                     self.git("config", "--unset", key)
@@ -627,6 +656,7 @@ class DeliveryTests(unittest.TestCase):
         hook = self.repo / ".git/hooks/pre-commit"
         hook.write_text("#!/bin/sh\nprintf 'unvalidated\\n' > README.md\ngit add -- README.md\nprintf 'baseline\\n' > README.md\n")
         hook.chmod(0o755)
+        self.git("commit", "--allow-empty", "-qm", "Run local commit hook")
         result = self.deliver()
         self.assertEqual("blocked", result["status"], result)
         self.assertFalse(any(c[1] == "push" for c in self.forge.commands))
@@ -648,9 +678,10 @@ class DeliveryTests(unittest.TestCase):
         hook = self.repo / ".git" / "hooks" / "pre-commit"
         hook.write_text("#!/bin/sh\nprintf 'hook mutation\\n' > feature.txt\ngit add -- feature.txt\n")
         hook.chmod(0o755)
+        self.git("commit", "--allow-empty", "-qm", "Run local commit hook")
         result = self.deliver()
         self.assertEqual("blocked", result["status"], result)
-        self.assertIn("content", result["summary"].lower())
+        self.assertEqual("reviewed-head-changed", result["reason_code"])
         self.assertEqual(0, self.forge.create_count)
 
     def test_branch_option_injection_and_path_escape_are_rejected(self) -> None:
@@ -658,7 +689,7 @@ class DeliveryTests(unittest.TestCase):
             spec = {**self.spec, key: value}
             result = delivery_tools.Delivery(spec, run_process=self.forge).run()
             self.assertEqual("blocked", result["status"])
-        self.assertEqual(self.spec["baseline"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.spec["reviewed_head"], self.git("rev-parse", "HEAD"))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import delivery_tools  # noqa: E402
 from effect_guard import EffectGuard  # noqa: E402
-from test_delivery_tools import FakeGitHub  # noqa: E402
+from test_delivery_tools import FakeGitHub, record_publication  # noqa: E402
 
 
 class FakeDelivery:
@@ -110,6 +110,8 @@ class EffectGuardTests(unittest.TestCase):
         git("push", "-q", str(remote), "main")
         git("switch", "-qc", "feat/test")
         (repository / "feature.txt").write_text("implemented\n")
+        git("add", "feature.txt")
+        git("commit", "-qm", "feat: implement task")
 
         forge = FakeGitHub(repository)
         guard = EffectGuard(
@@ -134,6 +136,7 @@ class EffectGuardTests(unittest.TestCase):
                 "check_timeout_seconds": 0,
             },
         }
+        record_publication(effect["delivery"], git, remote)
         return repository, git, forge, guard, effect
 
     def test_completed_effect_is_returned_without_repeating_the_adapter(self):
@@ -320,6 +323,8 @@ class EffectGuardTests(unittest.TestCase):
         git("push", "-q", str(remote), "main")
         git("switch", "-qc", "feat/test")
         (repository / "feature.txt").write_text("implemented\n")
+        git("add", "feature.txt")
+        git("commit", "-qm", "feat: implement task")
 
         forge = FakeGitHub(repository)
         forge.crash_after = "pr-create"
@@ -346,6 +351,7 @@ class EffectGuardTests(unittest.TestCase):
             },
         }
 
+        record_publication(effect["delivery"], git, remote)
         with self.assertRaises(KeyboardInterrupt):
             guard.ensure(effect)
         effect_id = EffectGuard._normalise(effect)[1]
@@ -381,6 +387,8 @@ class EffectGuardTests(unittest.TestCase):
         git("push", "-q", str(remote), "main")
         git("switch", "-qc", "feat/test")
         (repository / "feature.txt").write_text("implemented\n")
+        git("add", "feature.txt")
+        git("commit", "-qm", "feat: implement task")
 
         forge = FakeGitHub(repository)
         malformed = True
@@ -414,6 +422,7 @@ class EffectGuardTests(unittest.TestCase):
             },
         }
 
+        record_publication(effect["delivery"], git, remote)
         uncertain = guard.ensure(effect)
         revised = copy.deepcopy(effect)
         revised["delivery"]["pr_title"] = "Revised task"
@@ -580,6 +589,9 @@ class EffectGuardTests(unittest.TestCase):
         fix["delivery"]["task_files"].append("regression.txt")
         fix["delivery"]["expected_fingerprint"] = delivery_tools.content_fingerprint(repository)
         fix["delivery"]["commit_message"] = "fix: repair the failing check"
+        git("add", "feature.txt", "regression.txt")
+        git("commit", "-qm", "fix: repair the failing check")
+        record_publication(fix["delivery"], git, forge.remote)
         fixed = guard.ensure(fix)
 
         self.assertEqual("effect-outcome-indeterminate", red["reason_code"])
@@ -597,11 +609,13 @@ class EffectGuardTests(unittest.TestCase):
         (repository / "README.md").write_text("base moved on\n")
         git("commit", "-qam", "advance base")
         base = git("rev-parse", "HEAD")
+        git("push", "-q", str(forge.remote), "main")
         git("switch", "-q", "feat/test")
         git("merge", "-q", "--no-edit", "main")
         stale = copy.deepcopy(effect)
         stale["delivery"]["expected_fingerprint"] = delivery_tools.content_fingerprint(repository)
         stale["delivery"]["commit_message"] = "Merge main into feat/test"
+        record_publication(stale["delivery"], git, forge.remote)
         merged = copy.deepcopy(stale)
         merged["delivery"]["baseline"] = base
 

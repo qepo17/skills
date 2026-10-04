@@ -66,7 +66,7 @@ For ordinary repository changes, the orchestrator owns completion through an ope
 
 A request to use this skill for a repository change requests this workflow; ordinary scoped commit/push/PR delivery, including fixes published while watching, needs no further invitation or approval. Honor explicit local-only/no-push/no-PR instructions, repository policy or exact-approval requirements, and tool/sandbox permissions. Resolve an ambiguous destination before publication. Do not infer authority for merge, auto-merge, deployment, migrations, permissions changes, tracker writes, creating a remote repository, or destructive work.
 
-Read [DELIVERY.md](DELIVERY.md) whenever using normal GitHub PR completion, without waiting for a separate PR request. Capture a new content fingerprint after the last relevant check. If source changes afterward, verify again before creating a new effect proposal.
+Read [DELIVERY.md](DELIVERY.md) whenever using normal GitHub PR completion, without waiting for a separate PR request. Prepare task-only commits locally, inspect hook changes, and bind verification and review to the resulting head. Review every outgoing commit against the observed remote heads before recording the publication set; a filename list cannot identify unrelated edits within a file. Capture a new content fingerprint after the last relevant check. If source or history changes afterward, review and verify again before creating a new effect proposal.
 
 If no changes are needed, report the evidence and create no empty PR. For explicit opt-outs, return the actual local result. Missing authentication or remote, ambiguous destination, denied permission, or failed required verification/review leaves delivery blocked or partial: state the result, blocker, and next needed action. Continue useful local development where possible; do not silently downgrade to local-only, bypass safety, or call the task complete.
 
@@ -84,7 +84,7 @@ The watcher repeats until the PR is mergeable or genuinely blocked:
 - Treat requested changes as red: address actionable feedback within scope.
 - Verify each fix locally and publish it as a revised effect, then watch the new head. Tiny reversible fixes may use focused self-review; a substantive fix goes back to the orchestrator for independent review before publication.
 
-A PR is mergeable when it is open and ready for review, its head is the verified head, every check on that head finished green, and the forge reports no conflicts and no unmet merge requirement.
+Use the read-only observer and acceptance policy in [DELIVERY.md](DELIVERY.md) to decide whether the PR is mergeable. Required checks must pass; optional skipped/neutral checks are acceptable. Worker reports and historical delivery receipts do not establish current mergeability.
 
 The watcher stops and reports rather than widening scope or guessing when it meets a failure the base branch already has, a fix that needs a consequential decision or broader scope, checks that cannot start, missing permissions, human changes to the PR or branch, a gate only a human can satisfy such as a required approval, or a repeated failure without new evidence. It never merges, enables auto-merge, approves, dismisses reviews, or resolves reviewers' conversations.
 
