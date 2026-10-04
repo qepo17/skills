@@ -10,6 +10,14 @@ Agent Skills for taking a software request through implementation, verification,
 | `idea-to-ticket` | Optional research and a ticket draft for an unticketed idea; publish only when authorized. |
 | `end-to-end-development` | Orchestrator-first development with bounded workers across repositories, through verified changes and open task PRs watched until mergeable by default. |
 
+## See it in action
+
+![One request, three repos, three open PRs — end-to-end development demo](skills/end-to-end-development/assets/end-to-end-development-preview.gif)
+
+[Try the multi-repository example](skills/end-to-end-development/README.md).
+
+Start from a workspace root containing UI, backend, and contract repositories. Describe the feature; the agent discovers the affected repositories and assigns task owners in its plan. This illustrated demo follows that plan through implementation, verification, and three open PRs watched until green and mergeable.
+
 ## Development model
 
 ```text

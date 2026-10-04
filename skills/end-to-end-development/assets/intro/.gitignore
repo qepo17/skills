@@ -1,0 +1,8 @@
+/target/
+/media/*.wav
+/frames/
+/_frame_snapshots/
+*.mp4
+*.png
+*.gif
+*.log

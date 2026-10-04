@@ -1,0 +1,2 @@
+# Keep rendered videos local; publish the GIF preview.
+*.mp4
