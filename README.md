@@ -9,6 +9,7 @@ Agent Skills for taking a software request through implementation, verification,
 | --- | --- |
 | `idea-to-ticket` | Optional research and a ticket draft for an unticketed idea; publish only when authorized. |
 | `end-to-end-development` | Orchestrator-first development with bounded workers across repositories, through verified changes and open task PRs watched until mergeable by default. |
+| `init-agents-md` | Create or regenerate a project's `AGENTS.md` from engineering principles, repository evidence and optional stack Do/Don't sources, keeping existing Do/Don't rules. |
 
 ## See it in action
 
@@ -74,7 +75,7 @@ npx skills add qepo17/skills --global --agent codex --skill end-to-end-developme
 Update installed skills:
 
 ```bash
-npx skills update --global end-to-end-development idea-to-ticket
+npx skills update --global end-to-end-development idea-to-ticket init-agents-md
 ```
 
 ## Requirements

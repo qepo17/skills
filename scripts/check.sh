@@ -36,6 +36,7 @@ grep -Fq 'end-to-end-development' "$TMP_DIR/skills-list.txt"
 ! grep -Fq 'fast-end-to-end-development' "$TMP_DIR/skills-list.txt"
 ! grep -Fq 'simple-code' "$TMP_DIR/skills-list.txt"
 grep -Fq 'idea-to-ticket' "$TMP_DIR/skills-list.txt"
+grep -Fq 'init-agents-md' "$TMP_DIR/skills-list.txt"
 
 # Validate the idea skill with no sibling skills available.
 cp -R skills/idea-to-ticket "$TMP_DIR/idea-to-ticket"
